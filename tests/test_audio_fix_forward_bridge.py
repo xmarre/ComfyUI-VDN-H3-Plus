@@ -8,16 +8,24 @@ import comfy.ops
 import comfy.quant_ops
 import comfy.ldm.minimax.model as minimax_model
 
+from vdn_h3.audio_fix_forward_bridge import _rms_rope_split_half_surrogate
 from vdn_h3.audio_fix_train import comfy_quant_training_mode
 
 
-def test_rms_rope_bridge_uses_inference_value_and_functional_gradient(monkeypatch):
+def _identity_split_half_rope(seq: int, rot_dim: int, dtype=torch.float32):
+    eye = torch.eye(2, dtype=dtype)
+    return eye.view(1, 1, 1, 1, 2, 2).expand(
+        1, int(seq), 1, int(rot_dim) // 2, 2, 2
+    ).contiguous()
+
+
+def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(monkeypatch):
     calls = {"functional": 0, "inplace": 0}
 
-    def functional(q, k, rope, qw, kw, **kwargs):
-        del rope, qw, kw, kwargs
+    def unsupported_functional(*args, **kwargs):
+        del args, kwargs
         calls["functional"] += 1
-        return q * 2.0, k * 3.0
+        raise RuntimeError("custom-op autograd path must not be used")
 
     def inplace(q, k, rope, qw, kw, **kwargs):
         del rope, qw, kw, kwargs
@@ -25,17 +33,45 @@ def test_rms_rope_bridge_uses_inference_value_and_functional_gradient(monkeypatc
         q.add_(10.0)
         k.sub_(5.0)
 
-    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half", functional)
+    monkeypatch.setattr(
+        comfy.quant_ops.ck, "rms_rope_split_half", unsupported_functional
+    )
     monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", inplace)
 
-    q = torch.randn(2, 3, requires_grad=True)
-    k = torch.randn(2, 3, requires_grad=True)
+    seq, heads, width, rot_dim = 3, 2, 8, 6
+    rope = _identity_split_half_rope(seq, rot_dim)
+    q_scale = torch.linspace(0.8, 1.2, width)
+    k_scale = torch.linspace(1.1, 0.7, width)
+    q = torch.randn(1, seq, heads, width, requires_grad=True)
+    k = torch.randn(1, seq, heads, width, requires_grad=True)
     q_before = q.detach().clone()
     k_before = k.detach().clone()
 
+    # Compute the gradient oracle from the local ordinary-PyTorch reference itself.
+    q_ref = q_before.clone().requires_grad_(True)
+    k_ref = k_before.clone().requires_grad_(True)
+    q_sur, k_sur = _rms_rope_split_half_surrogate(
+        q_ref,
+        k_ref,
+        rope,
+        q_scale,
+        k_scale,
+        epsilon=1e-6,
+        rot_dim=rot_dim,
+    )
+    (q_sur.sum() + k_sur.sum()).backward()
+    q_grad_ref = q_ref.grad.detach().clone()
+    k_grad_ref = k_ref.grad.detach().clone()
+
     with comfy_quant_training_mode():
         q_out, k_out = comfy.quant_ops.ck.rms_rope_split_half(
-            q, k, None, None, None
+            q,
+            k,
+            rope,
+            q_scale,
+            k_scale,
+            epsilon=1e-6,
+            rot_dim=rot_dim,
         )
         assert torch.equal(q_out.detach(), q_before + 10.0)
         assert torch.equal(k_out.detach(), k_before - 5.0)
@@ -44,9 +80,13 @@ def test_rms_rope_bridge_uses_inference_value_and_functional_gradient(monkeypatc
         assert torch.equal(k.detach(), k_before)
         (q_out.sum() + k_out.sum()).backward()
 
-    assert calls == {"functional": 1, "inplace": 1}
-    assert torch.equal(q.grad, torch.full_like(q, 2.0))
-    assert torch.equal(k.grad, torch.full_like(k, 3.0))
+    # The original comfy-kitchen functional custom op is deliberately never called;
+    # its torch.library operator currently has no registered autograd formula.
+    assert calls == {"functional": 0, "inplace": 1}
+    assert torch.allclose(q.grad, q_grad_ref)
+    assert torch.allclose(k.grad, k_grad_ref)
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(k.grad).all()
 
 
 def test_linear_input_act_bridge_uses_fused_value_and_training_gradient(monkeypatch):
