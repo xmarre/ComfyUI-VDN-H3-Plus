@@ -416,15 +416,16 @@ def differentiable_vdn_runtime():
 
 @contextmanager
 def comfy_quant_training_mode():
-    """Enable Comfy's quantized autograd plus the differentiable VDN recurrence."""
+    """Use production H3 forward values with autograd-safe H3/VDN backward paths."""
     import comfy.model_management as mm
+    from vdn_h3.audio_fix_forward_bridge import inference_exact_training_primitives
 
     old_training = mm.in_training
     old_fp8_bwd = mm.training_fp8_bwd
     mm.in_training = True
     mm.training_fp8_bwd = False
     try:
-        with differentiable_vdn_runtime():
+        with differentiable_vdn_runtime(), inference_exact_training_primitives():
             yield
     finally:
         mm.in_training = old_training
