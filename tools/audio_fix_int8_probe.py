@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""Probe the already-installed production H3 before starting audio-fix training.
+"""Probe the installed INT8/ConvRot H3 before starting audio-fix training.
 
-This downloads nothing. It verifies that Comfy's quantized Linear backward propagates
-through the user's actual INT8/ConvRot qkv projection, then verifies the zero-initialized
-sidecar receives the expected first-step gradient while the frozen base receives none.
+This downloads nothing. The cheap probe verifies that Comfy's quantized Linear
+backward propagates through the actual INT8/ConvRot qkv projection and that the
+zero-initialized sidecar receives the expected first-step gradient while the frozen
+base receives none.
+
+With ``--vdn-checkpoint`` it additionally performs a small direct MiniMax-H3 forward
+through the exact VDN/Stage-B/Turbo ModelPatcher wrapper stack used by the standalone
+trainer. This catches the important failure mode where the trainer has valid wrapper
+objects but a direct H3 call never executes them.
 """
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 
 
 def _bootstrap():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--comfy-root", default=os.environ.get("COMFYUI_ROOT", "/home/toor/ComfyUI"))
+    parser.add_argument(
+        "--comfy-root",
+        default=os.environ.get("COMFYUI_ROOT", "/home/toor/ComfyUI"),
+    )
     known, _ = parser.parse_known_args()
     root = os.path.abspath(os.path.expanduser(known.comfy_root))
     if not os.path.isfile(os.path.join(root, "comfy", "sd.py")):
@@ -29,13 +39,23 @@ COMFY_ROOT = _bootstrap()
 
 import torch  # noqa: E402
 import comfy.model_management  # noqa: E402
+import comfy.samplers  # noqa: E402
 import comfy.sd  # noqa: E402
 
+from vdn_h3.audio_fix_model_options import build_student_transformer_options  # noqa: E402
 from vdn_h3.audio_fix_train import (  # noqa: E402
     TrainableAudioFixBank,
     comfy_quant_training_mode,
     validate_production_quant_targets,
 )
+from vdn_h3.audio_node import _apply_vdn_audio_safe  # noqa: E402
+
+
+VIDEO_CHANNELS = 24
+AUDIO_CHANNELS = 32
+VIDEO_SHIFT = 12.0
+AUDIO_SHIFT = 3.0
+AUDIO_SCALE = VIDEO_SHIFT / AUDIO_SHIFT
 
 
 def _resolve_base(path):
@@ -54,15 +74,201 @@ def _grad_max(parameter):
     return 0.0 if parameter.grad is None else float(parameter.grad.detach().abs().max())
 
 
+def _finite_delta(left, right):
+    if not torch.isfinite(left).all() or not torch.isfinite(right).all():
+        raise RuntimeError("full-stack probe produced a non-finite H3 output")
+    return float((left.float() - right.float()).abs().max())
+
+
+@contextmanager
+def _student_role(student, device):
+    student.patch_model(device_to=device, load_weights=False)
+    student.pre_run()
+    try:
+        yield student.get_model_object("diffusion_model")
+    finally:
+        student.cleanup()
+        student.unpatch_model(device_to=device, unpatch_weights=False)
+
+
+def _direct_h3_output(dm, video, audio, sigma, context, sigmas, transformer_options):
+    timestep = torch.tensor([float(sigma) * 1000.0], device=video.device, dtype=torch.float32)
+    output = dm(
+        [video, audio],
+        timestep,
+        context,
+        transformer_options,
+        minimax_payload={"audio_scale": AUDIO_SCALE},
+    )
+    if not isinstance(output, (list, tuple)) or len(output) != 2:
+        raise RuntimeError("MiniMax H3 did not return [video, audio]")
+    return output[0], output[1]
+
+
+def _full_stack_probe(base, base_dm, device, args):
+    if not args.vdn_checkpoint:
+        return
+
+    print("full-stack direct-call probe: building VDN/Stage-B/Turbo student", flush=True)
+    student = _apply_vdn_audio_safe(
+        base,
+        args.vdn_checkpoint,
+        {"default": args.stage_b_strength, "turbo": args.turbo_strength},
+        "stream",
+        "grouped",
+        True,
+        audio_adapter_strength=1.0,
+        conditioning_adapter_strength=1.0,
+        audio_video_context_strength=1.0,
+        conditioning_video_context_strength=1.0,
+        audio_fix_strength=0.0,
+        apply_turbo_adapter=True,
+        retain_buffers="off",
+        global_gate_mode=args.global_gate_mode,
+        adapter_ablation="none",
+        fast_kernels=False,
+    )[0]
+
+    sigmas = comfy.samplers.calculate_sigmas(
+        base.model.model_sampling, "simple", 10
+    ).to(device=device, dtype=torch.float32)
+    if sigmas.numel() != 11 or float(sigmas[-1]) != 0.0:
+        raise RuntimeError(f"unexpected 10-step simple sigma table: {sigmas.tolist()}")
+    transformer_options = build_student_transformer_options(
+        student,
+        sigmas,
+        video_shift=VIDEO_SHIFT,
+        audio_shift=AUDIO_SHIFT,
+    )
+
+    generator = torch.Generator(device=device).manual_seed(args.seed + 4049)
+    video = torch.randn(
+        1,
+        VIDEO_CHANNELS,
+        args.full_stack_video_frames,
+        args.full_stack_latent_height,
+        args.full_stack_latent_width,
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    audio = torch.randn(
+        1,
+        AUDIO_CHANNELS,
+        1,
+        args.full_stack_audio_frames,
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    # Hidden-width context skips the token-refiner and keeps the probe focused on the
+    # packed H3 + VDN + released adapter graph. Real prompt embeddings are exercised by
+    # the subsequent one-step trainer smoke run.
+    context = torch.randn(
+        1,
+        args.full_stack_text_tokens,
+        int(base_dm.hidden_size),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    sigma = float(sigmas[min(4, sigmas.numel() - 2)])
+
+    with torch.no_grad(), comfy_quant_training_mode():
+        dense_options = {
+            "minimax_h3_sigma_shift_video": VIDEO_SHIFT,
+            "minimax_h3_sigma_shift_audio": AUDIO_SHIFT,
+            "sample_sigmas": sigmas,
+        }
+        dense_v, dense_a = _direct_h3_output(
+            base_dm,
+            video,
+            audio,
+            sigma,
+            context,
+            sigmas,
+            dense_options,
+        )
+        with _student_role(student, device) as student_dm:
+            student_v, student_a = _direct_h3_output(
+                student_dm,
+                video,
+                audio,
+                sigma,
+                context,
+                sigmas,
+                transformer_options,
+            )
+
+    video_delta = _finite_delta(student_v, dense_v)
+    audio_delta = _finite_delta(student_a, dense_a)
+    print(
+        "full-stack direct-call delta: "
+        f"video_max={video_delta:.6g} audio_max={audio_delta:.6g}",
+        flush=True,
+    )
+    if video_delta == 0.0 and audio_delta == 0.0:
+        raise RuntimeError(
+            "VDN/Stage-B/Turbo student was bit-identical to dense H3; the direct-call "
+            "wrapper stack did not affect the model and training must not start"
+        )
+
+    # build_student_transformer_options already proves the required wrapper keys are
+    # present. A nonzero full-model delta proves those wrappers actually executed.
+    print(
+        "full-stack direct-call wrapper execution: OK "
+        f"(Stage-B={args.stage_b_strength:g}, Turbo={args.turbo_strength:g}, "
+        f"gate={args.global_gate_mode})",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--comfy-root", default=COMFY_ROOT)
-    parser.add_argument("--base-model", required=True,
-                        help="Existing production INT8/ConvRot MiniMax-H3 safetensors")
+    parser.add_argument(
+        "--base-model",
+        required=True,
+        help="Existing production INT8/ConvRot MiniMax-H3 safetensors",
+    )
     parser.add_argument("--rows", type=int, default=8)
+    parser.add_argument(
+        "--vdn-checkpoint",
+        default=None,
+        help="Optional released VDN stage; enables the direct full-stack wrapper probe",
+    )
+    parser.add_argument("--stage-b-strength", type=float, default=1.0)
+    parser.add_argument("--turbo-strength", type=float, default=0.75)
+    parser.add_argument(
+        "--global-gate-mode",
+        choices=("checkpoint", "video_only"),
+        default="video_only",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--full-stack-video-frames", type=int, default=8)
+    parser.add_argument("--full-stack-audio-frames", type=int, default=32)
+    parser.add_argument("--full-stack-latent-height", type=int, default=8)
+    parser.add_argument("--full-stack-latent-width", type=int, default=8)
+    parser.add_argument("--full-stack-text-tokens", type=int, default=8)
     args = parser.parse_args()
+
     if args.rows < 4:
         raise SystemExit("--rows must be >= 4")
+    if not 0.0 <= args.stage_b_strength <= 2.0:
+        raise SystemExit("--stage-b-strength must be in [0, 2]")
+    if not 0.0 < args.turbo_strength <= 2.0:
+        raise SystemExit("--turbo-strength must be in (0, 2]; Turbo-off is not this probe path")
+    if args.full_stack_video_frames < 2 or args.full_stack_audio_frames < 2:
+        raise SystemExit("full-stack video/audio frame counts must be >= 2")
+    if (
+        args.full_stack_latent_height < 2
+        or args.full_stack_latent_width < 2
+        or args.full_stack_latent_height % 2
+        or args.full_stack_latent_width % 2
+    ):
+        raise SystemExit("full-stack latent height/width must be positive even values >= 2")
+    if args.full_stack_text_tokens < 1:
+        raise SystemExit("--full-stack-text-tokens must be >= 1")
 
     base_path = _resolve_base(args.base_model)
     base = comfy.sd.load_diffusion_model(base_path, model_options={})
@@ -83,8 +289,13 @@ def main():
 
     with comfy_quant_training_mode():
         # Probe 1: the frozen quantized op must provide d(output)/d(input).
-        x = torch.randn(args.rows, module.in_features, device=device, dtype=torch.bfloat16,
-                        requires_grad=True)
+        x = torch.randn(
+            args.rows,
+            module.in_features,
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
         y = module(x)
         loss = y.float().square().mean()
         loss.backward()
@@ -101,7 +312,6 @@ def main():
         try:
             x2 = torch.randn(args.rows, module.in_features, device=device, dtype=torch.bfloat16)
             with bank.scope(1, args.rows - 1, enabled=True):
-                base_out = None
                 with bank.disabled():
                     base_out = module(x2).detach()
                 out = module(x2)
@@ -115,7 +325,8 @@ def main():
                 raise RuntimeError("zero-init audio_fix B received no finite first-step gradient")
             if a_grad != 0.0:
                 raise RuntimeError(
-                    f"zero-init audio_fix A gradient should be zero before B moves, got {a_grad}")
+                    f"zero-init audio_fix A gradient should be zero before B moves, got {a_grad}"
+                )
             if any(parameter.grad is not None for parameter in dm.parameters()):
                 raise RuntimeError("frozen base accumulated gradients during sidecar probe")
             print(f"zero-init sidecar B gradient: OK (max={b_grad:.6g}); A=0 as expected")
@@ -133,11 +344,14 @@ def main():
         finally:
             bank.uninstall()
 
-    print("PROBE PASSED: existing production INT8/ConvRot H3 is usable for sidecar training")
+    print("INT8/ConvRot sidecar gradient probe: PASSED", flush=True)
+    _full_stack_probe(base, dm, device, args)
+    print("PROBE PASSED: production H3 is structurally usable for audio-fix training", flush=True)
 
 
 def math_isfinite(value):
     import math
+
     return math.isfinite(float(value))
 
 
