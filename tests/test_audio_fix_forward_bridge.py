@@ -3,10 +3,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+import comfy.ldm.minimax.model as minimax_model
 import comfy.model_management as mm
 import comfy.ops
 import comfy.quant_ops
-import comfy.ldm.minimax.model as minimax_model
 
 from vdn_h3.audio_fix_forward_bridge import _rms_rope_split_half_surrogate
 from vdn_h3.audio_fix_train import comfy_quant_training_mode
@@ -19,7 +19,7 @@ def _identity_split_half_rope(seq: int, rot_dim: int, dtype=torch.float32):
     ).contiguous()
 
 
-def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(monkeypatch):
+def test_rms_rope_bridge_uses_inference_value_and_lazy_pytorch_gradient(monkeypatch):
     calls = {"functional": 0, "inplace": 0}
 
     def unsupported_functional(*args, **kwargs):
@@ -47,7 +47,6 @@ def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(mon
     q_before = q.detach().clone()
     k_before = k.detach().clone()
 
-    # Compute the gradient oracle from the local ordinary-PyTorch reference itself.
     q_ref = q_before.clone().requires_grad_(True)
     k_ref = k_before.clone().requires_grad_(True)
     q_sur, k_sur = _rms_rope_split_half_surrogate(
@@ -75,13 +74,13 @@ def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(mon
         )
         assert torch.equal(q_out.detach(), q_before + 10.0)
         assert torch.equal(k_out.detach(), k_before - 5.0)
-        # The inference-exact bridge must not mutate the actual autograd inputs.
         assert torch.equal(q.detach(), q_before)
         assert torch.equal(k.detach(), k_before)
+        # Forward only executes the exact production kernel; no differentiable
+        # surrogate graph is retained across the block.
+        assert calls == {"functional": 0, "inplace": 1}
         (q_out.sum() + k_out.sum()).backward()
 
-    # The original comfy-kitchen functional custom op is deliberately never called;
-    # its torch.library operator currently has no registered autograd formula.
     assert calls == {"functional": 0, "inplace": 1}
     assert torch.allclose(q.grad, q_grad_ref)
     assert torch.allclose(k.grad, k_grad_ref)
@@ -89,7 +88,38 @@ def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(mon
     assert torch.isfinite(k.grad).all()
 
 
-def test_linear_input_act_bridge_uses_fused_value_and_training_gradient(monkeypatch):
+def test_rms_rope_no_grad_path_is_exact_and_graph_free(monkeypatch):
+    calls = {"functional": 0, "inplace": 0}
+
+    def functional(*args, **kwargs):
+        del args, kwargs
+        calls["functional"] += 1
+        raise RuntimeError("functional path should not execute")
+
+    def inplace(q, k, rope, qw, kw, **kwargs):
+        del rope, qw, kw, kwargs
+        calls["inplace"] += 1
+        q.mul_(2.0)
+        k.mul_(3.0)
+
+    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half", functional)
+    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", inplace)
+
+    q = torch.randn(1, 2, 1, 4)
+    k = torch.randn(1, 2, 1, 4)
+    rope = _identity_split_half_rope(2, 4)
+    scale = torch.ones(4)
+    with comfy_quant_training_mode(), torch.no_grad():
+        qo, ko = comfy.quant_ops.ck.rms_rope_split_half(
+            q, k, rope, scale, scale, epsilon=1e-6, rot_dim=4
+        )
+    assert calls == {"functional": 0, "inplace": 1}
+    assert not qo.requires_grad and not ko.requires_grad
+    assert torch.equal(qo, q * 2.0)
+    assert torch.equal(ko, k * 3.0)
+
+
+def test_linear_input_act_bridge_defers_training_surrogate_until_backward(monkeypatch):
     calls = {"inference": 0, "training": 0}
 
     def fake_linear_input_act(linear, x, input_act):
@@ -107,10 +137,32 @@ def test_linear_input_act_bridge_uses_fused_value_and_training_gradient(monkeypa
         assert mm.in_training is True
         out = comfy.ops.linear_input_act(object(), x, "swiglu")
         assert torch.equal(out.detach(), x.detach() * 10.0 + 7.0)
+        # The large eager SwiGLU/fc2 graph must not exist during block forward.
+        assert calls == {"inference": 1, "training": 0}
         out.sum().backward()
 
     assert calls == {"inference": 1, "training": 1}
     assert torch.equal(x.grad, torch.full_like(x, 3.0))
+
+
+def test_linear_input_act_no_grad_never_builds_training_surrogate(monkeypatch):
+    calls = {"inference": 0, "training": 0}
+
+    def fake_linear_input_act(linear, x, input_act):
+        del linear, input_act
+        if mm.in_training:
+            calls["training"] += 1
+            return x * 3.0
+        calls["inference"] += 1
+        return x * 5.0
+
+    monkeypatch.setattr(comfy.ops, "linear_input_act", fake_linear_input_act)
+    x = torch.randn(3, 4)
+    with comfy_quant_training_mode(), torch.no_grad():
+        out = comfy.ops.linear_input_act(object(), x, "swiglu")
+    assert calls == {"inference": 1, "training": 0}
+    assert torch.equal(out, x * 5.0)
+    assert not out.requires_grad
 
 
 def test_h3_modulation_bridge_preserves_arithmetic_without_input_aliasing():
@@ -123,9 +175,11 @@ def test_h3_modulation_bridge_preserves_arithmetic_without_input_aliasing():
 
     x_before = x.detach().clone()
     expected_scaled = minimax_model._mod_scale_shift(
-        x_before.clone(), shift.detach(), scale.detach(), segments)
+        x_before.clone(), shift.detach(), scale.detach(), segments
+    )
     expected_gated = minimax_model._mod_gate(
-        x_before.clone(), gate.detach(), other.detach(), segments)
+        x_before.clone(), gate.detach(), other.detach(), segments
+    )
 
     before_version = x._version
     original_scale_shift = minimax_model._mod_scale_shift
