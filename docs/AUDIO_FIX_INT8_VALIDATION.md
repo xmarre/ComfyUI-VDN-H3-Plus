@@ -45,7 +45,7 @@ git rev-parse HEAD
 
 Do not compare GPU results from different heads without recording that fact.
 
-## 2. Run the structural + gradient probe
+## 2. Run the structural + gradient + forward-parity probe
 
 Use the same installed base model and VDN stage as the production workflow:
 
@@ -65,10 +65,39 @@ This must pass **all** of the following before training:
 2. the zero-initialized `audio_fix` sidecar is an exact forward no-op;
 3. its B matrix receives a finite first-step gradient while A remains zero at zero-init;
 4. after one tiny B update, A receives a finite nonzero gradient;
-5. the direct MiniMax-H3 call can see the required `vdn_h3` and `vdn_h3_audio_adapter_scope` ModelPatcher wrappers;
-6. the direct VDN/Stage-B/Turbo student produces finite output and is not bit-identical to the wrapper-free dense H3 call.
+5. dense H3 inference and autograd-safe training execution remain within the hard relative-RMS parity limit;
+6. the direct MiniMax-H3 call can see the required `vdn_h3` and `vdn_h3_audio_adapter_scope` ModelPatcher wrappers;
+7. the VDN/Stage-B/Turbo inference and autograd-safe training executions remain within the same hard parity limit;
+8. the direct VDN/Stage-B/Turbo student produces finite output and is not bit-identical to the wrapper-free dense H3 call.
 
-Failure of any item is a hard stop. Do not work around it by starting training anyway.
+Failure of any item is a hard stop. Do not work around it by starting training anyway, and do not raise `--max-training-parity-rel-rms` merely to pass the probe. The default `0.02` gate is deliberate.
+
+### Why the trainer has an inference-exact forward bridge
+
+A corrected GPU probe reached the dense-H3 comparison and measured:
+
+```text
+video_rel_rms = 0.0650898
+video_max     = 0.618967
+audio_rel_rms = 0.0405348
+audio_max     = 0.425354
+```
+
+That was a real blocker, not tolerance noise. The global Comfy `in_training=True` state required by the autograd-safe H3/VDN graph changes two production H3 primitives:
+
+- MiniMax-H3 switches from its in-place fused RMS/RoPE inference kernel to the functional training kernel;
+- `comfy.ops.linear_input_act` disables the production fused INT8 activation + MLP down-projection path while the global training flag is set.
+
+Across 50 transformer blocks that changed the dense model output by several percent before VDN was even involved.
+
+The trainer now keeps the global training state required for differentiable H3/VDN execution but bridges those two primitives explicitly:
+
+- **forward value:** exact production inference primitive;
+- **backward:** Comfy's supported functional/eager training primitive as a straight-through surrogate.
+
+The production RMS/RoPE kernel runs only on detached clones and therefore cannot mutate the live autograd inputs. The fused INT8 `linear_input_act` value is likewise obtained under `no_grad`; its supported eager training path supplies the input gradient. Both patches are scoped to `comfy_quant_training_mode()` and are restored even on exceptions.
+
+This is intentionally different from loosening the parity threshold: the probe still compares the complete dense and VDN/Turbo outputs against the same `0.02` hard limit after the bridge is active.
 
 ## 3. Cache a small prompt set with the installed H3 text encoder
 
