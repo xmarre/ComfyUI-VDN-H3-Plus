@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from vdn_h3.audio_fix_progress import install_scope_safe_block_checkpointing
 
@@ -58,14 +57,13 @@ def test_checkpoint_recompute_reenters_captured_audio_scope_after_outer_scope_ex
     calls = []
     block = _Block(bank, calls)
     model = SimpleNamespace(blocks=[block])
-    impl = SimpleNamespace(
-        current_train_scope=bank.scope_var.get,
-        checkpoint=checkpoint,
-    )
     progress = _Progress()
 
     originals = install_scope_safe_block_checkpointing(
-        impl, model, bank, progress=progress
+        model,
+        bank,
+        progress=progress,
+        scope_getter=bank.scope_var.get,
     )
 
     x = torch.randn(8, requires_grad=True)
@@ -81,6 +79,7 @@ def test_checkpoint_recompute_reenters_captured_audio_scope_after_outer_scope_ex
     assert torch.isfinite(x.grad).all()
     assert len(calls) >= 2
     assert all(call == (11, 19, True) for call in calls)
+    # One forward invocation plus at least one checkpoint recomputation invocation.
     assert progress.blocks >= 2
 
     for wrapped_block, original in originals:
