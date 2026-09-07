@@ -84,6 +84,10 @@ class RuntimeLinearBranch(B.LinearBranch):
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
+        # These no longer participate after the scans. Releasing them here keeps the
+        # statistics workspace and feature copies out of the gate/readout peak.
+        del a, b, key, value, key_by_frame, value_by_frame, beta, frame_mean
+
         gate = torch.sigmoid(
             F.linear(xv, w["output_gate.down.weight"])
             @ w["output_gate.up.weight"].T
@@ -99,6 +103,7 @@ class RuntimeLinearBranch(B.LinearBranch):
             out_dtype=gate.dtype,
             fuse=self.fuse_epilogue,
         )
+        del prefix_states, suffix_states
 
         if query.dim() == 4:
             query_fhsd = query
@@ -110,7 +115,7 @@ class RuntimeLinearBranch(B.LinearBranch):
             readout,
             w["norm.weight"],
             gate,
-            w["norm.weight"].new_tensor(1e-6).item(),
+            B._readout_eps(w["norm.weight"].dtype),
             fuse=self.fuse_epilogue,
         )
 

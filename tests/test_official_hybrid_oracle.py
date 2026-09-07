@@ -53,9 +53,6 @@ def _load_official_hybrid():
     ):
         _pkg(name)
 
-    # OpenVDN's softmax kernels import the diffusers MiniMax rotary helper at module
-    # import time. This CPU oracle never supplies rotary_emb, so install the inert
-    # dependency before loading those kernels rather than depending on diffusers.
     minimax = types.ModuleType("diffusers.models.transformers.transformer_minimax_h3")
     minimax._apply_rotary_emb = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("RoPE helper must not run when rotary_emb=None"))
@@ -89,9 +86,6 @@ def _load_official_hybrid():
     branch = _load("official_hybrid_branch", "src/models/linear_attention/branch.py")
     linear_pkg.BidirectionalLinearBranch = branch.BidirectionalLinearBranch
 
-    # Register under the exact canonical module name imported by the released
-    # HybridAttention class. This keeps the oracle's dependency wiring faithful to
-    # OpenVDN rather than substituting a lookalike helper module.
     softmax_kernels = _load(
         "src.models.softmax_attention.kernels",
         "src/models/softmax_attention/kernels.py",
@@ -105,9 +99,6 @@ def _load_official_hybrid():
     softmax_pkg.window_softmax_flex = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("FlexAttention must not run in CPU reference oracle"))
 
-    # HybridAttention's full-cover dense dispatch is deliberately unreachable in this
-    # windowed reduced case. Keep it as a fail-fast stub so the oracle cannot silently
-    # switch to a different attention implementation.
     attention_dispatch = types.ModuleType("diffusers.models.attention_dispatch")
     attention_dispatch.dispatch_attention_fn = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("dense diffusers dispatch must not run in windowed oracle"))
@@ -243,6 +234,8 @@ def test_complete_hybrid_attention_direct_official(official_hybrid):
     layout = VDNLayout(
         video_start=video_start,
         video_end=video_end,
+        audio_start=video_start,
+        audio_end=video_start,
         num_frames=frames,
         tokens_per_frame=tokens_per_frame,
         frame_size=(1, tokens_per_frame),
