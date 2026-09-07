@@ -2,16 +2,21 @@
 
 The MiniMax-H3 training hooks are deliberately fail-closed: every target projection
 must execute under an explicit ``TrainAudioScope``. PyTorch non-reentrant activation
-checkpointing can recompute a block later after the caller's ContextVar scope has
-unwound, so the recompute function explicitly re-enters the scope captured when the
-checkpoint was created.
+checkpointing recomputes a block later, after the diffusion-model wrapper that owns
+VDN's ContextVars has unwound. The recompute therefore has to restore the *complete*
+forward Context, not only the audio-fix scope. In particular, VDN's published layout
+and execution-local runtime state live in ContextVars too; losing the layout makes the
+attention wrapper silently take the native dense fallback and produces a different
+autograd graph on recompute.
 
 This module also exposes a lightweight tqdm reporter that counts actual H3 transformer
-block invocations. That makes long production-geometry rollouts/backward passes visible
-instead of leaving the terminal silent for minutes.
+block invocations. Phase transitions are written as durable log lines so a traceback
+still says where a long production-geometry run failed even after tqdm clears its
+transient work bar.
 """
 from __future__ import annotations
 
+import contextvars
 from dataclasses import dataclass
 
 from tqdm.auto import tqdm
@@ -26,6 +31,7 @@ class _StepProgress:
     total_steps: int
     train_index: int
     bar: object
+    phase: str | None = None
 
 
 class TrainingProgress:
@@ -77,7 +83,15 @@ class TrainingProgress:
     def phase(self, text: str):
         if self._current is None:
             return
-        self._current.bar.set_postfix_str(str(text), refresh=True)
+        text = str(text)
+        if self._current.phase == text:
+            return
+        self._current.phase = text
+        self._current.bar.set_postfix_str(text, refresh=True)
+        self.write(
+            f"[audio-fix step {self._current.step}/{self._current.total_steps}] "
+            f"{text} ({self._current.bar.n}/{self._current.bar.total} blocks)"
+        )
 
     def block_done(self):
         if self._current is not None:
@@ -91,6 +105,17 @@ class TrainingProgress:
             peak=f"{float(peak_gib):.1f}GiB",
             sec=f"{float(seconds):.1f}",
             refresh=True,
+        )
+
+    def fail(self, exc: BaseException):
+        if self._current is None:
+            self.write(f"[audio-fix] FAILED before step work: {type(exc).__name__}: {exc}")
+            return
+        phase = self._current.phase or "unknown phase"
+        self.write(
+            f"[audio-fix step {self._current.step}/{self._current.total_steps}] FAILED "
+            f"during {phase} at {self._current.bar.n}/{self._current.bar.total} blocks: "
+            f"{type(exc).__name__}: {exc}"
         )
 
     def close_work(self):
@@ -108,13 +133,21 @@ class TrainingProgress:
 
 def install_scope_safe_block_checkpointing(model, bank, progress=None,
                                             scope_getter=current_train_scope):
-    """Checkpoint H3 blocks while preserving the audio-fix scope on recompute.
+    """Checkpoint H3 blocks while restoring the complete forward Context on recompute.
 
-    The scope source is the authoritative ``vdn_h3.audio_fix_train`` ContextVar, not
-    an incidental attribute on whichever CLI module imported the training helpers.
-    ``scope_getter`` is injectable only for focused CPU tests.
+    The audio-fix scope is used to decide whether this block should be checkpointed,
+    but it is not the only state that must survive. MiniMax-H3 VDN also publishes its
+    packed layout and execution-local runtime lease through ContextVars owned by outer
+    ModelPatcher wrappers. Those wrappers are no longer on the Python stack when
+    backward asks checkpointing to recompute an individual block.
 
-    The returned ``(block, original_forward)`` list is compatible with
+    Capture ``contextvars.copy_context()`` at checkpoint creation and run both the
+    original forward and any later recomputation inside that captured Context. This
+    preserves the exact same VDN-vs-native branch selection and fail-closed audio-fix
+    scope without teaching this helper about every individual VDN ContextVar.
+
+    ``scope_getter`` remains injectable for focused CPU tests. The returned
+    ``(block, original_forward)`` list is compatible with
     ``audio_fix_train.restore_block_checkpointing``.
     """
     originals = []
@@ -124,24 +157,26 @@ def install_scope_safe_block_checkpointing(model, bank, progress=None,
         def wrapped(*args, _original=original, **kwargs):
             scope = scope_getter()
 
-            def run_scoped(*inner_args, **inner_kwargs):
-                # Count the actual block invocation, including checkpoint recomputation.
-                # Do it before the body so a failing block still leaves useful progress.
-                if progress is not None:
-                    progress.block_done()
-                if scope is None:
-                    return _original(*inner_args, **inner_kwargs)
-                with bank.scope(
-                    scope.audio_start,
-                    scope.audio_end,
-                    enabled=scope.enabled,
-                    checkpoint_blocks=scope.checkpoint_blocks,
-                ):
-                    return _original(*inner_args, **inner_kwargs)
-
             if (scope is not None and scope.enabled and scope.checkpoint_blocks):
-                return checkpoint(run_scoped, *args, use_reentrant=False, **kwargs)
-            return run_scoped(*args, **kwargs)
+                forward_context = contextvars.copy_context()
+
+                def run_captured(*inner_args, **inner_kwargs):
+                    # Count the actual block invocation, including checkpoint
+                    # recomputation. Do it before the body so a failing block still
+                    # leaves useful progress.
+                    if progress is not None:
+                        progress.block_done()
+                    return forward_context.run(
+                        _original, *inner_args, **inner_kwargs
+                    )
+
+                return checkpoint(
+                    run_captured, *args, use_reentrant=False, **kwargs
+                )
+
+            if progress is not None:
+                progress.block_done()
+            return _original(*args, **kwargs)
 
         block.forward = wrapped
         originals.append((block, original))
