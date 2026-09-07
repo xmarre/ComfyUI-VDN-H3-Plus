@@ -49,6 +49,25 @@ def _effective(pair):
     return b.float() @ a.float() * float(scale)
 
 
+def test_audio_fix_bank_does_not_register_or_serialize_frozen_h3():
+    model = _DummyModel()
+    bank = TrainableAudioFixBank(model, rank=2, alpha=2)
+
+    assert bank.model is model
+    assert "model" not in dict(bank.named_children())
+    model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+    bank_parameter_ids = {id(parameter) for parameter in bank.parameters()}
+    assert bank_parameter_ids
+    assert bank_parameter_ids.isdisjoint(model_parameter_ids)
+    assert bank.parameter_count == sum(
+        parameter.numel() for pair in bank.pairs for parameter in pair.parameters()
+    )
+    state = bank.state_dict()
+    assert state
+    assert all(key.startswith("pairs.") for key in state)
+    assert not any(key.startswith("model.") for key in state)
+
+
 def test_audio_fix_export_roundtrips_through_runtime_converter_exactly():
     torch.manual_seed(7)
     model = _DummyModel()
@@ -65,6 +84,7 @@ def test_audio_fix_export_roundtrips_through_runtime_converter_exactly():
     state, cfg = bank.export_peft(dtype=torch.float32)
     converted = convert_adapter(state, {"config": cfg})
 
+    assert cfg["source_stack"] == "comfy_int8_convrot_vdn_stage_b_turbo"
     for path, train_pair in zip(bank.targets, bank.pairs):
         expected = train_pair.lora_B @ train_pair.lora_A * train_pair.scale
         actual = _effective(converted[path])
