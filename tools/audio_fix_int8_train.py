@@ -4,7 +4,13 @@
 No H3 or text-encoder weights are downloaded by this program. Prompt embeddings must
 first be cached with ``tools/audio_fix_cache_prompts.py`` using the existing Comfy text
 encoder. The frozen teacher is the same quantized H3 base without VDN/adapters; the
-student is VDN + Stage-B 1.0 + Turbo 1.0 plus the trainable audio-only sidecar.
+student is VDN + configurable Stage-B/Turbo strengths plus the trainable audio-only
+sidecar.
+
+The current training rollout deliberately uses exact H3 evaluations at every selected
+10-step RES location. It does not emulate Spectrum forecasts or Progressive/Continuum
+phase boundaries; checkpoints record that rollout profile explicitly so it cannot be
+mistaken for an exact full-workflow trajectory match.
 """
 from __future__ import annotations
 
@@ -45,6 +51,7 @@ import comfy.samplers  # noqa: E402
 import comfy.sd  # noqa: E402
 from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree  # noqa: E402
 
+from vdn_h3.audio_fix_model_options import build_student_transformer_options  # noqa: E402
 from vdn_h3.audio_fix_train import (  # noqa: E402
     TrainableAudioFixBank,
     comfy_quant_training_mode,
@@ -62,6 +69,7 @@ VIDEO_CHANNELS = 24
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 AUDIO_SCALE = VIDEO_SHIFT / AUDIO_SHIFT
+ROLLOUT_PROFILE = "exact_res_all_actual_no_spectrum_or_progressive_handoff"
 
 
 def _resolve_base(path):
@@ -185,14 +193,17 @@ def _student_role(student, device):
         student.unpatch_model(device_to=device, unpatch_weights=False)
 
 
-def _model_output(dm, video, audio, sigma, context, tags, sigmas):
+def _model_output(dm, video, audio, sigma, context, tags, sigmas,
+                  transformer_options=None):
     timestep = torch.as_tensor([float(sigma) * 1000.0], device=video.device,
                                dtype=torch.float32)
-    transformer_options = {
-        "minimax_h3_sigma_shift_video": VIDEO_SHIFT,
-        "minimax_h3_sigma_shift_audio": AUDIO_SHIFT,
-        "sample_sigmas": sigmas,
-    }
+    if transformer_options is None:
+        # Dense teacher path: deliberately no VDN/adapter ModelPatcher wrappers.
+        transformer_options = {
+            "minimax_h3_sigma_shift_video": VIDEO_SHIFT,
+            "minimax_h3_sigma_shift_audio": AUDIO_SHIFT,
+            "sample_sigmas": sigmas,
+        }
     payload = {
         "audio_scale": AUDIO_SCALE,
         "text_token_tags": tags,
@@ -213,14 +224,15 @@ def _x0(video, audio, out_v, out_a, sigma):
 
 
 def _rollout_student(student, bank, video, audio, upto, context, tags, sigmas,
-                     audio_span, device):
+                     audio_span, device, transformer_options):
     old_v = old_a = old_down = old_sigma = None
     with torch.no_grad(), _student_role(student, device), bank.scope(
             *audio_span, enabled=True, checkpoint_blocks=False):
         dm = student.get_model_object("diffusion_model")
         for index in range(upto):
             out_v, out_a = _model_output(
-                dm, video, audio, sigmas[index], context, tags, sigmas)
+                dm, video, audio, sigmas[index], context, tags, sigmas,
+                transformer_options=transformer_options)
             den_v, den_a = _x0(video, audio, out_v, out_a, sigmas[index])
             next_v = res_multistep_update(
                 video, den_v, sigmas[index], sigmas[index + 1],
@@ -244,16 +256,17 @@ def _teacher_target(base_dm, bank, video, audio, index, context, tags, sigmas):
 
 
 def _frozen_student_target(student, bank, video, audio, index, context, tags, sigmas,
-                           device):
+                           device, transformer_options):
     with torch.no_grad(), _student_role(student, device), bank.disabled():
         dm = student.get_model_object("diffusion_model")
         out_v, out_a = _model_output(
-            dm, video, audio, sigmas[index], context, tags, sigmas)
+            dm, video, audio, sigmas[index], context, tags, sigmas,
+            transformer_options=transformer_options)
         return tuple(x.detach() for x in _x0(video, audio, out_v, out_a, sigmas[index]))
 
 
 def _save_adapter(output_root, step, bank, base_path, vdn_checkpoint, latent_shape,
-                  audio_t):
+                  audio_t, *, stage_b_strength, turbo_strength, global_gate_mode):
     path = os.path.join(output_root, f"audio_fix_step_{step:06d}")
     if os.path.exists(path):
         shutil.rmtree(path)
@@ -268,6 +281,16 @@ def _save_adapter(output_root, step, bank, base_path, vdn_checkpoint, latent_sha
             "sampler_steps": 10,
             "video_shift": VIDEO_SHIFT,
             "audio_shift": AUDIO_SHIFT,
+            "stage_b_strength": float(stage_b_strength),
+            "turbo_strength": float(turbo_strength),
+            "global_gate_mode": global_gate_mode,
+            "audio_adapter_strength": 1.0,
+            "conditioning_adapter_strength": 1.0,
+            "audio_video_context_strength": 1.0,
+            "conditioning_video_context_strength": 1.0,
+            "rollout_profile": ROLLOUT_PROFILE,
+            "spectrum_forecasting_emulated": False,
+            "progressive_handoff_emulated": False,
             "video_latent_shape": list(latent_shape),
             "audio_latent_frames": int(audio_t),
             "teacher": "same production INT8/ConvRot H3 with VDN/adapters disabled",
@@ -295,6 +318,13 @@ def main():
                         help="7-second H3 chunk -> 292 audio latent frames")
     parser.add_argument("--train-steps", type=int, default=250)
     parser.add_argument("--sampler-steps", type=int, default=10)
+    parser.add_argument("--stage-b-strength", type=float, default=1.0)
+    parser.add_argument("--turbo-strength", type=float, default=0.75)
+    parser.add_argument(
+        "--global-gate-mode",
+        choices=("checkpoint", "video_only"),
+        default="video_only",
+    )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--alpha", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
@@ -315,6 +345,10 @@ def main():
         raise SystemExit("latent height/width must be >= 2")
     if args.latent_height % 2 or args.latent_width % 2:
         raise SystemExit("MiniMax H3 latent height/width must be even")
+    if not 0.0 <= args.stage_b_strength <= 2.0:
+        raise SystemExit("--stage-b-strength must be in [0, 2]")
+    if not 0.0 < args.turbo_strength <= 2.0:
+        raise SystemExit("--turbo-strength must be in (0, 2]; Turbo-off is not this training path")
     if args.save_every < 1:
         raise SystemExit("--save-every must be >= 1")
 
@@ -341,12 +375,13 @@ def main():
     for parameter in base_dm.parameters():
         parameter.requires_grad_(False)
 
-    # Build the exact released student path in bypass mode. No audio_fix is read from
-    # the VDN stage during training; the new bank below is the only trainable adapter.
+    # Build the selected released VDN/Turbo student profile in bypass mode. No
+    # audio_fix is read from the VDN stage during training; the new bank below is the
+    # only trainable adapter.
     student = _apply_vdn_audio_safe(
         base,
         args.vdn_checkpoint,
-        {"default": 1.0, "turbo": 1.0},
+        {"default": args.stage_b_strength, "turbo": args.turbo_strength},
         "stream",
         "grouped",
         True,
@@ -357,7 +392,7 @@ def main():
         audio_fix_strength=0.0,
         apply_turbo_adapter=True,
         retain_buffers="off",
-        global_gate_mode="checkpoint",
+        global_gate_mode=args.global_gate_mode,
         adapter_ablation="none",
         fast_kernels=False,
     )[0]
@@ -382,19 +417,43 @@ def main():
     if sigmas.numel() != 11 or float(sigmas[-1]) != 0.0:
         raise RuntimeError(f"Unexpected production simple sigma table: {sigmas.tolist()}")
 
+    # Direct H3 calls do not pass through Comfy's normal prepare_model_patcher path.
+    # Merge the student's ModelPatcher wrappers explicitly and fail closed if either
+    # VDN layout ownership or generated-audio adapter scoping is missing.
+    student_transformer_options = build_student_transformer_options(
+        student,
+        sigmas,
+        video_shift=VIDEO_SHIFT,
+        audio_shift=AUDIO_SHIFT,
+    )
+
     latent_shape = (
         1, VIDEO_CHANNELS, args.video_latent_frames,
         args.latent_height, args.latent_width,
     )
     early = {0, 1, 2, 4, 8, 16, 32}
+    profile = {
+        "stage_b_strength": args.stage_b_strength,
+        "turbo_strength": args.turbo_strength,
+        "global_gate_mode": args.global_gate_mode,
+        "sampler": "res_multistep",
+        "sampler_steps": args.sampler_steps,
+        "rollout_profile": ROLLOUT_PROFILE,
+    }
+    print("audio-fix training profile: " + json.dumps(profile, sort_keys=True), flush=True)
 
     try:
         with comfy_quant_training_mode():
             if step == 0 and (args.smoke or 0 in early):
                 if hasattr(optimizer, "eval"):
                     optimizer.eval()
-                _save_adapter(output_root, 0, bank, base_path, args.vdn_checkpoint,
-                              latent_shape, args.audio_latent_frames)
+                _save_adapter(
+                    output_root, 0, bank, base_path, args.vdn_checkpoint,
+                    latent_shape, args.audio_latent_frames,
+                    stage_b_strength=args.stage_b_strength,
+                    turbo_strength=args.turbo_strength,
+                    global_gate_mode=args.global_gate_mode,
+                )
                 if hasattr(optimizer, "train"):
                     optimizer.train()
 
@@ -405,7 +464,9 @@ def main():
                 audio_span = generated_audio_span(
                     context.shape[1], args.video_latent_frames,
                     args.latent_height, args.latent_width, args.audio_latent_frames)
-                # Uniformly train every actual model-call location in the 10-NFE grid.
+                # Uniformly train every exact model-call location in the 10-NFE grid.
+                # Spectrum/progressive phase topology is deliberately not represented
+                # by this rollout profile and is validated separately before full training.
                 train_index = random.Random(args.seed + step * 1000003).randrange(args.sampler_steps)
                 video = torch.randn(latent_shape, generator=generator, device=device,
                                     dtype=torch.float32)
@@ -416,18 +477,20 @@ def main():
                 started = time.time()
                 video, audio = _rollout_student(
                     student, bank, video, audio, train_index, context, tags, sigmas,
-                    audio_span, device)
+                    audio_span, device, student_transformer_options)
                 teacher_v, teacher_a = _teacher_target(
                     base_dm, bank, video, audio, train_index, context, tags, sigmas)
                 frozen_v, _frozen_a = _frozen_student_target(
-                    student, bank, video, audio, train_index, context, tags, sigmas, device)
+                    student, bank, video, audio, train_index, context, tags, sigmas,
+                    device, student_transformer_options)
 
                 optimizer.zero_grad(set_to_none=True)
                 with _student_role(student, device), bank.scope(
                         *audio_span, enabled=True, checkpoint_blocks=True):
                     dm = student.get_model_object("diffusion_model")
                     out_v, out_a = _model_output(
-                        dm, video, audio, sigmas[train_index], context, tags, sigmas)
+                        dm, video, audio, sigmas[train_index], context, tags, sigmas,
+                        transformer_options=student_transformer_options)
                     student_v, student_a = _x0(
                         video, audio, out_v, out_a, sigmas[train_index])
                     # Audio is carried at video_shift/audio_shift = 4. Compare native
@@ -470,6 +533,7 @@ def main():
                     "nonzero_grad_tensors": nonzero,
                     "seconds": elapsed,
                     "peak_gib": torch.cuda.max_memory_allocated(device) / (1 << 30),
+                    **profile,
                 }
                 print(json.dumps(row, ensure_ascii=False), flush=True)
                 with open(metrics_path, "a", encoding="utf-8") as handle:
@@ -482,7 +546,11 @@ def main():
                         optimizer.eval()
                     _save_adapter(
                         output_root, step, bank, base_path, args.vdn_checkpoint,
-                        latent_shape, args.audio_latent_frames)
+                        latent_shape, args.audio_latent_frames,
+                        stage_b_strength=args.stage_b_strength,
+                        turbo_strength=args.turbo_strength,
+                        global_gate_mode=args.global_gate_mode,
+                    )
                     if hasattr(optimizer, "train"):
                         optimizer.train()
                     _save_state(
