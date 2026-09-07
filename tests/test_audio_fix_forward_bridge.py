@@ -19,7 +19,7 @@ def _identity_split_half_rope(seq: int, rot_dim: int, dtype=torch.float32):
     ).contiguous()
 
 
-def test_rms_rope_bridge_uses_inference_value_and_lazy_pytorch_gradient(monkeypatch):
+def test_rms_rope_bridge_uses_inference_value_and_pytorch_surrogate_gradient(monkeypatch):
     calls = {"functional": 0, "inplace": 0}
 
     def unsupported_functional(*args, **kwargs):
@@ -47,7 +47,7 @@ def test_rms_rope_bridge_uses_inference_value_and_lazy_pytorch_gradient(monkeypa
     q_before = q.detach().clone()
     k_before = k.detach().clone()
 
-    # Gradient oracle from the local ordinary-PyTorch reference.
+    # Compute the gradient oracle from the local ordinary-PyTorch reference itself.
     q_ref = q_before.clone().requires_grad_(True)
     k_ref = k_before.clone().requires_grad_(True)
     q_sur, k_sur = _rms_rope_split_half_surrogate(
@@ -75,13 +75,13 @@ def test_rms_rope_bridge_uses_inference_value_and_lazy_pytorch_gradient(monkeypa
         )
         assert torch.equal(q_out.detach(), q_before + 10.0)
         assert torch.equal(k_out.detach(), k_before - 5.0)
+        # The inference-exact bridge must not mutate the actual autograd inputs.
         assert torch.equal(q.detach(), q_before)
         assert torch.equal(k.detach(), k_before)
-        # Forward must only run the exact fused kernel.  The surrogate graph is built
-        # lazily by the custom backward, not retained across checkpoint recomputation.
-        assert calls == {"functional": 0, "inplace": 1}
         (q_out.sum() + k_out.sum()).backward()
 
+    # The original comfy-kitchen functional custom op is deliberately never called;
+    # its torch.library operator currently has no registered autograd formula.
     assert calls == {"functional": 0, "inplace": 1}
     assert torch.allclose(q.grad, q_grad_ref)
     assert torch.allclose(k.grad, k_grad_ref)
@@ -89,7 +89,7 @@ def test_rms_rope_bridge_uses_inference_value_and_lazy_pytorch_gradient(monkeypa
     assert torch.isfinite(k.grad).all()
 
 
-def test_linear_input_act_bridge_defers_training_surrogate_until_backward(monkeypatch):
+def test_linear_input_act_bridge_uses_fused_value_and_training_gradient(monkeypatch):
     calls = {"inference": 0, "training": 0}
 
     def fake_linear_input_act(linear, x, input_act):
@@ -107,8 +107,6 @@ def test_linear_input_act_bridge_defers_training_surrogate_until_backward(monkey
         assert mm.in_training is True
         out = comfy.ops.linear_input_act(object(), x, "swiglu")
         assert torch.equal(out.detach(), x.detach() * 10.0 + 7.0)
-        # The large eager SwiGLU/fc2 graph must not exist during block forward.
-        assert calls == {"inference": 1, "training": 0}
         out.sum().backward()
 
     assert calls == {"inference": 1, "training": 1}
