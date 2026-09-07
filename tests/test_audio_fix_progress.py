@@ -30,18 +30,30 @@ class _Bank:
 
 
 class _Block(nn.Module):
-    def __init__(self, bank, calls):
+    def __init__(self, bank, layout_var, calls):
         super().__init__()
         self.bank = bank
+        self.layout_var = layout_var
         self.calls = calls
 
     def forward(self, x):
         scope = self.bank.scope_var.get()
         if scope is None:
-            raise RuntimeError("missing scope")
-        self.calls.append((scope.audio_start, scope.audio_end, scope.checkpoint_blocks))
+            raise RuntimeError("missing audio-fix scope")
+        layout = self.layout_var.get()
+        if layout is None:
+            raise RuntimeError("missing VDN layout context")
+        self.calls.append((
+            scope.audio_start,
+            scope.audio_end,
+            scope.checkpoint_blocks,
+            layout,
+        ))
         # Nontrivial intermediates ensure checkpoint backward has work to recompute.
-        return torch.sin(x * x + 0.25) * x
+        # The extra layout-dependent branch mimics VDN choosing a different attention
+        # graph when its published layout disappears.
+        scale = 1.25 if layout == "production-layout" else 0.5
+        return torch.sin(x * x + scale) * x
 
 
 class _Progress:
@@ -52,10 +64,11 @@ class _Progress:
         self.blocks += 1
 
 
-def test_checkpoint_recompute_reenters_captured_audio_scope_after_outer_scope_exits():
+def test_checkpoint_recompute_restores_complete_forward_context_after_outer_wrappers_exit():
     bank = _Bank()
+    layout_var = contextvars.ContextVar("test_vdn_layout", default=None)
     calls = []
-    block = _Block(bank, calls)
+    block = _Block(bank, layout_var, calls)
     model = SimpleNamespace(blocks=[block])
     progress = _Progress()
 
@@ -67,18 +80,24 @@ def test_checkpoint_recompute_reenters_captured_audio_scope_after_outer_scope_ex
     )
 
     x = torch.randn(8, requires_grad=True)
-    with bank.scope(11, 19, enabled=True, checkpoint_blocks=True):
-        y = block(x)
+    layout_token = layout_var.set("production-layout")
+    try:
+        with bank.scope(11, 19, enabled=True, checkpoint_blocks=True):
+            y = block(x)
+    finally:
+        layout_var.reset(layout_token)
 
-    # Deliberately leave the caller's scope before backward. The checkpoint helper must
-    # restore the captured scope for recomputation instead of weakening fail-closed hooks.
+    # Deliberately leave *both* outer ContextVar owners before backward. This models
+    # the real trainer: the diffusion-model layout wrapper and audio-fix scope have
+    # unwound before a checkpointed block is recomputed.
     assert bank.scope_var.get() is None
+    assert layout_var.get() is None
     y.sum().backward()
 
     assert x.grad is not None
     assert torch.isfinite(x.grad).all()
     assert len(calls) >= 2
-    assert all(call == (11, 19, True) for call in calls)
+    assert all(call == (11, 19, True, "production-layout") for call in calls)
     # One forward invocation plus at least one checkpoint recomputation invocation.
     assert progress.blocks >= 2
 
