@@ -56,13 +56,10 @@ def test_minimax_audio_training_geometry_is_stereo_and_matches_packed_layout():
     rows = pack_audio(latent)
     assert rows.shape == (2 * audio_t, 32)
 
-    layout = PackedLayout(
-        text_len=8,
-        video_t=8,
-        latent_h=8,
-        latent_w=8,
-        audio_t=audio_t,
-    )
+    # Keep this positional so the regression remains tied to PackedLayout's semantic
+    # argument order rather than to a parameter-name spelling that changed during
+    # MiniMax-H3 development: (text_len, latent_t, latent_h, latent_w, audio_t).
+    layout = PackedLayout(8, 8, 8, 8, audio_t)
     aa, ab, _ = next(seg for seg in layout.segments if seg[2] == "audio")
     assert ab - aa == rows.shape[0] == 2 * audio_t
 
