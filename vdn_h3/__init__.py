@@ -41,7 +41,10 @@ def _ensure_comfy_importable() -> None:
 
 
 _ensure_comfy_importable()
-del _ensure_comfy_importable, _standalone_comfy_root
+# Keep _standalone_comfy_root bound: _ensure_comfy_importable references it as a
+# module global, and deleting it confuses static lifetime analysis even though the
+# bootstrap call above has already completed.
+del _ensure_comfy_importable
 
 from .runtime_introspection import (  # noqa: E402
     install_runtime_introspection_bridge as _install_runtime_introspection_bridge,
