@@ -1,4 +1,6 @@
-from vdn_h3.direct_gpu_load import _must_stay_cpu
+import inspect
+
+from vdn_h3.direct_gpu_load import _must_stay_cpu, load_diffusion_model_direct_gpu
 
 
 def test_quantization_metadata_stays_on_cpu():
@@ -25,3 +27,9 @@ def test_model_weights_and_quant_scales_remain_gpu_candidates():
         "visual.blocks.0.attn.qkv.weight",
     ):
         assert not _must_stay_cpu(key)
+
+
+def test_diffusion_loader_can_replace_comfy_public_loader_call_shape():
+    signature = inspect.signature(load_diffusion_model_direct_gpu)
+    assert "path" in signature.parameters
+    assert "model_options" in signature.parameters
