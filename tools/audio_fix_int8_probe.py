@@ -54,6 +54,7 @@ from vdn_h3.audio_node import _apply_vdn_audio_safe  # noqa: E402
 
 VIDEO_CHANNELS = 24
 AUDIO_CHANNELS = 32
+AUDIO_STREAMS = 2
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 AUDIO_SCALE = VIDEO_SHIFT / AUDIO_SHIFT
@@ -186,10 +187,12 @@ def _full_stack_probe(base, base_dm, device, args):
         device=device,
         dtype=torch.float32,
     )
+    # MiniMax-H3 audio latents are stereo: [B, 32, 2, T]. PackedLayout reserves
+    # 2*T target-audio rows, so a mono [B, 32, 1, T] probe cannot represent H3 geometry.
     audio = torch.randn(
         1,
         AUDIO_CHANNELS,
-        1,
+        AUDIO_STREAMS,
         args.full_stack_audio_frames,
         generator=generator,
         device=device,
