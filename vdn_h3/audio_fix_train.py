@@ -15,6 +15,7 @@ import contextvars
 import json
 import math
 import os
+import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -74,11 +75,16 @@ def _logical_features(module, path):
     return in_features, out_features
 
 
-def _quant_params(weight):
-    params = getattr(weight, "_params", None)
-    if params is None and hasattr(weight, "data"):
-        params = getattr(weight.data, "_params", None)
-    return params
+def _quant_parts(weight):
+    candidates = (weight, getattr(weight, "data", None))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        params = getattr(candidate, "_params", None)
+        qdata = getattr(candidate, "_qdata", None)
+        if params is not None:
+            return params, qdata
+    return None, None
 
 
 def validate_production_quant_targets(model, num_blocks: int = 50) -> tuple[str, ...]:
@@ -93,16 +99,12 @@ def validate_production_quant_targets(model, num_blocks: int = 50) -> tuple[str,
     for path in targets:
         module = _get_submodule(model, path)
         _logical_features(module, path)
-        weight = getattr(module, "weight", None)
-        params = _quant_params(weight)
+        params, qdata = _quant_parts(getattr(module, "weight", None))
         if params is None:
             failures.append(f"{path}: weight is not a Comfy QuantizedTensor")
             continue
         if not bool(getattr(params, "convrot", False)):
             failures.append(f"{path}: quantized weight is not ConvRot")
-        qdata = getattr(weight, "_qdata", None)
-        if qdata is None and hasattr(weight, "data"):
-            qdata = getattr(weight.data, "_qdata", None)
         if qdata is not None and getattr(qdata, "dtype", None) != torch.int8:
             failures.append(f"{path}: expected INT8 storage, got {qdata.dtype}")
     if failures:
@@ -152,6 +154,7 @@ class TrainableAudioFixBank(nn.Module):
         super().__init__()
         if int(rank) < 1 or float(alpha) <= 0:
             raise ValueError("audio-fix rank/alpha must be positive")
+        self.model = model
         self.rank = int(rank)
         self.alpha = float(alpha)
         self.targets = tuple(targets or expected_comfy_targets(len(model.blocks)))
@@ -188,13 +191,6 @@ class TrainableAudioFixBank(nn.Module):
         finally:
             _SCOPE.reset(token)
 
-    @staticmethod
-    def _slice_rows(x, start, end):
-        row_dim = 1 if x.ndim == 3 else 0
-        sl = [slice(None)] * x.ndim
-        sl[row_dim] = slice(start, end)
-        return tuple(sl), row_dim
-
     def _hook(self, pair, path):
         def hook(_module, inputs, output):
             scope = _SCOPE.get()
@@ -212,14 +208,18 @@ class TrainableAudioFixBank(nn.Module):
                 raise RuntimeError(
                     f"audio-fix target {path} expected rank-2/3 packed rows, got "
                     f"input {tuple(x.shape)} output {tuple(output.shape)}")
-            sl, row_dim = self._slice_rows(x, scope.audio_start, scope.audio_end)
+            row_dim = 1 if x.ndim == 3 else 0
             if scope.audio_end > x.shape[row_dim]:
                 raise RuntimeError(
                     f"audio-fix span [{scope.audio_start},{scope.audio_end}) exceeds "
                     f"{x.shape[row_dim]} packed rows at {path}")
             if scope.audio_start == scope.audio_end:
                 return output
-            delta = pair(x[sl]).to(dtype=output.dtype)
+            if row_dim == 0:
+                xa = x[scope.audio_start:scope.audio_end]
+            else:
+                xa = x[:, scope.audio_start:scope.audio_end]
+            delta = pair(xa).to(dtype=output.dtype)
             # Training cannot use the inference runtime's in-place output-slice update:
             # downstream autograd/checkpoint recomputation needs a functional graph.
             if row_dim == 0:
@@ -235,9 +235,10 @@ class TrainableAudioFixBank(nn.Module):
             ), dim=1)
         return hook
 
-    def install(self, model):
+    def install(self, model=None):
         if self._handles:
             raise RuntimeError("audio-fix training hooks already installed")
+        model = self.model if model is None else model
         for path, pair in zip(self.targets, self.pairs):
             self._handles.append(
                 _get_submodule(model, path).register_forward_hook(self._hook(pair, path)))
@@ -255,15 +256,14 @@ class TrainableAudioFixBank(nn.Module):
         for path, pair in zip(self.targets, self.pairs):
             a = pair.lora_A.detach().to(device="cpu", dtype=dtype).contiguous()
             b = pair.lora_B.detach().to(device="cpu", dtype=dtype).contiguous()
-            root = path.split(".", 2)
-            block = int(root[1])
+            block = int(path.split(".", 2)[1])
             source_root = f"transformer_blocks.{block}"
             if path.endswith(".attn.qkv_proj"):
                 if b.shape[0] % 3:
                     raise RuntimeError(f"fused QKV output is not divisible by three: {path}")
                 q, k, v = b.chunk(3, dim=0)
                 for suffix, part in (("to_q", q), ("to_k", k), ("to_v", v)):
-                    source = source_root + f".attn.to_{suffix[-1]}"
+                    source = source_root + f".attn.{suffix}"
                     targets.append(source)
                     state[f"{source}.lora_A.audio_fix.weight"] = a.clone()
                     state[f"{source}.lora_B.audio_fix.weight"] = part.contiguous()
@@ -298,6 +298,10 @@ class TrainableAudioFixBank(nn.Module):
         }
         return state, config
 
+    def save_adapter(self, out_dir, *, step, metadata=None, dtype=torch.float32):
+        return save_standalone_adapter(
+            self, out_dir, step=step, metadata=metadata, dtype=dtype)
+
 
 def save_standalone_adapter(bank, out_dir, *, step, metadata=None, dtype=torch.float32):
     """Write only the tiny correction adapter; never duplicate the frozen H3/VDN stage."""
@@ -305,7 +309,6 @@ def save_standalone_adapter(bank, out_dir, *, step, metadata=None, dtype=torch.f
         raise FileExistsError(out_dir)
     tmp = out_dir.rstrip("/") + ".tmp"
     if os.path.exists(tmp):
-        import shutil
         shutil.rmtree(tmp)
     os.makedirs(tmp)
     try:
@@ -321,26 +324,43 @@ def save_standalone_adapter(bank, out_dir, *, step, metadata=None, dtype=torch.f
             fh.write("\n")
         os.replace(tmp, out_dir)
     except Exception:
-        import shutil
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     return out_dir
 
 
-@contextmanager
-def comfy_quant_training_mode():
-    """Enable Comfy's differentiable quantized-linear path and restore global state."""
-    import comfy.model_management as mm
+def _phi1(z):
+    return torch.expm1(z) / z
 
-    old_training = mm.in_training
-    old_fp8_bwd = mm.training_fp8_bwd
-    mm.in_training = True
-    mm.training_fp8_bwd = False
-    try:
-        yield
-    finally:
-        mm.in_training = old_training
-        mm.training_fp8_bwd = old_fp8_bwd
+
+def _phi2(z):
+    return (_phi1(z) - 1.0) / z
+
+
+def res_multistep_update(sample, denoised, sigma, sigma_next, *,
+                         previous_denoised=None, previous_sigma_down=None,
+                         previous_sigma=None):
+    """Deterministic eta=0 Comfy RES-multistep interval used by production H3."""
+    sigma = torch.as_tensor(sigma, dtype=sample.dtype, device=sample.device)
+    sigma_next = torch.as_tensor(sigma_next, dtype=sample.dtype, device=sample.device)
+    if previous_denoised is None or float(sigma_next) == 0.0:
+        return sample + ((sample - denoised) / sigma) * (sigma_next - sigma)
+    if previous_sigma_down is None or previous_sigma is None:
+        raise ValueError("second-order RES update needs previous sigma history")
+    old_down = torch.as_tensor(
+        previous_sigma_down, dtype=sample.dtype, device=sample.device)
+    old_sigma = torch.as_tensor(
+        previous_sigma, dtype=sample.dtype, device=sample.device)
+    t = -torch.log(sigma)
+    t_old = -torch.log(old_down)
+    t_next = -torch.log(sigma_next)
+    t_prev = -torch.log(old_sigma)
+    h = t_next - t
+    c2 = (t_prev - t_old) / h
+    z = -h
+    b2 = torch.nan_to_num(_phi2(z) / c2, nan=0.0)
+    b1 = torch.nan_to_num(_phi1(z) - b2, nan=0.0)
+    return torch.exp(-h) * sample + h * (b1 * denoised + b2 * previous_denoised)
 
 
 def differentiable_run_scans(backend, alpha, a_raw, b_raw, text_state=None):
@@ -383,7 +403,24 @@ def differentiable_vdn_runtime():
         retained.run_scans_runtime = previous
 
 
-def install_block_checkpointing(model):
+@contextmanager
+def comfy_quant_training_mode():
+    """Enable Comfy's quantized autograd plus the differentiable VDN recurrence."""
+    import comfy.model_management as mm
+
+    old_training = mm.in_training
+    old_fp8_bwd = mm.training_fp8_bwd
+    mm.in_training = True
+    mm.training_fp8_bwd = False
+    try:
+        with differentiable_vdn_runtime():
+            yield
+    finally:
+        mm.in_training = old_training
+        mm.training_fp8_bwd = old_fp8_bwd
+
+
+def install_block_checkpointing(model, _bank=None):
     """Checkpoint H3 blocks only during the graph-building audio-fix student forward."""
     originals = []
     for block in model.blocks:
@@ -398,12 +435,12 @@ def install_block_checkpointing(model):
 
         block.forward = wrapped
         originals.append((block, original))
+    return originals
 
-    def restore():
-        for block, original in originals:
-            block.forward = original
 
-    return restore
+def restore_block_checkpointing(originals):
+    for block, original in originals:
+        block.forward = original
 
 
 __all__ = [
@@ -415,6 +452,8 @@ __all__ = [
     "expected_comfy_targets",
     "generated_audio_span",
     "install_block_checkpointing",
+    "res_multistep_update",
+    "restore_block_checkpointing",
     "save_standalone_adapter",
     "validate_production_quant_targets",
 ]
