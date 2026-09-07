@@ -24,6 +24,16 @@ training = [
   "prodigy-plus-schedule-free==2.0.1",
 ]
 
+# This repository is a flat-layout ComfyUI custom node and also contains non-Python
+# top-level directories (web/assets/example_workflows).  Setuptools' automatic flat
+# discovery rejects that layout, which made `pip install -e '.[training]'` fail before
+# it could install the optional trainer dependency.  Only vdn_h3 is an installable
+# Python package; the custom-node checkout itself continues to own the root __init__.py
+# and frontend/assets in place.
+[tool.setuptools.packages.find]
+include = ["vdn_h3*"]
+exclude = ["tests*", "tools*", "web*", "assets*", "example_workflows*"]
+
 [project.urls]
 Repository = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus"
 Issues = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus/issues"
