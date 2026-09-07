@@ -321,11 +321,11 @@ def main():
     parser.add_argument("--train-steps", type=int, default=250)
     parser.add_argument("--sampler-steps", type=int, default=10)
     parser.add_argument("--stage-b-strength", type=float, default=1.0)
-    parser.add_argument("--turbo-strength", type=float, default=0.75)
+    parser.add_argument("--turbo-strength", type=float, default=1.0)
     parser.add_argument(
         "--global-gate-mode",
         choices=("checkpoint", "video_only"),
-        default="video_only",
+        default="checkpoint",
     )
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--alpha", type=int, default=32)
