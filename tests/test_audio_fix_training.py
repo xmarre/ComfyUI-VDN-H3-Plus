@@ -25,11 +25,17 @@ class _DummyAttn(nn.Module):
         self.head_dim = hidden
 
 
+class _DummyMLP(nn.Module):
+    def __init__(self, hidden=4):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, hidden * 2, bias=False)
+
+
 class _DummyBlock(nn.Module):
     def __init__(self, hidden=4):
         super().__init__()
         self.attn = _DummyAttn(hidden)
-        self.mlp = SimpleNamespace(fc1=nn.Linear(hidden, hidden * 2, bias=False))
+        self.mlp = _DummyMLP(hidden)
 
 
 class _DummyModel(nn.Module):
@@ -102,21 +108,24 @@ def test_grouped_window_reference_keeps_gradients(monkeypatch):
 
 class _IdentityDeltaBackend:
     def factor_apply(self, alpha, a_raw, b_raw):
-        dim = a_raw.shape[-1]
-        eye = torch.eye(dim, device=a_raw.device, dtype=a_raw.dtype)
+        del a_raw
+        dim = b_raw.shape[-1]
+        eye = torch.eye(dim, device=b_raw.device, dtype=b_raw.dtype)
         transition = alpha.unsqueeze(-1) * eye
         return transition, b_raw
 
 
 def test_differentiable_vdn_scan_propagates_gradients():
-    alpha = torch.sigmoid(torch.randn(3, 1, 2, requires_grad=True))
+    alpha_source = torch.randn(3, 1, 2, requires_grad=True)
+    alpha = torch.sigmoid(alpha_source)
     a = torch.randn(3, 1, 2, 2, requires_grad=True)
     b = torch.randn(3, 1, 2, 2, requires_grad=True)
     prefix, suffix = differentiable_run_scans(_IdentityDeltaBackend(), alpha, a, b)
     (prefix.square().mean() + suffix.square().mean()).backward()
     # This test backend intentionally ignores A; alpha and B are the recurrent inputs.
-    assert alpha.grad is None  # alpha is non-leaf; its source is tested below.
+    assert alpha_source.grad is not None and torch.count_nonzero(alpha_source.grad) > 0
     assert b.grad is not None and torch.count_nonzero(b.grad) > 0
+    assert a.grad is None
 
 
 def test_vdn_main_rope_uses_functional_kernel_while_training(monkeypatch):
