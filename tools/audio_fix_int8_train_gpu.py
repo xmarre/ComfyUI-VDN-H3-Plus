@@ -10,14 +10,22 @@ training profile:
 - 8-step ``res_multistep`` / Comfy ``simple`` sigma grid;
 - 52 video latent frames and 292 stereo audio latent frames.
 
-The released Turbo adapter is an 8-step adapter. A 10-step deployment run at reduced
+The released Turbo adapter is an 8-step adapter.  A 10-step deployment run at reduced
 Turbo strength is a separate transfer/quality operating point and must not be used as
 the canonical Turbo-1.0 training rollout.
 
 Loading/runtime policy is specialized for a workstation with substantially more VRAM
-than host RAM. The trainer also reports live setup/phase progress and counts actual H3
-transformer-block executions during rollout, teacher/frozen targets, train forward and
-checkpoint recomputation.
+than host RAM:
+
+- the 24+ GiB production H3 checkpoint is read straight into CUDA instead of first
+  materializing a full CPU state dictionary;
+- the VDN linear branch is forced to bounded streaming, preferring the released
+  INT8/ConvRot branch when present, so the ordinary resident-BF16 path cannot first
+  clone the complete branch into host RAM;
+- retained CUDA scratch/prefetch buffers stay enabled so one-block-ahead branch I/O
+  can overlap execution without turning host RAM into a model-weight cache.
+
+Normal ComfyUI node behavior is untouched.
 """
 from __future__ import annotations
 
@@ -28,6 +36,11 @@ import os
 import random
 import sys
 import time
+
+from vdn_h3.audio_fix_progress import (
+    TrainingProgress,
+    install_scope_safe_block_checkpointing,
+)
 
 
 CANONICAL_SAMPLER_STEPS = 8
@@ -97,21 +110,23 @@ def _save_adapter_8(impl, output_root, step, bank, base_path, vdn_checkpoint,
             "teacher": "same production INT8/ConvRot H3 with VDN/adapters disabled",
         },
     )
-    print(f"adapter checkpoint -> {path}", flush=True)
+    return path
 
 
 def main():
     impl = _load_impl()
-    from vdn_h3.audio_fix_progress import (
-        TrainingProgress,
-        install_scope_safe_block_checkpointing,
-    )
     from vdn_h3.direct_gpu_load import load_diffusion_model_direct_gpu
     import vdn_h3.policy as vdn_policy
 
     # Avoid Comfy's ordinary CPU-first state-dict staging for the production base.
     impl.comfy.sd.load_diffusion_model = load_diffusion_model_direct_gpu
 
+    # The ordinary resident VDN path intentionally materializes BF16 branch tensors as
+    # CPU Parameters before Comfy migrates them. That is correct for normal Comfy model
+    # management but wrong for this 96-GiB-VRAM / low-host-RAM standalone trainer.
+    # Keep branch weights bounded/streamed and prefer the checkpoint's native INT8
+    # representation. Retained CUDA scratch enables one-block lookahead without
+    # retaining checkpoint weights in host RAM.
     apply_vdn = impl._apply_vdn_audio_safe
 
     def apply_vdn_gpu_low_host_ram(model, vdn_checkpoint, strength, branch_weights,
@@ -283,7 +298,7 @@ def main():
         initial_step=step,
     )
     checkpoint_originals = install_scope_safe_block_checkpointing(
-        impl, base_dm, bank, progress=progress
+        base_dm, bank, progress=progress
     )
 
     try:
@@ -291,13 +306,14 @@ def main():
             if step == 0 and (args.smoke or 0 in early):
                 if hasattr(optimizer, "eval"):
                     optimizer.eval()
-                _save_adapter_8(
+                saved = _save_adapter_8(
                     impl, output_root, 0, bank, base_path, args.vdn_checkpoint,
                     latent_shape, args.audio_latent_frames,
                     stage_b_strength=args.stage_b_strength,
                     turbo_strength=args.turbo_strength,
                     global_gate_mode=args.global_gate_mode,
                 )
+                progress.write(f"adapter checkpoint -> {saved}")
                 if hasattr(optimizer, "train"):
                     optimizer.train()
 
@@ -401,13 +417,14 @@ def main():
                     progress.phase("saving checkpoint")
                     if hasattr(optimizer, "eval"):
                         optimizer.eval()
-                    _save_adapter_8(
+                    saved = _save_adapter_8(
                         impl, output_root, step, bank, base_path,
                         args.vdn_checkpoint, latent_shape, args.audio_latent_frames,
                         stage_b_strength=args.stage_b_strength,
                         turbo_strength=args.turbo_strength,
                         global_gate_mode=args.global_gate_mode,
                     )
+                    progress.write(f"adapter checkpoint -> {saved}")
                     if hasattr(optimizer, "train"):
                         optimizer.train()
                     impl._save_state(
