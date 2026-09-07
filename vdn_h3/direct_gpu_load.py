@@ -72,17 +72,22 @@ def _load_safetensors_cuda(path: str, device: torch.device, *, metadata: bool):
     return (state, file_metadata) if metadata else state
 
 
-def load_diffusion_model_direct_gpu(path: str):
-    """Load a diffusion checkpoint without staging its weight state dict in host RAM."""
+def load_diffusion_model_direct_gpu(path: str, model_options=None):
+    """Load a diffusion checkpoint without staging its weight state dict in host RAM.
+
+    ``model_options`` mirrors Comfy's public ``load_diffusion_model`` call shape so
+    this helper can safely replace it inside the standalone trainer.  Caller options
+    are preserved, except that load/offload placement is deliberately pinned to CUDA.
+    """
     device = cuda_device()
     state, metadata = _load_safetensors_cuda(path, device, metadata=True)
+    options = dict(model_options or {})
+    options["load_device"] = device
+    options["offload_device"] = device
     try:
         model = comfy.sd.load_diffusion_model_state_dict(
             state,
-            model_options={
-                "load_device": device,
-                "offload_device": device,
-            },
+            model_options=options,
             metadata=metadata,
         )
     finally:
