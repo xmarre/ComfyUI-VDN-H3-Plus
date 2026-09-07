@@ -48,7 +48,22 @@ The passive drift trace then showed a broad released-stack trajectory difference
 
 The **next gate is exactly one optimizer step** at production geometry using the canonical training stack below.
 
-## 0. Install the training-only dependency
+## 0. GPU-resident loading requirement
+
+The standalone tools must not use Comfy's ordinary CPU-first checkpoint staging on a large-VRAM / limited-host-RAM workstation. Comfy's public `load_diffusion_model()` and `load_clip()` paths first materialize safetensors state dictionaries on CPU because `comfy.utils.load_torch_file()` defaults to `device=cpu` when no device is supplied.
+
+This repository therefore provides a training-tool-only direct-CUDA loader in `vdn_h3/direct_gpu_load.py`:
+
+- MiniMax-H3 diffusion state dict is read directly to CUDA;
+- MiniMax-H3 Qwen3-VL text-encoder state dict is read directly to CUDA;
+- load and offload devices are both pinned to the active CUDA device for these standalone processes;
+- the GPU trainer entrypoint changes VDN branch policy from the implementation's conservative forced `stream` mode to `auto`, allowing the existing VRAM-aware policy to keep the branch resident when it fits.
+
+Normal ComfyUI nodes are unchanged.
+
+Small CPU allocations still exist for prompt-cache files, checkpoint metadata, and serialized optimizer/train state. The large H3 and Qwen3-VL checkpoint weights are not intentionally staged in host RAM by the GPU-resident path.
+
+## 1. Install the training-only dependency
 
 The Comfy node itself has no mandatory Python dependencies. The standalone trainer additionally needs Prodigy-Plus:
 
@@ -59,7 +74,7 @@ python -m pip install -e '.[training]'
 
 The optional extra is pinned to `prodigy-plus-schedule-free==2.0.1`.
 
-## 1. Pull the validation branch
+## 2. Pull the validation branch
 
 ```bash
 cd /home/toor/ComfyUI/custom_nodes/ComfyUI-VDN-H3-Plus
@@ -76,7 +91,7 @@ git rev-parse HEAD
 
 Do not compare GPU results from different heads without recording that fact.
 
-## 2. Structural + gradient + forward-parity probe — completed
+## 3. Structural + gradient + forward-parity probe — completed
 
 The deployment-profile command is retained for reproducibility:
 
@@ -117,7 +132,7 @@ The trainer keeps the global training state required for differentiable H3/VDN e
 
 The production RMS/RoPE kernel runs only on detached clones and cannot mutate live autograd inputs. The fused INT8 `linear_input_act` value is likewise obtained under `no_grad`; its supported eager training path supplies the input gradient. Both patches are scoped to `comfy_quant_training_mode()` and restored even on exceptions.
 
-## 3. Passive Sol-H3 drift localization — completed
+## 4. Passive Sol-H3 drift localization — completed
 
 The deployment-profile trace is retained for reproducibility:
 
@@ -133,7 +148,7 @@ python tools/h3_prefix_drift_probe.py \
 
 The result does not identify one incorrect native-row operation to patch. Released adapter residuals alter prefix/audio/video branch computations from block 0, video residual drift accumulates first, and late audio divergence is additionally amplified after the transformer stack. This supports continuing the learned generated-audio correction rather than adding a destructive full-prefix clamp.
 
-## 4. Cache a small prompt set with the installed H3 text encoder
+## 5. Cache a small prompt set with the installed H3 text encoder
 
 Prepare a small JSONL or line-based prompt file that includes at minimum:
 
@@ -153,11 +168,11 @@ python tools/audio_fix_cache_prompts.py \
   --output-dir /home/toor/audio_fix_prompt_cache
 ```
 
-The cache stores the real `cond` tensor and `minimax_token_tags`; the trainer does not download another text encoder.
+`audio_fix_cache_prompts.py` now uses the direct-CUDA text-encoder loader. It does not use Comfy's ordinary CPU-first `load_clip()` path.
 
-For the current released workflow, the installed encoder filename is typically `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`; use the actual file loaded by the workflow rather than downloading a substitute.
+The cache stores the real `cond` tensor and `minimax_token_tags`; the trainer does not download another text encoder. For the current released workflow, the installed encoder filename is typically `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`; use the actual file loaded by the workflow rather than downloading a substitute.
 
-## 5. Run exactly one production-geometry optimizer step
+## 6. Run exactly one production-geometry optimizer step
 
 Use the target workflow's **video latent** height and width, not pixel dimensions. MiniMax-H3 video latents are spatially downscaled by 16, so a pixel geometry `W x H` corresponds to trainer arguments:
 
@@ -168,10 +183,10 @@ latent_height = H / 16
 
 Both resulting latent axes must be even because the H3 DiT patchifies them by `2 x 2`.
 
-Run the smoke at the canonical released stack:
+Use the GPU-resident entrypoint for the smoke:
 
 ```bash
-python tools/audio_fix_int8_train.py \
+python tools/audio_fix_int8_train_gpu.py \
   --comfy-root /home/toor/ComfyUI \
   --base-model MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-comfy-int8-convrot.safetensors \
   --vdn-checkpoint vdn-minimax-h3-int8-convrot-comfyui \
@@ -186,7 +201,7 @@ python tools/audio_fix_int8_train.py \
   --no-resume
 ```
 
-Those three profile flags match the command defaults and are shown explicitly so the training record is unambiguous.
+The underlying training graph is unchanged; only large-checkpoint placement and VDN branch residency policy differ from the implementation entrypoint. The three profile flags above match the canonical training defaults and are shown explicitly so the training record is unambiguous.
 
 The fixed production contract also enforces:
 
@@ -209,7 +224,9 @@ metrics.jsonl
 
 The step-1 metrics must show finite `loss`, `audio_teacher_loss`, `video_preserve_loss`, `grad_norm`, a positive `nonzero_grad_tensors`, and a sane `peak_gib` for the installed GPU.
 
-## 6. Do not start the 250-step run yet
+The VDN startup log must also be inspected. On a high-VRAM workstation the `auto` policy should normally select a resident branch if the policy's safety margin says it fits. If it chooses streamed INT8 instead, record that rather than forcing residency beyond the policy gate.
+
+## 7. Do not start the 250-step run yet
 
 The direct trainer is explicit about its rollout scope:
 
@@ -221,7 +238,7 @@ progressive_handoff_emulated = false
 
 The one-step adapter must first be exercised through the real deployment graph to prove that the learned correction survives Spectrum forecasting and Progressive/Continuum boundaries. The full 250-step run remains blocked until the Spectrum trajectory mismatch is resolved or deliberately justified with strong evidence.
 
-## 7. Deploy the step-1 adapter for matched A/B validation
+## 8. Deploy the step-1 adapter for matched A/B validation
 
 Copy only the exported adapter directory into the selected VDN stage as:
 
@@ -257,7 +274,7 @@ Only after canonical validation should the same checkpoint be transfer-tested at
 
 Do not set `audio_adapter_strength=0` for either trained-checkpoint test. That was a useful diagnostic/mitigation for the released checkpoint, but it removes part of the full adapter stack on top of which the correction is trained.
 
-## 8. Acceptance criteria before long training
+## 9. Acceptance criteria before long training
 
 Check decoded media, not just training loss:
 
