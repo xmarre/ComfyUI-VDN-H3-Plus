@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
+from comfy.ldm.minimax.model import PackedLayout, pack_audio
 from vdn_h3.adapters import convert_adapter
 from vdn_h3.audio_fix_train import (
     TrainableAudioFixBank,
@@ -47,6 +48,23 @@ class _DummyModel(nn.Module):
 def _effective(pair):
     a, b, scale = pair
     return b.float() @ a.float() * float(scale)
+
+
+def test_minimax_audio_training_geometry_is_stereo_and_matches_packed_layout():
+    audio_t = 32
+    latent = torch.randn(1, 32, 2, audio_t)
+    rows = pack_audio(latent)
+    assert rows.shape == (2 * audio_t, 32)
+
+    layout = PackedLayout(
+        text_len=8,
+        video_t=8,
+        latent_h=8,
+        latent_w=8,
+        audio_t=audio_t,
+    )
+    aa, ab, _ = next(seg for seg in layout.segments if seg[2] == "audio")
+    assert ab - aa == rows.shape[0] == 2 * audio_t
 
 
 def test_audio_fix_bank_does_not_register_or_serialize_frozen_h3():
