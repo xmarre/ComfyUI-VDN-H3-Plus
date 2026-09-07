@@ -7,12 +7,15 @@ mmap-backed CPU tensors.  That is a poor fit for machines with large VRAM but
 comparatively small host RAM.
 
 These helpers bypass Comfy's checkpoint reader for the large standalone safetensors
-files and read tensors with ``safetensors.safe_open(..., device="cuda")`` directly.
-Load and offload devices are then pinned to the same GPU for the lifetime of the
-standalone process.
+files and read the actual model tensors with ``safetensors.safe_open(...,
+device="cuda")`` directly.  Small byte-encoded control tensors that Comfy parses on
+CPU (notably ``*.comfy_quant`` and tokenizer payloads) are copied back to CPU before
+Comfy's state-dict loader sees them.  This preserves Comfy's quantized-checkpoint
+contract without staging the multi-gigabyte weight tensors in host RAM.
 
-This module is training-tool-only; normal ComfyUI nodes continue to use Comfy's own
-model-management policy.
+Load and offload devices are pinned to the same GPU for the lifetime of the standalone
+process.  This module is training-tool-only; normal ComfyUI nodes continue to use
+Comfy's own model-management policy.
 """
 from __future__ import annotations
 
@@ -25,6 +28,24 @@ import comfy.model_management
 import comfy.sd
 
 
+# These are opaque byte/config tensors, not model weights.  Current Comfy consumes
+# ``*.comfy_quant`` via ``tensor.numpy().tobytes()`` in ops.py, which requires CPU.
+# Tokenizer payloads are likewise host-side parser inputs.  Their combined size is
+# tiny compared with the model weights, so keeping them on CPU does not undermine the
+# GPU-resident loading policy.
+_CPU_CONTROL_BASENAMES = frozenset({
+    "tokenizer_json",
+    "spiece_model",
+    "tekken_model",
+    "gemma_spiece_model",
+})
+
+
+def _must_stay_cpu(key: str) -> bool:
+    basename = key.rsplit(".", 1)[-1]
+    return key.endswith(".comfy_quant") or basename in _CPU_CONTROL_BASENAMES
+
+
 def cuda_device() -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError("audio-fix direct-GPU tools require CUDA")
@@ -35,7 +56,7 @@ def cuda_device() -> torch.device:
 
 
 def _load_safetensors_cuda(path: str, device: torch.device, *, metadata: bool):
-    """Own a CUDA state dict without creating a full CPU/mmap checkpoint copy."""
+    """Own a mostly-CUDA state dict without creating a full CPU/mmap checkpoint copy."""
     if not path.lower().endswith((".safetensors", ".sft")):
         raise RuntimeError(
             f"direct-GPU loader only accepts safetensors checkpoints, got {path}")
@@ -43,13 +64,16 @@ def _load_safetensors_cuda(path: str, device: torch.device, *, metadata: bool):
     with torch.cuda.device(device):
         with safe_open(path, framework="pt", device="cuda") as handle:
             for key in handle.keys():
-                state[key] = handle.get_tensor(key)
+                tensor = handle.get_tensor(key)
+                if _must_stay_cpu(key):
+                    tensor = tensor.cpu()
+                state[key] = tensor
             file_metadata = handle.metadata() if metadata else None
     return (state, file_metadata) if metadata else state
 
 
 def load_diffusion_model_direct_gpu(path: str):
-    """Load a diffusion checkpoint without staging its state dict in host RAM."""
+    """Load a diffusion checkpoint without staging its weight state dict in host RAM."""
     device = cuda_device()
     state, metadata = _load_safetensors_cuda(path, device, metadata=True)
     try:
@@ -73,7 +97,7 @@ def load_diffusion_model_direct_gpu(path: str):
 
 
 def load_minimax_clip_direct_gpu(path: str):
-    """Load the MiniMax-H3 Qwen3-VL text encoder directly into CUDA memory."""
+    """Load the MiniMax-H3 Qwen3-VL text encoder weights directly into CUDA memory."""
     device = cuda_device()
     state = _load_safetensors_cuda(path, device, metadata=False)
     try:
