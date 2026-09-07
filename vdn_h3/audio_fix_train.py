@@ -16,6 +16,7 @@ import json
 import math
 import os
 import shutil
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -148,13 +149,16 @@ class AudioFixPair(nn.Module):
 
 
 class TrainableAudioFixBank(nn.Module):
-    """FP32 sidecar LoRAs attached to the frozen Comfy H3 module tree."""
+    """FP32 sidecar LoRAs attached to, but never owning, the frozen Comfy H3 tree."""
 
     def __init__(self, model, rank=32, alpha=32, targets=None):
         super().__init__()
         if int(rank) < 1 or float(alpha) <= 0:
             raise ValueError("audio-fix rank/alpha must be positive")
-        self.model = model
+        # Do not assign the frozen H3 as a normal nn.Module attribute. Doing so would
+        # register the 33B model as a child of the tiny sidecar, causing bank.to(),
+        # bank.parameters() and bank.state_dict() to traverse/serialize the base model.
+        object.__setattr__(self, "_model_ref", weakref.ref(model))
         self.rank = int(rank)
         self.alpha = float(alpha)
         self.targets = tuple(targets or expected_comfy_targets(len(model.blocks)))
@@ -166,6 +170,13 @@ class TrainableAudioFixBank(nn.Module):
             in_features, out_features = _logical_features(module, path)
             self.pairs.append(AudioFixPair(in_features, out_features, self.rank, self.alpha))
         self._handles = []
+
+    @property
+    def model(self):
+        model = self._model_ref()
+        if model is None:
+            raise RuntimeError("audio-fix frozen H3 model no longer exists")
+        return model
 
     @property
     def parameter_count(self):
@@ -294,7 +305,7 @@ class TrainableAudioFixBank(nn.Module):
             "exact_targets": True,
             "scope": "generated_audio",
             "target_policy": "portable_sequence_linear",
-            "source_stack": "comfy_int8_convrot_vdn_stage_b_turbo_unit",
+            "source_stack": "comfy_int8_convrot_vdn_stage_b_turbo",
         }
         return state, config
 
