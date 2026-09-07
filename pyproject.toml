@@ -19,6 +19,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+training = [
+  "prodigy-plus-schedule-free==2.0.1",
+]
+
 [project.urls]
 Repository = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus"
 Issues = "https://github.com/xmarre/ComfyUI-VDN-H3-Plus/issues"
