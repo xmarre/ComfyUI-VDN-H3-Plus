@@ -17,6 +17,37 @@ Progressive emulation no
 
 Turbo is required. A Turbo-off run is not an accepted production correction path. Turbo `0.75` is a deployment transfer/validation setting after canonical training, not a trainer default.
 
+## Current gate status
+
+Completed on the installed production INT8/ConvRot graph:
+
+- quantized input-gradient probe;
+- zero-init sidecar B-gradient probe and subsequent A-gradient probe;
+- dense-H3 training/inference forward parity;
+- finished VDN/Stage-B/Turbo training/inference forward parity;
+- passive Sol-H3 prefix/audio/video drift localization.
+
+The authoritative deployment-profile parity run produced exact forward equality:
+
+```text
+dense H3:
+video_rel_rms=0 video_max=0
+audio_rel_rms=0 audio_max=0
+
+VDN/Turbo student:
+video_rel_rms=0 video_max=0
+audio_rel_rms=0 audio_max=0
+
+student-vs-dense:
+video_max=1.86064 audio_max=1.87091
+```
+
+The nonzero student-vs-dense delta proves that exact parity was not obtained by accidentally bypassing the VDN/Turbo student.
+
+The passive drift trace then showed a broad released-stack trajectory difference rather than a hidden sparse-audio topology bug. Block 0 begins with identical hidden rows but immediately diverges in released QKV/attention/MLP computations; cumulative video drift appears first and later feeds prefix/audio through dense cross-stream attention. No native-prefix/native-attention production override is justified by that result. See `docs/SOL_H3_AUDIO_PREFIX_AUDIT.md`.
+
+The **next gate is exactly one optimizer step** at production geometry using the canonical training stack below.
+
 ## 0. Install the training-only dependency
 
 The Comfy node itself has no mandatory Python dependencies. The standalone trainer additionally needs Prodigy-Plus:
@@ -45,9 +76,9 @@ git rev-parse HEAD
 
 Do not compare GPU results from different heads without recording that fact.
 
-## 2. Run the structural + gradient + forward-parity probe
+## 2. Structural + gradient + forward-parity probe — completed
 
-Use the same installed base model and VDN stage as the production workflow:
+The deployment-profile command is retained for reproducibility:
 
 ```bash
 python tools/audio_fix_int8_probe.py \
@@ -61,22 +92,11 @@ python tools/audio_fix_int8_probe.py \
 
 This is deliberately a **deployment-profile parity probe**. It verifies that the inference-exact training bridge reproduces the installed deployment graph; the `0.75` / `video_only` values above do **not** define the canonical training profile.
 
-This must pass **all** of the following before training:
-
-1. the installed INT8/ConvRot qkv projection propagates a finite nonzero input gradient;
-2. the zero-initialized `audio_fix` sidecar is an exact forward no-op;
-3. its B matrix receives a finite first-step gradient while A remains zero at zero-init;
-4. after one tiny B update, A receives a finite nonzero gradient;
-5. dense H3 inference and autograd-safe training execution remain within the hard relative-RMS parity limit;
-6. the direct MiniMax-H3 call can see the required `vdn_h3` and `vdn_h3_audio_adapter_scope` ModelPatcher wrappers;
-7. the VDN/Stage-B/Turbo inference and autograd-safe training executions remain within the same hard parity limit;
-8. the direct VDN/Stage-B/Turbo student produces finite output and is not bit-identical to the wrapper-free dense H3 call.
-
-Failure of any item is a hard stop. Do not work around it by starting training anyway, and do not raise `--max-training-parity-rel-rms` merely to pass the probe. The default `0.02` gate is deliberate.
+The hard relative-RMS limit remains `0.02`; it was not relaxed. The current production result is exactly zero for both dense H3 and the wrapped VDN/Turbo student.
 
 ### Why the trainer has an inference-exact forward bridge
 
-A corrected GPU probe reached the dense-H3 comparison and measured:
+Before the bridge, a corrected GPU probe measured:
 
 ```text
 video_rel_rms = 0.0650898
@@ -85,23 +105,35 @@ audio_rel_rms = 0.0405348
 audio_max     = 0.425354
 ```
 
-That was a real blocker, not tolerance noise. The global Comfy `in_training=True` state required by the autograd-safe H3/VDN graph changes two production H3 primitives:
+That was a real blocker, not tolerance noise. The global Comfy `in_training=True` state required by the autograd-safe H3/VDN graph changed two production H3 primitives:
 
-- MiniMax-H3 switches from its in-place fused RMS/RoPE inference kernel to the functional training kernel;
-- `comfy.ops.linear_input_act` disables the production fused INT8 activation + MLP down-projection path while the global training flag is set.
+- MiniMax-H3 switched from its in-place fused RMS/RoPE inference kernel to the functional training kernel;
+- `comfy.ops.linear_input_act` disabled the production fused INT8 activation + MLP down-projection path while the global training flag was set.
 
-Across 50 transformer blocks that changed the dense model output by several percent before VDN was even involved.
-
-The trainer now keeps the global training state required for differentiable H3/VDN execution but bridges those two primitives explicitly:
+The trainer keeps the global training state required for differentiable H3/VDN execution but bridges those two primitives explicitly:
 
 - **forward value:** exact production inference primitive;
 - **backward:** Comfy's supported functional/eager training primitive as a straight-through surrogate.
 
-The production RMS/RoPE kernel runs only on detached clones and therefore cannot mutate the live autograd inputs. The fused INT8 `linear_input_act` value is likewise obtained under `no_grad`; its supported eager training path supplies the input gradient. Both patches are scoped to `comfy_quant_training_mode()` and are restored even on exceptions.
+The production RMS/RoPE kernel runs only on detached clones and cannot mutate live autograd inputs. The fused INT8 `linear_input_act` value is likewise obtained under `no_grad`; its supported eager training path supplies the input gradient. Both patches are scoped to `comfy_quant_training_mode()` and restored even on exceptions.
 
-This is intentionally different from loosening the parity threshold: the probe still compares the complete dense and VDN/Turbo outputs against the same `0.02` hard limit after the bridge is active.
+## 3. Passive Sol-H3 drift localization — completed
 
-## 3. Cache a small prompt set with the installed H3 text encoder
+The deployment-profile trace is retained for reproducibility:
+
+```bash
+python tools/h3_prefix_drift_probe.py \
+  --comfy-root /home/toor/ComfyUI \
+  --base-model MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-comfy-int8-convrot.safetensors \
+  --vdn-checkpoint vdn-minimax-h3-int8-convrot-comfyui \
+  --stage-b-strength 1.0 \
+  --turbo-strength 0.75 \
+  --global-gate-mode video_only
+```
+
+The result does not identify one incorrect native-row operation to patch. Released adapter residuals alter prefix/audio/video branch computations from block 0, video residual drift accumulates first, and late audio divergence is additionally amplified after the transformer stack. This supports continuing the learned generated-audio correction rather than adding a destructive full-prefix clamp.
+
+## 4. Cache a small prompt set with the installed H3 text encoder
 
 Prepare a small JSONL or line-based prompt file that includes at minimum:
 
@@ -123,9 +155,20 @@ python tools/audio_fix_cache_prompts.py \
 
 The cache stores the real `cond` tensor and `minimax_token_tags`; the trainer does not download another text encoder.
 
-## 4. Run exactly one production-geometry optimizer step
+For the current released workflow, the installed encoder filename is typically `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors`; use the actual file loaded by the workflow rather than downloading a substitute.
 
-Use the target workflow's **video latent** height and width, not pixel dimensions. The smoke must use the same canonical released stack as training:
+## 5. Run exactly one production-geometry optimizer step
+
+Use the target workflow's **video latent** height and width, not pixel dimensions. MiniMax-H3 video latents are spatially downscaled by 16, so a pixel geometry `W x H` corresponds to trainer arguments:
+
+```text
+latent_width  = W / 16
+latent_height = H / 16
+```
+
+Both resulting latent axes must be even because the H3 DiT patchifies them by `2 x 2`.
+
+Run the smoke at the canonical released stack:
 
 ```bash
 python tools/audio_fix_int8_train.py \
@@ -143,7 +186,7 @@ python tools/audio_fix_int8_train.py \
   --no-resume
 ```
 
-Those three profile flags now match the command defaults and are shown explicitly so the training record is unambiguous.
+Those three profile flags match the command defaults and are shown explicitly so the training record is unambiguous.
 
 The fixed production contract also enforces:
 
@@ -164,11 +207,11 @@ train_state.pt
 metrics.jsonl
 ```
 
-and the step-1 metrics must show finite `loss`, `audio_teacher_loss`, `video_preserve_loss`, `grad_norm`, a positive `nonzero_grad_tensors`, and a sane `peak_gib` for the installed GPU.
+The step-1 metrics must show finite `loss`, `audio_teacher_loss`, `video_preserve_loss`, `grad_norm`, a positive `nonzero_grad_tensors`, and a sane `peak_gib` for the installed GPU.
 
-## 5. Do not start the 250-step run yet
+## 6. Do not start the 250-step run yet
 
-The direct trainer is currently explicit about its rollout scope:
+The direct trainer is explicit about its rollout scope:
 
 ```text
 rollout_profile = exact_res_all_actual_no_spectrum_or_progressive_handoff
@@ -176,9 +219,9 @@ spectrum_forecasting_emulated = false
 progressive_handoff_emulated = false
 ```
 
-That is intentional. The one-step adapter must first be exercised through the real deployment graph to prove that the learned correction survives Spectrum forecasting and Progressive/Continuum boundaries.
+The one-step adapter must first be exercised through the real deployment graph to prove that the learned correction survives Spectrum forecasting and Progressive/Continuum boundaries. The full 250-step run remains blocked until the Spectrum trajectory mismatch is resolved or deliberately justified with strong evidence.
 
-## 6. Deploy the step-1 adapter for matched A/B validation
+## 7. Deploy the step-1 adapter for matched A/B validation
 
 Copy only the exported adapter directory into the selected VDN stage as:
 
@@ -210,11 +253,11 @@ audio_fix_strength = 0.00
 audio_fix_strength = 1.00
 ```
 
-Only after that canonical validation should the same checkpoint be transfer-tested at the deployment Turbo strength `0.75`. Record any deployment-only routing difference, such as `global_gate_mode=video_only`, separately rather than baking it into the training profile.
+Only after canonical validation should the same checkpoint be transfer-tested at deployment Turbo strength `0.75`. Record any deployment-only routing difference, such as `global_gate_mode=video_only`, separately rather than baking it into the training profile.
 
 Do not set `audio_adapter_strength=0` for either trained-checkpoint test. That was a useful diagnostic/mitigation for the released checkpoint, but it removes part of the full adapter stack on top of which the correction is trained.
 
-## 7. Acceptance criteria before long training
+## 8. Acceptance criteria before long training
 
 Check decoded media, not just training loss:
 
