@@ -65,6 +65,7 @@ from vdn_h3.audio_node import _apply_vdn_audio_safe  # noqa: E402
 
 
 AUDIO_CHANNELS = 32
+AUDIO_STREAMS = 2
 VIDEO_CHANNELS = 24
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
@@ -293,6 +294,7 @@ def _save_adapter(output_root, step, bank, base_path, vdn_checkpoint, latent_sha
             "progressive_handoff_emulated": False,
             "video_latent_shape": list(latent_shape),
             "audio_latent_frames": int(audio_t),
+            "audio_streams": AUDIO_STREAMS,
             "teacher": "same production INT8/ConvRot H3 with VDN/adapters disabled",
         },
     )
@@ -315,7 +317,7 @@ def main():
     parser.add_argument("--video-latent-frames", type=int, default=52,
                         help="7-second H3 chunk at 24 fps -> 52 video latent frames")
     parser.add_argument("--audio-latent-frames", type=int, default=292,
-                        help="7-second H3 chunk -> 292 audio latent frames")
+                        help="7-second H3 chunk -> 292 audio latent frames per stereo stream")
     parser.add_argument("--train-steps", type=int, default=250)
     parser.add_argument("--sampler-steps", type=int, default=10)
     parser.add_argument("--stage-b-strength", type=float, default=1.0)
@@ -438,6 +440,7 @@ def main():
         "global_gate_mode": args.global_gate_mode,
         "sampler": "res_multistep",
         "sampler_steps": args.sampler_steps,
+        "audio_streams": AUDIO_STREAMS,
         "rollout_profile": ROLLOUT_PROFILE,
     }
     print("audio-fix training profile: " + json.dumps(profile, sort_keys=True), flush=True)
@@ -470,8 +473,10 @@ def main():
                 train_index = random.Random(args.seed + step * 1000003).randrange(args.sampler_steps)
                 video = torch.randn(latent_shape, generator=generator, device=device,
                                     dtype=torch.float32)
+                # H3's audio latent is stereo [B, 32, 2, T]; PackedLayout reserves
+                # 2*T generated-audio rows, one channel-major stream for each side.
                 audio = torch.randn(
-                    1, AUDIO_CHANNELS, 1, args.audio_latent_frames,
+                    1, AUDIO_CHANNELS, AUDIO_STREAMS, args.audio_latent_frames,
                     generator=generator, device=device, dtype=torch.float32)
 
                 started = time.time()
