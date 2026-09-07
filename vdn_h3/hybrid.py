@@ -329,7 +329,7 @@ def make_vdn_forward(attn, state, block_index):
         text_x = text_k_raw = text_v_raw = None
         if linear_active:
             a, b = layout.video_start, layout.video_end
-            resources = state.runtime.current()
+            resources = None if comfy.model_management.in_training else state.runtime.current()
             text_rows = layout.text_len if branch.enable_text_state else 0
             scratch = (
                 resources.activation_scratch(
@@ -366,8 +366,12 @@ def make_vdn_forward(attn, state, block_index):
             qw = comfy.model_management.cast_to(q_norm.weight, device=device)
             kw = comfy.model_management.cast_to(k_norm.weight, device=device)
             rot = rope_freqs.shape[-3] * 2
-            comfy.quant_ops.ck.rms_rope_split_half_(
-                q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
+            if comfy.model_management.in_training:
+                q4, k4 = comfy.quant_ops.ck.rms_rope_split_half(
+                    q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
+            else:
+                comfy.quant_ops.ck.rms_rope_split_half_(
+                    q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
             q, k = q4[0], k4[0]
             del q4, k4
         else:
@@ -375,26 +379,38 @@ def make_vdn_forward(attn, state, block_index):
             k = k_norm(k_raw)
 
         if window_active:
-            backend = state.softmax_backend
-            if backend == "flex":
-                from vdn_h3.window import window_softmax_flex
-                try:
-                    softmax_out = window_softmax_flex(
-                        q, k, v, layout.video_start, layout.video_end,
-                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                        head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
-                except Exception as exc:
-                    backend = "grouped"
-                    _log.warning(
-                        "[vdn] flex attention failed (%s); falling back to grouped SDPA "
-                        "for this execution", exc)
-            if backend != "flex":
-                from vdn_h3.retained import window_softmax_grouped_runtime
-                softmax_out = window_softmax_grouped_runtime(
+            if comfy.model_management.in_training:
+                # Retained grouped attention uses inference-owned preallocated scratch.
+                # Training instead uses the exact grouped reference partition so all
+                # Q/K/V dependencies stay in a normal autograd graph. Model-level
+                # attention overrides remain excluded, matching VDN inference semantics.
+                from vdn_h3.window import window_softmax_grouped
+                softmax_out = window_softmax_grouped(
                     q, k, v, layout.video_start, layout.video_end,
                     layout.num_frames, layout.tokens_per_frame, layout.bounds,
                     head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
-                    transformer_options=transformer_options)
+                    transformer_options=None)
+            else:
+                backend = state.softmax_backend
+                if backend == "flex":
+                    from vdn_h3.window import window_softmax_flex
+                    try:
+                        softmax_out = window_softmax_flex(
+                            q, k, v, layout.video_start, layout.video_end,
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
+                    except Exception as exc:
+                        backend = "grouped"
+                        _log.warning(
+                            "[vdn] flex attention failed (%s); falling back to grouped SDPA "
+                            "for this execution", exc)
+                if backend != "flex":
+                    from vdn_h3.retained import window_softmax_grouped_runtime
+                    softmax_out = window_softmax_grouped_runtime(
+                        q, k, v, layout.video_start, layout.video_end,
+                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                        head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
+                        transformer_options=transformer_options)
         else:
             softmax_out = _dense_subset_attention(
                 q, k, v, heads, head_dim, transformer_options)
@@ -489,8 +505,14 @@ def make_vdn_forward(attn, state, block_index):
             # The branch has consumed its raw Q/K/V copies. Do not keep them alive
             # through the final projection, where their storage can add to the peak.
             del q_raw_video, k_raw_video, v_video, text_k_raw, text_v_raw
-            out[layout.video_start:layout.video_end] += F.linear(
-                readout.type_as(x), weights["to_out_linear.weight"])
+            branch_out = F.linear(readout.type_as(x), weights["to_out_linear.weight"])
+            if comfy.model_management.in_training:
+                # Avoid version-counter mutations on the attention output while the
+                # generated-audio correction graph is live.
+                a, b = layout.video_start, layout.video_end
+                out = torch.cat((out[:a], out[a:b] + branch_out, out[b:]), dim=0)
+            else:
+                out[layout.video_start:layout.video_end] += branch_out
         return out
 
     vdn_forward._vdn_forward = True
