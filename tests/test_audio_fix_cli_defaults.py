@@ -5,6 +5,11 @@ from pathlib import Path
 
 
 TRAINER = Path(__file__).resolve().parents[1] / "tools" / "audio_fix_int8_train.py"
+TARGETS = {
+    "--stage-b-strength",
+    "--turbo-strength",
+    "--global-gate-mode",
+}
 
 
 def _argument_defaults():
@@ -18,16 +23,19 @@ def _argument_defaults():
         if not node.args or not isinstance(node.args[0], ast.Constant):
             continue
         name = node.args[0].value
-        if not isinstance(name, str) or not name.startswith("--"):
+        if name not in TARGETS:
             continue
         default = next((kw.value for kw in node.keywords if kw.arg == "default"), None)
-        if default is not None:
-            defaults[name] = ast.literal_eval(default)
+        if default is None:
+            raise AssertionError(f"{name} has no explicit default")
+        defaults[name] = ast.literal_eval(default)
     return defaults
 
 
 def test_direct_int8_trainer_defaults_to_canonical_released_stack():
     defaults = _argument_defaults()
-    assert defaults["--stage-b-strength"] == 1.0
-    assert defaults["--turbo-strength"] == 1.0
-    assert defaults["--global-gate-mode"] == "checkpoint"
+    assert defaults == {
+        "--stage-b-strength": 1.0,
+        "--turbo-strength": 1.0,
+        "--global-gate-mode": "checkpoint",
+    }
