@@ -37,11 +37,6 @@ import random
 import sys
 import time
 
-from vdn_h3.audio_fix_progress import (
-    TrainingProgress,
-    install_scope_safe_block_checkpointing,
-)
-
 
 CANONICAL_SAMPLER_STEPS = 8
 
@@ -58,6 +53,50 @@ def _load_impl():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _build_parser():
+    """Build the CLI without importing Comfy/VDN runtime modules.
+
+    ``--help`` must work on CPU-only hosts and before the supplied Comfy checkout has
+    been added to ``sys.path``.  Runtime imports therefore happen only after argument
+    parsing in :func:`main`.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--comfy-root",
+        default=os.environ.get("COMFYUI_ROOT", "/home/toor/ComfyUI"),
+    )
+    parser.add_argument("--base-model", required=True,
+                        help="Existing production INT8/ConvRot MiniMax-H3 safetensors")
+    parser.add_argument("--vdn-checkpoint", required=True,
+                        help="Existing VDN stage name under Comfy models/vdn")
+    parser.add_argument("--prompt-cache-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--latent-height", type=int, required=True,
+                        help="Production VIDEO latent height (not pixel height)")
+    parser.add_argument("--latent-width", type=int, required=True,
+                        help="Production VIDEO latent width (not pixel width)")
+    parser.add_argument("--video-latent-frames", type=int, default=52)
+    parser.add_argument("--audio-latent-frames", type=int, default=292)
+    parser.add_argument("--train-steps", type=int, default=250)
+    parser.add_argument("--sampler-steps", type=int, default=CANONICAL_SAMPLER_STEPS)
+    parser.add_argument("--stage-b-strength", type=float, default=1.0)
+    parser.add_argument("--turbo-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--global-gate-mode",
+        choices=("checkpoint", "video_only"),
+        default="checkpoint",
+    )
+    parser.add_argument("--rank", type=int, default=32)
+    parser.add_argument("--alpha", type=int, default=32)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--video-preserve-weight", type=float, default=0.1)
+    parser.add_argument("--save-every", type=int, default=10)
+    parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Force one optimizer step and save step 0/1")
+    return parser
 
 
 def _training_branch_policy(vdn_policy, path, free_bytes):
@@ -114,7 +153,17 @@ def _save_adapter_8(impl, output_root, step, bank, base_path, vdn_checkpoint,
 
 
 def main():
+    # Parse first.  This lets argparse service --help without importing Comfy's CUDA
+    # runtime on CPU-only CI hosts and gives standalone tools a root before vdn_h3 is
+    # imported for the first time.
+    args = _build_parser().parse_args()
+    os.environ["COMFYUI_ROOT"] = os.path.abspath(os.path.expanduser(args.comfy_root))
+
     impl = _load_impl()
+    from vdn_h3.audio_fix_progress import (
+        TrainingProgress,
+        install_scope_safe_block_checkpointing,
+    )
     from vdn_h3.direct_gpu_load import load_diffusion_model_direct_gpu
     import vdn_h3.policy as vdn_policy
 
@@ -150,39 +199,6 @@ def main():
             )
         finally:
             vdn_policy.auto_branch_policy = original_auto_policy
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--comfy-root", default=impl.COMFY_ROOT)
-    parser.add_argument("--base-model", required=True,
-                        help="Existing production INT8/ConvRot MiniMax-H3 safetensors")
-    parser.add_argument("--vdn-checkpoint", required=True,
-                        help="Existing VDN stage name under Comfy models/vdn")
-    parser.add_argument("--prompt-cache-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--latent-height", type=int, required=True,
-                        help="Production VIDEO latent height (not pixel height)")
-    parser.add_argument("--latent-width", type=int, required=True,
-                        help="Production VIDEO latent width (not pixel width)")
-    parser.add_argument("--video-latent-frames", type=int, default=52)
-    parser.add_argument("--audio-latent-frames", type=int, default=292)
-    parser.add_argument("--train-steps", type=int, default=250)
-    parser.add_argument("--sampler-steps", type=int, default=CANONICAL_SAMPLER_STEPS)
-    parser.add_argument("--stage-b-strength", type=float, default=1.0)
-    parser.add_argument("--turbo-strength", type=float, default=1.0)
-    parser.add_argument(
-        "--global-gate-mode",
-        choices=("checkpoint", "video_only"),
-        default="checkpoint",
-    )
-    parser.add_argument("--rank", type=int, default=32)
-    parser.add_argument("--alpha", type=int, default=32)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--video-preserve-weight", type=float, default=0.1)
-    parser.add_argument("--save-every", type=int, default=10)
-    parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--smoke", action="store_true",
-                        help="Force one optimizer step and save step 0/1")
-    args = parser.parse_args()
 
     if args.sampler_steps != CANONICAL_SAMPLER_STEPS:
         raise SystemExit(
