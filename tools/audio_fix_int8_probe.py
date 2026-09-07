@@ -8,8 +8,9 @@ base receives none.
 
 With ``--vdn-checkpoint`` it additionally performs a small direct MiniMax-H3 forward
 through the exact VDN/Stage-B/Turbo ModelPatcher wrapper stack used by the standalone
-trainer. This catches the important failure mode where the trainer has valid wrapper
-objects but a direct H3 call never executes them.
+trainer. It also compares ordinary inference execution against the autograd-safe
+training execution for both dense H3 and the finished VDN/Turbo student. A material
+training/inference mismatch is a hard stop before optimization.
 """
 from __future__ import annotations
 
@@ -80,6 +81,34 @@ def _finite_delta(left, right):
     return float((left.float() - right.float()).abs().max())
 
 
+def _relative_rms(reference, candidate):
+    if not torch.isfinite(reference).all() or not torch.isfinite(candidate).all():
+        raise RuntimeError("training/inference parity probe produced a non-finite H3 output")
+    ref = reference.float()
+    cand = candidate.float()
+    numerator = (cand - ref).square().mean().sqrt()
+    denominator = ref.square().mean().sqrt().clamp_min(1e-8)
+    return float(numerator / denominator), float((cand - ref).abs().max())
+
+
+def _assert_pair_parity(label, inference, training, limit):
+    video_rms, video_max = _relative_rms(inference[0], training[0])
+    audio_rms, audio_max = _relative_rms(inference[1], training[1])
+    print(
+        f"{label} training/inference parity: "
+        f"video_rel_rms={video_rms:.6g} video_max={video_max:.6g} "
+        f"audio_rel_rms={audio_rms:.6g} audio_max={audio_max:.6g}",
+        flush=True,
+    )
+    worst = max(video_rms, audio_rms)
+    if worst > float(limit):
+        raise RuntimeError(
+            f"{label} training/inference relative RMS mismatch {worst:.6g} exceeds "
+            f"the probe limit {float(limit):.6g}; do not train against a materially "
+            "different execution path"
+        )
+
+
 @contextmanager
 def _student_role(student, device):
     student.patch_model(device_to=device, load_weights=False)
@@ -91,7 +120,7 @@ def _student_role(student, device):
         student.unpatch_model(device_to=device, unpatch_weights=False)
 
 
-def _direct_h3_output(dm, video, audio, sigma, context, sigmas, transformer_options):
+def _direct_h3_output(dm, video, audio, sigma, context, transformer_options):
     timestep = torch.tensor([float(sigma) * 1000.0], device=video.device, dtype=torch.float32)
     output = dm(
         [video, audio],
@@ -102,7 +131,7 @@ def _direct_h3_output(dm, video, audio, sigma, context, sigmas, transformer_opti
     )
     if not isinstance(output, (list, tuple)) or len(output) != 2:
         raise RuntimeError("MiniMax H3 did not return [video, audio]")
-    return output[0], output[1]
+    return output[0].detach(), output[1].detach()
 
 
 def _full_stack_probe(base, base_dm, device, args):
@@ -140,6 +169,11 @@ def _full_stack_probe(base, base_dm, device, args):
         video_shift=VIDEO_SHIFT,
         audio_shift=AUDIO_SHIFT,
     )
+    dense_options = {
+        "minimax_h3_sigma_shift_video": VIDEO_SHIFT,
+        "minimax_h3_sigma_shift_audio": AUDIO_SHIFT,
+        "sample_sigmas": sigmas,
+    }
 
     generator = torch.Generator(device=device).manual_seed(args.seed + 4049)
     video = torch.randn(
@@ -174,34 +208,39 @@ def _full_stack_probe(base, base_dm, device, args):
     )
     sigma = float(sigmas[min(4, sigmas.numel() - 2)])
 
-    with torch.no_grad(), comfy_quant_training_mode():
-        dense_options = {
-            "minimax_h3_sigma_shift_video": VIDEO_SHIFT,
-            "minimax_h3_sigma_shift_audio": AUDIO_SHIFT,
-            "sample_sigmas": sigmas,
-        }
-        dense_v, dense_a = _direct_h3_output(
-            base_dm,
-            video,
-            audio,
-            sigma,
-            context,
-            sigmas,
-            dense_options,
-        )
+    # First execute exactly as deployment inference does. Then execute the same graph
+    # under the trainer's autograd-safe global mode. The latter swaps in functional
+    # RMS/RoPE and differentiable VDN recurrence implementations, which must remain
+    # numerically equivalent enough to train a correction intended for inference.
+    with torch.no_grad():
+        dense_inference = _direct_h3_output(
+            base_dm, video, audio, sigma, context, dense_options)
         with _student_role(student, device) as student_dm:
-            student_v, student_a = _direct_h3_output(
-                student_dm,
-                video,
-                audio,
-                sigma,
-                context,
-                sigmas,
-                transformer_options,
-            )
+            student_inference = _direct_h3_output(
+                student_dm, video, audio, sigma, context, transformer_options)
 
-    video_delta = _finite_delta(student_v, dense_v)
-    audio_delta = _finite_delta(student_a, dense_a)
+    with torch.no_grad(), comfy_quant_training_mode():
+        dense_training = _direct_h3_output(
+            base_dm, video, audio, sigma, context, dense_options)
+        with _student_role(student, device) as student_dm:
+            student_training = _direct_h3_output(
+                student_dm, video, audio, sigma, context, transformer_options)
+
+    _assert_pair_parity(
+        "dense H3",
+        dense_inference,
+        dense_training,
+        args.max_training_parity_rel_rms,
+    )
+    _assert_pair_parity(
+        "VDN/Turbo student",
+        student_inference,
+        student_training,
+        args.max_training_parity_rel_rms,
+    )
+
+    video_delta = _finite_delta(student_training[0], dense_training[0])
+    audio_delta = _finite_delta(student_training[1], dense_training[1])
     print(
         "full-stack direct-call delta: "
         f"video_max={video_delta:.6g} audio_max={audio_delta:.6g}",
@@ -210,13 +249,14 @@ def _full_stack_probe(base, base_dm, device, args):
     if video_delta == 0.0 and audio_delta == 0.0:
         raise RuntimeError(
             "VDN/Stage-B/Turbo student was bit-identical to dense H3; the direct-call "
-            "wrapper stack did not affect the model and training must not start"
+            "wrapper/adapter stack did not affect the model and training must not start"
         )
 
-    # build_student_transformer_options already proves the required wrapper keys are
-    # present. A nonzero full-model delta proves those wrappers actually executed.
+    # build_student_transformer_options proves the required wrapper keys are present;
+    # MiniMaxH3Model.forward consumes exactly that wrapper collection. The nonzero
+    # student/base delta additionally proves the finished patched student is active.
     print(
-        "full-stack direct-call wrapper execution: OK "
+        "full-stack direct-call execution: OK "
         f"(Stage-B={args.stage_b_strength:g}, Turbo={args.turbo_strength:g}, "
         f"gate={args.global_gate_mode})",
         flush=True,
@@ -250,6 +290,12 @@ def main():
     parser.add_argument("--full-stack-latent-height", type=int, default=8)
     parser.add_argument("--full-stack-latent-width", type=int, default=8)
     parser.add_argument("--full-stack-text-tokens", type=int, default=8)
+    parser.add_argument(
+        "--max-training-parity-rel-rms",
+        type=float,
+        default=0.02,
+        help="Hard relative-RMS limit for inference vs autograd-safe full-stack output",
+    )
     args = parser.parse_args()
 
     if args.rows < 4:
@@ -269,6 +315,8 @@ def main():
         raise SystemExit("full-stack latent height/width must be positive even values >= 2")
     if args.full_stack_text_tokens < 1:
         raise SystemExit("--full-stack-text-tokens must be >= 1")
+    if not 0.0 < args.max_training_parity_rel_rms <= 1.0:
+        raise SystemExit("--max-training-parity-rel-rms must be in (0, 1]")
 
     base_path = _resolve_base(args.base_model)
     base = comfy.sd.load_diffusion_model(base_path, model_options={})
