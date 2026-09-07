@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Cache MiniMax-H3 prompt conditioning with the text encoder already in ComfyUI.
+"""Cache MiniMax-H3 prompt conditioning with the installed text encoder.
 
-No Hugging Face download is performed. ``--text-encoder`` may be an absolute path or a
-filename already present under ``ComfyUI/models/text_encoders``. The cached tensors are
-all the production INT8 audio-fix trainer needs from Qwen3-VL.
+The H3 Qwen3-VL encoder can be much larger than available host RAM.  This standalone
+utility therefore loads its safetensors state dictionary directly on CUDA and keeps
+the encoder GPU-resident while caching prompts.  No Hugging Face download and no
+full-checkpoint CPU staging are performed.
 """
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -20,15 +22,17 @@ def _bootstrap():
     root = os.path.abspath(os.path.expanduser(known.comfy_root))
     if not os.path.isfile(os.path.join(root, "comfy", "sd.py")):
         raise SystemExit(f"Not a ComfyUI checkout: {root}")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     sys.path.insert(0, root)
+    sys.path.insert(0, repo)
     return root
 
 
 COMFY_ROOT = _bootstrap()
 
 import torch  # noqa: E402
-import comfy.model_management  # noqa: E402
-import comfy.sd  # noqa: E402
+
+from vdn_h3.direct_gpu_load import load_minimax_clip_direct_gpu  # noqa: E402
 
 
 def _resolve_encoder(path):
@@ -68,11 +72,15 @@ def main():
     parser.add_argument("--comfy-root", default=COMFY_ROOT)
     parser.add_argument("--text-encoder", required=True,
                         help="Existing MiniMax-H3 text encoder safetensors")
-    parser.add_argument("--prompts", required=True, help="JSONL with prompt field, or one prompt per line")
+    parser.add_argument("--prompts", required=True,
+                        help="JSONL with prompt field, or one prompt per line")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--take", type=int, default=0, help="0 = all prompts")
     parser.add_argument("--prefix", default="sample")
     args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise SystemExit("MiniMax-H3 prompt caching requires CUDA in direct-GPU mode")
 
     encoder_path = _resolve_encoder(args.text_encoder)
     prompts = _read_prompts(os.path.abspath(args.prompts))
@@ -81,12 +89,8 @@ def main():
     output = os.path.abspath(os.path.expanduser(args.output_dir))
     os.makedirs(output, exist_ok=True)
 
-    print(f"loading existing MiniMax-H3 conditioner: {encoder_path}", flush=True)
-    clip = comfy.sd.load_clip(
-        ckpt_paths=[encoder_path],
-        embedding_directory=None,
-        clip_type=comfy.sd.CLIPType.MINIMAX,
-    )
+    print(f"loading existing MiniMax-H3 conditioner directly on GPU: {encoder_path}", flush=True)
+    clip = load_minimax_clip_direct_gpu(encoder_path)
 
     for index, prompt in enumerate(prompts):
         tokens = clip.tokenize(prompt)
@@ -111,8 +115,11 @@ def main():
         torch.save(payload, path)
         print(f"[{index + 1}/{len(prompts)}] {path}", flush=True)
 
+    # Do not call Comfy's generic unload path here: this process exits immediately,
+    # and an unload-to-CPU policy would defeat the purpose of the GPU-resident loader.
     del clip
-    comfy.model_management.unload_all_models()
+    gc.collect()
+    torch.cuda.empty_cache()
     print(f"cached {len(prompts)} prompts under {output}", flush=True)
 
 
