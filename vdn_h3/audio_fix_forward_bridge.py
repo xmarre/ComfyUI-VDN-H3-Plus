@@ -3,18 +3,26 @@
 Comfy's global ``model_management.in_training`` switch changes two MiniMax-H3
 forward primitives that materially affect the 50-block trajectory:
 
-* H3 uses functional RMS/RoPE in training but an in-place fused kernel in inference.
+* H3 uses a non-mutating comfy-kitchen RMS/RoPE custom op in training but an in-place
+  fused kernel in inference.
 * ``linear_input_act`` disables the fused INT8 activation/down-projection path while
   ``in_training`` is true.
 
+The comfy-kitchen RMS/RoPE custom op intentionally has no registered autograd formula.
+It is suitable as a forward kernel, but it cannot be left inside the graph used by the
+standalone audio-fix trainer.  The trainer therefore uses a straight-through bridge:
+production fused values in the forward pass, and the same mathematical RMSNorm +
+split-half RoPE expressed only with ordinary PyTorch operations for backward.
+
 Current MiniMax-H3 also deliberately uses in-place packed-row modulation/residual
-updates in ``_mod_scale_shift`` and ``_mod_gate``.  Those are excellent inference
+updates in ``_mod_scale_shift`` and ``_mod_gate``. Those are excellent inference
 optimizations, but checkpointed autograd cannot allow the saved block inputs / norm
 outputs to be mutated after they have been captured for backward.
 
 The audio-fix trainer therefore needs both numerical and aliasing bridges:
 
 * exact production forward values for RMS/RoPE and fused INT8 fc2;
+* ordinary-PyTorch surrogate gradients for RMS/RoPE and fused INT8 fc2;
 * the exact same H3 modulation arithmetic, but applied to a clone so the caller's
   autograd-visible tensor is not modified in place.
 
@@ -26,6 +34,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import torch
+import torch.nn.functional as F
 
 
 def _straight_through(exact: torch.Tensor, surrogate: torch.Tensor) -> torch.Tensor:
@@ -39,6 +48,57 @@ def _clone_then_inplace(fn):
     def wrapped(x, *args, **kwargs):
         return fn(x.clone(), *args, **kwargs)
     return wrapped
+
+
+def _apply_rope_split_half_surrogate(x: torch.Tensor,
+                                     freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Pure-PyTorch split-half RoPE matching comfy-kitchen eager semantics.
+
+    ``freqs_cis`` stores 2x2 rotation matrices.  Split-half RoPE pairs the first and
+    second halves of the rotary vector, applies those matrices, then restores the
+    original last-dimension layout.  No custom torch.library op is used here, so
+    autograd can differentiate the complete expression.
+    """
+    t = x.reshape(*x.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
+    t = t.to(freqs_cis.dtype)
+    out = freqs_cis[..., 0] * t[..., 0] + freqs_cis[..., 1] * t[..., 1]
+    return out.movedim(-1, -2).reshape(*x.shape).type_as(x)
+
+
+def _rms_rope_split_half_surrogate(q: torch.Tensor,
+                                   k: torch.Tensor,
+                                   freqs_cis: torch.Tensor,
+                                   q_scale: torch.Tensor,
+                                   k_scale: torch.Tensor | None = None,
+                                   epsilon: float = 1e-6,
+                                   rot_dim: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Autograd-safe reference RMSNorm + partial split-half RoPE.
+
+    This mirrors the mathematical eager implementation used by comfy-kitchen, but is
+    kept local so the training graph cannot accidentally dispatch back into the
+    ``comfy_kitchen::rms_rope_split_half`` custom op, which currently has no autograd
+    formula.
+    """
+    if k_scale is None:
+        k_scale = q_scale
+
+    def one(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        x_norm = F.rms_norm(
+            x,
+            (x.shape[-1],),
+            weight=scale,
+            eps=float(epsilon),
+        )
+        if rot_dim and int(rot_dim) != x.shape[-1]:
+            rd = int(rot_dim)
+            if rd <= 0 or rd > x.shape[-1] or rd % 2:
+                raise ValueError(
+                    f"invalid split-half rotary dimension {rd} for width {x.shape[-1]}")
+            rotated = _apply_rope_split_half_surrogate(x_norm[..., :rd], freqs_cis)
+            return torch.cat((rotated, x_norm[..., rd:]), dim=-1)
+        return _apply_rope_split_half_surrogate(x_norm, freqs_cis)
+
+    return one(q, q_scale), one(k, k_scale)
 
 
 @contextmanager
@@ -61,12 +121,15 @@ def inference_exact_training_primitives():
     mod_scale_shift = minimax_model._mod_scale_shift
     mod_gate = minimax_model._mod_gate
 
-    def exact_forward_rms_rope(q, k, rope, qw, kw, **kwargs):
-        # Build the supported differentiable graph first.  The production fused kernel
-        # is then evaluated on detached clones so it cannot mutate q/k or enter autograd.
-        q_surrogate, k_surrogate = functional_rms_rope(
+    def exact_forward_rms_rope(q, k, rope, qw, kw=None, **kwargs):
+        # Do NOT use the saved functional comfy-kitchen op for the surrogate: its
+        # torch.library custom op currently has no autograd formula.  Build the
+        # differentiable reference entirely from ordinary PyTorch operations instead.
+        q_surrogate, k_surrogate = _rms_rope_split_half_surrogate(
             q, k, rope, qw, kw, **kwargs
         )
+        # Forward numerics remain the exact production in-place fused path, evaluated
+        # on detached clones so it cannot mutate q/k or enter the autograd graph.
         with torch.no_grad():
             q_exact = q.detach().clone()
             k_exact = k.detach().clone()
@@ -111,3 +174,8 @@ def inference_exact_training_primitives():
         ck.rms_rope_split_half = functional_rms_rope
         minimax_model._mod_gate = mod_gate
         minimax_model._mod_scale_shift = mod_scale_shift
+
+
+__all__ = [
+    "inference_exact_training_primitives",
+]
