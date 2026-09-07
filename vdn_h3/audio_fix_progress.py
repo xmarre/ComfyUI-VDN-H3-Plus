@@ -2,20 +2,22 @@
 
 The MiniMax-H3 training hooks are deliberately fail-closed: every target projection
 must execute under an explicit ``TrainAudioScope``. PyTorch non-reentrant activation
-checkpointing can recompute a block later without preserving the caller's ContextVar
-state, so the recompute function must explicitly re-enter the scope captured when the
+checkpointing can recompute a block later after the caller's ContextVar scope has
+unwound, so the recompute function explicitly re-enters the scope captured when the
 checkpoint was created.
 
 This module also exposes a lightweight tqdm reporter that counts actual H3 transformer
-block executions. That makes long production-geometry rollouts/backward passes visible
+block invocations. That makes long production-geometry rollouts/backward passes visible
 instead of leaving the terminal silent for minutes.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
 from tqdm.auto import tqdm
+from torch.utils.checkpoint import checkpoint
+
+from vdn_h3.audio_fix_train import current_train_scope
 
 
 @dataclass
@@ -42,6 +44,7 @@ class TrainingProgress:
             unit="step",
             dynamic_ncols=True,
             leave=True,
+            position=0,
             disable=self.disable,
         )
 
@@ -61,6 +64,7 @@ class TrainingProgress:
             unit="block",
             dynamic_ncols=True,
             leave=False,
+            position=1,
             mininterval=0.25,
             disable=self.disable,
         )
@@ -102,14 +106,13 @@ class TrainingProgress:
         self.steps.close()
 
 
-def install_scope_safe_block_checkpointing(impl, model, bank, progress=None):
+def install_scope_safe_block_checkpointing(model, bank, progress=None,
+                                            scope_getter=current_train_scope):
     """Checkpoint H3 blocks while preserving the audio-fix scope on recompute.
 
-    ``torch.utils.checkpoint`` is free to recompute after the original Python context
-    has unwound and does not guarantee propagation of arbitrary ContextVars. Capture
-    the active scope at checkpoint creation and explicitly re-enter an equivalent bank
-    scope for both the initial call and recomputation. This preserves the fail-closed
-    hook contract instead of weakening the hook when scope is missing.
+    The scope source is the authoritative ``vdn_h3.audio_fix_train`` ContextVar, not
+    an incidental attribute on whichever CLI module imported the training helpers.
+    ``scope_getter`` is injectable only for focused CPU tests.
 
     The returned ``(block, original_forward)`` list is compatible with
     ``audio_fix_train.restore_block_checkpointing``.
@@ -119,28 +122,25 @@ def install_scope_safe_block_checkpointing(impl, model, bank, progress=None):
         original = block.forward
 
         def wrapped(*args, _original=original, **kwargs):
-            scope = impl.current_train_scope()
+            scope = scope_getter()
 
             def run_scoped(*inner_args, **inner_kwargs):
-                if scope is None:
-                    result = _original(*inner_args, **inner_kwargs)
-                else:
-                    with bank.scope(
-                        scope.audio_start,
-                        scope.audio_end,
-                        enabled=scope.enabled,
-                        checkpoint_blocks=scope.checkpoint_blocks,
-                    ):
-                        result = _original(*inner_args, **inner_kwargs)
+                # Count the actual block invocation, including checkpoint recomputation.
+                # Do it before the body so a failing block still leaves useful progress.
                 if progress is not None:
                     progress.block_done()
-                return result
+                if scope is None:
+                    return _original(*inner_args, **inner_kwargs)
+                with bank.scope(
+                    scope.audio_start,
+                    scope.audio_end,
+                    enabled=scope.enabled,
+                    checkpoint_blocks=scope.checkpoint_blocks,
+                ):
+                    return _original(*inner_args, **inner_kwargs)
 
-            if (scope is not None and scope.enabled and scope.checkpoint_blocks
-                    and torch.is_grad_enabled()):
-                return impl.checkpoint(
-                    run_scoped, *args, use_reentrant=False, **kwargs
-                )
+            if (scope is not None and scope.enabled and scope.checkpoint_blocks):
+                return checkpoint(run_scoped, *args, use_reentrant=False, **kwargs)
             return run_scoped(*args, **kwargs)
 
         block.forward = wrapped
