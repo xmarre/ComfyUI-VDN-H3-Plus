@@ -2,12 +2,12 @@
 
 This document covers the **direct Comfy production trainer** in this repository. It is intentionally stricter than a normal training recipe because the correction must be proven on the actual installed MiniMax-H3 INT8/ConvRot + VDN + released-adapter graph before a long run is allowed.
 
-The current direct-trainer defaults are the production chatter-test profile:
+The direct-trainer defaults are the canonical released training stack:
 
 ```text
 Stage-B strength      1.00
-Turbo strength        0.75
-global_gate_mode      video_only
+Turbo strength        1.00
+global_gate_mode      checkpoint
 audio routing         1.00 / 1.00 / 1.00 / 1.00
 sampler               10-step res_multistep
 sigma table           Comfy simple
@@ -15,7 +15,7 @@ Spectrum emulation    no
 Progressive emulation no
 ```
 
-Turbo is required. A Turbo-off run is not an accepted production correction path.
+Turbo is required. A Turbo-off run is not an accepted production correction path. Turbo `0.75` is a deployment transfer/validation setting after canonical training, not a trainer default.
 
 ## 0. Install the training-only dependency
 
@@ -58,6 +58,8 @@ python tools/audio_fix_int8_probe.py \
   --turbo-strength 0.75 \
   --global-gate-mode video_only
 ```
+
+This is deliberately a **deployment-profile parity probe**. It verifies that the inference-exact training bridge reproduces the installed deployment graph; the `0.75` / `video_only` values above do **not** define the canonical training profile.
 
 This must pass **all** of the following before training:
 
@@ -123,7 +125,7 @@ The cache stores the real `cond` tensor and `minimax_token_tags`; the trainer do
 
 ## 4. Run exactly one production-geometry optimizer step
 
-Use the target workflow's **video latent** height and width, not pixel dimensions:
+Use the target workflow's **video latent** height and width, not pixel dimensions. The smoke must use the same canonical released stack as training:
 
 ```bash
 python tools/audio_fix_int8_train.py \
@@ -135,11 +137,13 @@ python tools/audio_fix_int8_train.py \
   --latent-height <PRODUCTION_VIDEO_LATENT_H> \
   --latent-width <PRODUCTION_VIDEO_LATENT_W> \
   --stage-b-strength 1.0 \
-  --turbo-strength 0.75 \
-  --global-gate-mode video_only \
+  --turbo-strength 1.0 \
+  --global-gate-mode checkpoint \
   --smoke \
   --no-resume
 ```
+
+Those three profile flags now match the command defaults and are shown explicitly so the training record is unambiguous.
 
 The fixed production contract also enforces:
 
@@ -174,7 +178,7 @@ progressive_handoff_emulated = false
 
 That is intentional. The one-step adapter must first be exercised through the real deployment graph to prove that the learned correction survives Spectrum forecasting and Progressive/Continuum boundaries.
 
-## 6. Deploy the step-1 adapter for a matched A/B
+## 6. Deploy the step-1 adapter for matched A/B validation
 
 Copy only the exported adapter directory into the selected VDN stage as:
 
@@ -184,13 +188,13 @@ Copy only the exported adapter directory into the selected VDN stage as:
 └── adapter_model.safetensors
 ```
 
-Keep the normal production routing restored:
+First validate the checkpoint against the exact canonical stack it was trained on:
 
 ```text
 lora_mode                           bypass
 stage_b_strength                    1.00
-turbo_strength                      0.75
-global_gate_mode                    video_only
+turbo_strength                      1.00
+global_gate_mode                    checkpoint
 adapter_ablation                    none
 audio_adapter_strength              1.00
 conditioning_adapter_strength       1.00
@@ -199,14 +203,16 @@ conditioning_video_context_strength 1.00
 sampler                             10-step res_multistep
 ```
 
-Run matched seeds through the **actual production Spectrum + Progressive/Continuum workflow** and compare only:
+Run matched seeds through the real workflow and compare only:
 
 ```text
 audio_fix_strength = 0.00
 audio_fix_strength = 1.00
 ```
 
-Do not set `audio_adapter_strength=0` for this test. That was a useful mitigation for the released checkpoint, but it would remove part of the full adapter stack on top of which the correction is trained.
+Only after that canonical validation should the same checkpoint be transfer-tested at the deployment Turbo strength `0.75`. Record any deployment-only routing difference, such as `global_gate_mode=video_only`, separately rather than baking it into the training profile.
+
+Do not set `audio_adapter_strength=0` for either trained-checkpoint test. That was a useful diagnostic/mitigation for the released checkpoint, but it removes part of the full adapter stack on top of which the correction is trained.
 
 ## 7. Acceptance criteria before long training
 
