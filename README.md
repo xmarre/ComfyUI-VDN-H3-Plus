@@ -4,7 +4,7 @@
 
 A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
 
-This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate). It also ships an in-repo Comfy Kitchen INT8 ConvRot converter for the VDN linear branch, so the supported INT8 VDN stage can be created directly from an official OpenVDN stage instead of requiring a separate pre-quantized model download.
+This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate). For the 8-step DMD stage, users can either download the ready-made Comfy Kitchen INT8 ConvRot build or reproduce the same supported stage conversion locally with the included quantizer.
 
 > The VDN model weights are separate from this repository and retain their upstream license. See [NOTICE](NOTICE) for implementation provenance and attribution.
 
@@ -17,7 +17,24 @@ git clone https://github.com/xmarre/ComfyUI-VDN-H3-Plus.git ComfyUI-VDN-H3
 
 Restart ComfyUI.
 
-Download an official VDN stage under `ComfyUI/models/vdn/` while preserving its directory structure, for example:
+### Recommended: pre-quantized INT8 ConvRot VDN stage
+
+For the released 8-step DMD/Turbo stage, the simplest path is the existing pre-quantized build:
+
+[**drbaph/vdn-minimax-h3-int8-convrot-comfyui**](https://huggingface.co/drbaph/vdn-minimax-h3-int8-convrot-comfyui)
+
+```bash
+hf download drbaph/vdn-minimax-h3-int8-convrot-comfyui \
+  --local-dir <ComfyUI>/models/vdn/vdn-minimax-h3-int8-convrot-comfyui
+```
+
+This is a pre-quantized build of the same released OpenVDN `stage-dmd-step-250` VDN stage, using the Comfy Kitchen INT8 ConvRot branch format supported by this node. It is not a separately trained VDN model. Use this unless you specifically want to reproduce the conversion yourself or quantize another supported stage.
+
+The downloaded folder becomes the `vdn_checkpoint` entry.
+
+### Official BF16 stages
+
+You can instead download the original OpenVDN stage under `ComfyUI/models/vdn/` while preserving its directory structure, for example:
 
 ```bash
 hf download OpenVDN/vdn-minimax-h3 \
@@ -30,11 +47,11 @@ Official stages include:
 - `stage-dmd-step-250` — released 8-step DMD/Turbo stage;
 - `stage-b-step-2000` — released Stage-B/default stage.
 
-### Build your own INT8 ConvRot VDN stage
+### Alternative: build your own INT8 ConvRot VDN stage
 
-A separate INT8 VDN checkpoint repository is **not required**. This repository includes `tools/quantize_vdn_branch_int8.py`, which converts an official OpenVDN stage into the Comfy Kitchen INT8 ConvRot format already supported by the node.
+This repository includes `tools/quantize_vdn_branch_int8.py`, which converts an official OpenVDN stage into the same Comfy Kitchen INT8 ConvRot format already supported by the node.
 
-From this repository checkout:
+After downloading the official stage, run from this repository checkout:
 
 ```bash
 python tools/quantize_vdn_branch_int8.py \
@@ -62,8 +79,6 @@ Useful options:
 --overwrite     replace an existing output directory
 --cpu           quantize on CPU instead of CUDA (slower)
 ```
-
-Pre-quantized mirrors can still be used as a convenience, but they are not a different trained VDN model and are not necessary to obtain the INT8 ConvRot VDN stage.
 
 ## Nodes
 
