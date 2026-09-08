@@ -32,6 +32,31 @@ This is a pre-quantized build of the same released OpenVDN `stage-dmd-step-250` 
 
 The downloaded folder becomes the `vdn_checkpoint` entry.
 
+#### Required companion for pruned/curve MiniMax-H3 bases
+
+If the selected MiniMax-H3 diffusion model is one of Comfy-Org's `*_pruned_*` / curve-AdaLN checkpoints and the released VDN Turbo adapter is enabled, the VDN stage also needs the exact ~97 KB AdaLN pruning affine. The normal Comfy-Org `minimax_h3_*_pruned_bf16.safetensors` files do **not** contain `adaln_basis` or `adaln_mean`, so do not point `extract_h3_adaln_affine.py` at those files.
+
+The matching sidecars are published by [multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned), whose provenance uses the corresponding Comfy-Org pruned curve tables unchanged:
+
+- T2VA / FL2VA base: `transformer/adaln_affine.safetensors`
+- Ref2VA base: `transformer_ref/adaln_affine.safetensors`
+
+Install the one matching the loaded base as `<VDN stage>/adaln_affine.safetensors`. For example, for FL2VA/T2VA with the recommended INT8 ConvRot VDN stage:
+
+```bash
+TMP="$(mktemp -d)"
+hf download multimodalart/MiniMax-H3-Pruned \
+  transformer/adaln_affine.safetensors \
+  --local-dir "$TMP"
+cp "$TMP/transformer/adaln_affine.safetensors" \
+  <ComfyUI>/models/vdn/vdn-minimax-h3-int8-convrot-comfyui/adaln_affine.safetensors
+rm -rf "$TMP"
+```
+
+For Ref2VA, replace `transformer/adaln_affine.safetensors` with `transformer_ref/adaln_affine.safetensors` in both lines.
+
+Dense/non-pruned MiniMax-H3 bases do not need this companion because their AdaLN input remains full-width.
+
 ### Official BF16 stages
 
 You can instead download the original OpenVDN stage under `ComfyUI/models/vdn/` while preserving its directory structure, for example:
@@ -147,13 +172,17 @@ Ownership depends on adapter mode:
 
 This distinction matters on quantized/pruned H3. Earlier v1.5.x candidates that materialized the projected AdaLN terms in bypass mode were part of the remaining VDN-specific execution preceding the production CUDA failure boundary. The bypass path now avoids that base-weight mutation entirely.
 
-If a matching BF16 source checkpoint remains beside an INT8 derivative, VDN can read only the small affine tensors from it. Otherwise use:
+For the standard Comfy-Org `*_pruned_*` single-file checkpoints, use the published ~97 KB sidecar described in [Required companion for pruned/curve MiniMax-H3 bases](#required-companion-for-prunedcurve-minimax-h3-bases). Those Comfy-Org files contain the collapsed curve table but omit `adaln_basis` and `adaln_mean`, so the extraction tool cannot recover the affine from them.
+
+`tools/extract_h3_adaln_affine.py` remains available only for a matching source checkpoint that actually contains `adaln_basis` and `adaln_mean` (for example, a repaired/private artifact that deliberately retained the pruning auxiliaries):
 
 ```bash
 python tools/extract_h3_adaln_affine.py \
-  <matching-pruned-bf16.safetensors> \
+  <source-containing-adaln_basis-and-adaln_mean.safetensors> \
   <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
 ```
+
+If that source also contains `adaln_t_table` / `time_embedder.table`, the tool records the table identity in the sidecar. Otherwise a deliberately stage-local sidecar is treated as an explicit companion. VDN still fails closed on any verified table mismatch and never silently drops the 51 released AdaLN updates.
 
 ## Branch weights and retained buffers
 

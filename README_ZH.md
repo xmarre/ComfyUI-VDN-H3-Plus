@@ -141,17 +141,36 @@ bias_delta = B @ (A @ mean)
 
 已安装 checkpoint 候选必须能证明其 curve table 与当前 base 相同；table 不匹配或无法验证的 affine 会 fail closed。
 
-对于修复后的 pruned MiniMax-H3 Comfy 模型谱系，BF16 源文件可以保留 `adaln_basis` 和 `adaln_mean`，而 INT8 派生文件可能有意省略这些原生 inference 不需要的辅助 tensor。如果匹配 BF16 文件仍与所选 INT8/INT8-ConvRot 文件放在同一目录，VDN 会自动读取它的少量 affine tensor/table，不会加载整份 BF16 模型。
+标准 Comfy-Org MiniMax-H3 `*_pruned_*` 单文件检查点包含折叠后的 curve table，但**不包含** `adaln_basis` 或 `adaln_mean`。因此不要把 `minimax_h3_fl2va_pruned_bf16.safetensors` 或 `minimax_h3_ref2va_pruned_bf16.safetensors` 传给 `extract_h3_adaln_affine.py`；该工具无法从这些文件中提取不存在的 tensor。
 
-如果不保留 BF16 sibling，只需一次性提取约 97 KB 的 companion：
+与这些 Comfy-Org curve table 对应的约 97 KB sidecar 已由 [multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned) 发布：
+
+- T2VA / FL2VA：`transformer/adaln_affine.safetensors`
+- Ref2VA：`transformer_ref/adaln_affine.safetensors`
+
+下载与当前 base 匹配的文件，并放到当前 VDN stage 中，文件名必须为 `adaln_affine.safetensors`。例如 T2VA/FL2VA：
+
+```bash
+TMP="$(mktemp -d)"
+hf download multimodalart/MiniMax-H3-Pruned \
+  transformer/adaln_affine.safetensors \
+  --local-dir "$TMP"
+cp "$TMP/transformer/adaln_affine.safetensors" \
+  <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
+rm -rf "$TMP"
+```
+
+Ref2VA 时将命令中的 `transformer/adaln_affine.safetensors` 两处都替换为 `transformer_ref/adaln_affine.safetensors`。
+
+`tools/extract_h3_adaln_affine.py` 只保留给真正含有 `adaln_basis` 和 `adaln_mean` 的匹配源检查点使用，例如有意保留 pruning auxiliary tensor 的 repaired/private artifact：
 
 ```bash
 python tools/extract_h3_adaln_affine.py \
-  <path-to-matching-pruned-bf16.safetensors> \
+  <source-containing-adaln_basis-and-adaln_mean.safetensors> \
   <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
 ```
 
-源文件含 curve table 时，工具会写入 table identity。若无法建立可信的匹配 affine，VDN 会明确报错，而不是丢掉 Turbo 的 51 个 AdaLN 更新或猜测 basis。
+源文件还含 `adaln_t_table` / `time_embedder.table` 时，工具会写入 table identity。若存在已验证的 table mismatch，VDN 仍会 fail closed；不会丢掉 Turbo 的 51 个 AdaLN 更新或猜测 basis。
 
 ## VDN branch 权重驻留
 
