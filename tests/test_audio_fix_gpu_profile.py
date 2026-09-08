@@ -30,3 +30,17 @@ def test_gpu_trainer_rejects_10_step_canonical_profile_textually():
     source = GPU_TRAINER.read_text(encoding="utf-8")
     assert "Canonical Turbo-1.0 audio-fix training requires --sampler-steps 8" in source
     assert '"sampler_steps": CANONICAL_SAMPLER_STEPS' in source
+
+
+def test_gpu_trainer_records_factor_gradient_and_prodigy_telemetry():
+    source = GPU_TRAINER.read_text(encoding="utf-8")
+    for field in (
+        '"nonzero_lora_a_grad_tensors"',
+        '"nonzero_lora_b_grad_tensors"',
+        '"prodigy_d"',
+        '"prodigy_d_prev"',
+    ):
+        assert field in source
+    assert 'optimizer_group = optimizer.param_groups[0]' in source
+    assert 'prodigy_d = float(optimizer_group["d"])' in source
+    assert 'prodigy_d_prev = float(optimizer_group["d_prev"])' in source
