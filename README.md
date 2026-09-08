@@ -4,7 +4,7 @@
 
 A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
 
-This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate).
+This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate). It also ships an in-repo Comfy Kitchen INT8 ConvRot converter for the VDN linear branch, so the supported INT8 VDN stage can be created directly from an official OpenVDN stage instead of requiring a separate pre-quantized model download.
 
 > The VDN model weights are separate from this repository and retain their upstream license. See [NOTICE](NOTICE) for implementation provenance and attribution.
 
@@ -29,6 +29,41 @@ Official stages include:
 
 - `stage-dmd-step-250` — released 8-step DMD/Turbo stage;
 - `stage-b-step-2000` — released Stage-B/default stage.
+
+### Build your own INT8 ConvRot VDN stage
+
+A separate INT8 VDN checkpoint repository is **not required**. This repository includes `tools/quantize_vdn_branch_int8.py`, which converts an official OpenVDN stage into the Comfy Kitchen INT8 ConvRot format already supported by the node.
+
+From this repository checkout:
+
+```bash
+python tools/quantize_vdn_branch_int8.py \
+  <ComfyUI>/models/vdn/stage-dmd-step-250
+```
+
+By default this creates the sibling stage:
+
+```text
+<ComfyUI>/models/vdn/stage-dmd-step-250-int8_convrot_comfyui/
+```
+
+with the quantized branch file:
+
+```text
+linear_branch/model_int8_convrot_comfyui.safetensors
+```
+
+The source stage is never modified. `model_spec.json`, adapters, and non-eligible tensors are preserved; only the supported VDN branch `F.linear` weights are quantized to Comfy Kitchen tensor-wise INT8 with ConvRot. The resulting stage is discovered through the normal `vdn_checkpoint` selector and works with the existing `branch_weights=auto` / `stream` paths.
+
+Useful options:
+
+```text
+--out <dir>     choose a different output stage directory
+--overwrite     replace an existing output directory
+--cpu           quantize on CPU instead of CUDA (slower)
+```
+
+Pre-quantized mirrors can still be used as a convenience, but they are not a different trained VDN model and are not necessary to obtain the INT8 ConvRot VDN stage.
 
 ## Nodes
 

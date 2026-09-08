@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-vdn-h3"
 version = "1.5.2"
-description = "VDN-H3 hybrid attention for ComfyUI's native MiniMax-H3 model"
+description = "VDN-H3 hybrid attention for ComfyUI MiniMax-H3 with self-quantized INT8 ConvRot VDN stages"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
