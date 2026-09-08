@@ -390,21 +390,35 @@ def main():
                 progress.phase("gradient validation + optimizer")
                 grad_sq = 0.0
                 nonzero = 0
-                for parameter in bank.parameters():
-                    if parameter.grad is None:
-                        continue
-                    if not impl.torch.isfinite(parameter.grad).all():
-                        raise FloatingPointError("non-finite audio-fix gradient")
-                    maximum = float(parameter.grad.detach().abs().max())
-                    if maximum > 0:
-                        nonzero += 1
-                    grad_sq += float(parameter.grad.detach().float().pow(2).sum())
+                nonzero_a = 0
+                nonzero_b = 0
+                for pair in bank.pairs:
+                    for side, parameter in (("A", pair.lora_A), ("B", pair.lora_B)):
+                        if parameter.grad is None:
+                            continue
+                        if not impl.torch.isfinite(parameter.grad).all():
+                            raise FloatingPointError("non-finite audio-fix gradient")
+                        maximum = float(parameter.grad.detach().abs().max())
+                        if maximum > 0:
+                            nonzero += 1
+                            if side == "A":
+                                nonzero_a += 1
+                            else:
+                                nonzero_b += 1
+                        grad_sq += float(parameter.grad.detach().float().pow(2).sum())
                 if nonzero == 0:
                     raise RuntimeError(
                         "audio_fix received no nonzero gradients through the full INT8/VDN graph")
                 optimizer.step()
                 step += 1
                 elapsed = time.time() - started
+
+                # prodigy-plus-schedule-free is pinned to 2.0.1. With d_limiter=True,
+                # this adaptive scale is the quantity that tells us whether a short
+                # diagnostic run has actually escaped the deliberately tiny d0 regime.
+                optimizer_group = optimizer.param_groups[0]
+                prodigy_d = float(optimizer_group["d"])
+                prodigy_d_prev = float(optimizer_group["d_prev"])
 
                 peak_gib = impl.torch.cuda.max_memory_allocated(device) / (1 << 30)
                 row = {
@@ -417,6 +431,10 @@ def main():
                     "video_preserve_loss": float(video_loss.detach()),
                     "grad_norm": grad_sq ** 0.5,
                     "nonzero_grad_tensors": nonzero,
+                    "nonzero_lora_a_grad_tensors": nonzero_a,
+                    "nonzero_lora_b_grad_tensors": nonzero_b,
+                    "prodigy_d": prodigy_d,
+                    "prodigy_d_prev": prodigy_d_prev,
                     "seconds": elapsed,
                     "peak_gib": peak_gib,
                     **profile,
