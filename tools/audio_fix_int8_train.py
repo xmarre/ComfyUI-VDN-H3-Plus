@@ -7,8 +7,8 @@ encoder. The frozen teacher is the same quantized H3 base without VDN/adapters; 
 student is VDN + configurable Stage-B/Turbo strengths plus the trainable audio-only
 sidecar.
 
-The current training rollout deliberately uses exact H3 evaluations at every selected
-10-step RES location. It does not emulate Spectrum forecasts or Progressive/Continuum
+The canonical training rollout deliberately uses exact H3 evaluations at every selected
+8-step RES location. It does not emulate Spectrum forecasts or Progressive/Continuum
 phase boundaries; checkpoints record that rollout profile explicitly so it cannot be
 mistaken for an exact full-workflow trajectory match.
 """
@@ -70,6 +70,7 @@ VIDEO_CHANNELS = 24
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
 AUDIO_SCALE = VIDEO_SHIFT / AUDIO_SHIFT
+CANONICAL_SAMPLER_STEPS = 8
 ROLLOUT_PROFILE = "exact_res_all_actual_no_spectrum_or_progressive_handoff"
 
 
@@ -279,7 +280,7 @@ def _save_adapter(output_root, step, bank, base_path, vdn_checkpoint, latent_sha
             "vdn_checkpoint": vdn_checkpoint,
             "sampler": "res_multistep",
             "sigma_schedule": "simple",
-            "sampler_steps": 10,
+            "sampler_steps": CANONICAL_SAMPLER_STEPS,
             "video_shift": VIDEO_SHIFT,
             "audio_shift": AUDIO_SHIFT,
             "stage_b_strength": float(stage_b_strength),
@@ -319,7 +320,7 @@ def main():
     parser.add_argument("--audio-latent-frames", type=int, default=292,
                         help="7-second H3 chunk -> 292 audio latent frames per stereo stream")
     parser.add_argument("--train-steps", type=int, default=250)
-    parser.add_argument("--sampler-steps", type=int, default=10)
+    parser.add_argument("--sampler-steps", type=int, default=CANONICAL_SAMPLER_STEPS)
     parser.add_argument("--stage-b-strength", type=float, default=1.0)
     parser.add_argument("--turbo-strength", type=float, default=1.0)
     parser.add_argument(
@@ -337,8 +338,10 @@ def main():
                         help="Force one optimizer step and save step 0/1")
     args = parser.parse_args()
 
-    if args.sampler_steps != 10:
-        raise SystemExit("Production audio-fix contract requires --sampler-steps 10")
+    if args.sampler_steps != CANONICAL_SAMPLER_STEPS:
+        raise SystemExit(
+            "Canonical Turbo-1.0 audio-fix training requires --sampler-steps 8; "
+            "10-step reduced-Turbo deployment runs are a separate transfer profile")
     if args.video_latent_frames != 52 or args.audio_latent_frames != 292:
         raise SystemExit(
             "Production 7-second contract requires --video-latent-frames 52 and "
@@ -416,8 +419,8 @@ def main():
     sigmas = comfy.samplers.calculate_sigmas(
         base.model.model_sampling, "simple", args.sampler_steps).to(
             device=device, dtype=torch.float32)
-    if sigmas.numel() != 11 or float(sigmas[-1]) != 0.0:
-        raise RuntimeError(f"Unexpected production simple sigma table: {sigmas.tolist()}")
+    if sigmas.numel() != CANONICAL_SAMPLER_STEPS + 1 or float(sigmas[-1]) != 0.0:
+        raise RuntimeError(f"Unexpected canonical simple sigma table: {sigmas.tolist()}")
 
     # Direct H3 calls do not pass through Comfy's normal prepare_model_patcher path.
     # Merge the student's ModelPatcher wrappers explicitly and fail closed if either
@@ -467,7 +470,7 @@ def main():
                 audio_span = generated_audio_span(
                     context.shape[1], args.video_latent_frames,
                     args.latent_height, args.latent_width, args.audio_latent_frames)
-                # Uniformly train every exact model-call location in the 10-NFE grid.
+                # Uniformly train every exact model-call location in the canonical 8-NFE grid.
                 # Spectrum/progressive phase topology is deliberately not represented
                 # by this rollout profile and is validated separately before full training.
                 train_index = random.Random(args.seed + step * 1000003).randrange(args.sampler_steps)
