@@ -155,8 +155,6 @@ def make_layout_wrapper(state):
             try:
                 return executor(*args, **kwargs)
             except comfy.model_management.InterruptProcessingException:
-                # All persistent scratch belongs to this VDNState, so a cancelled
-                # execution can release it without touching another node/model.
                 state.runtime.clear()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -253,8 +251,6 @@ def make_vdn_forward(attn, state, block_index):
         if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
 
-        # ModelPatcher clones share VDNState. Keep the small lazy backend selector on
-        # an execution-local shallow branch copy so simultaneous geometry cannot race.
         branch = copy.copy(base_branch)
         branch._backend = None
         branch._backend_key = None
@@ -329,6 +325,10 @@ def make_vdn_forward(attn, state, block_index):
         v = v.clone()
 
         if window_active:
+            # Apply only explicit shape-preserving preprocessing on the full
+            # post-RoPE sequence, before VDN remaps rows into local KV domains.
+            from vdn_h3.softmax_provider import preprocess
+            q, k, v = preprocess(transformer_options, q, k, v, heads)
             backend = state.softmax_backend
             if backend == "flex":
                 from vdn_h3.window import window_softmax_flex
@@ -344,7 +344,7 @@ def make_vdn_forward(attn, state, block_index):
                             transformer_options, native_flex, q, k, v,
                             kind="flex_masked", scale=head_dim ** -0.5)
                     finally:
-                        del native_flex  # release QKV before the linear complement
+                        del native_flex
                 except Exception as exc:
                     backend = "grouped"
                     _log.warning(
@@ -406,7 +406,7 @@ def make_vdn_forward(attn, state, block_index):
 
     vdn_forward.attention_history_v1 = attention_history
     vdn_forward._vdn_forward = True
-    vdn_forward._vdn_softmax_provider_api = 1
+    vdn_forward._vdn_softmax_provider_api = 2
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     return vdn_forward
 
