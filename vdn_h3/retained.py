@@ -143,6 +143,7 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
     groups = []
     square_aligned = []
     max_kv_rows = global_idx.numel()
+    global_count = global_idx.numel()
     for (lo, hi), frames in grouped.items():
         extra = [
             frame for frame in anchors
@@ -151,9 +152,14 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         key_frames = sorted(set(range(lo, hi + 1)) | set(extra))
         win_idx = torch.cat([frame_rows(frame) for frame in key_frames])
         q_idx = torch.cat([frame_rows(frame) for frame in frames])
-        groups.append((q_idx, win_idx))
-        square_aligned.append(global_idx.numel() == 0 and frames == key_frames)
-        max_kv_rows = max(max_kv_rows, global_idx.numel() + win_idx.numel())
+        # K/V are consumed in [global rows, window rows] order. The v2 square
+        # domain uses real Q rows in exactly that same order. Mapping requested Q
+        # rows into the square output is therefore independent of attention math.
+        domain_idx = torch.cat((global_idx, win_idx)) if global_count else win_idx
+        query_positions = torch.searchsorted(win_idx, q_idx) + global_count
+        groups.append((q_idx, win_idx, domain_idx, query_positions))
+        square_aligned.append(global_count == 0 and frames == key_frames)
+        max_kv_rows = max(max_kv_rows, global_count + win_idx.numel())
 
     return {
         "global_idx": global_idx,
@@ -175,16 +181,18 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                                    anchor_frames="none", transformer_options=None):
     """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
 
-    VDN's released local-window operator is exact SDPA. Model-level attention
-    overrides (Sage/Kitchen/etc.) apply to native/base attention, but must not leak
-    into VDN's trained local-window branch. Only the explicit
-    ``vdn_softmax_provider_v1`` subcall contract is consumed.
+    VDN's native local-window operator is exact SDPA. Generic model-level dense
+    overrides do not leak into the trained local branch. Explicit v1/v2 providers
+    may consume only the row domains VDN already selected. v2 may evaluate real
+    extra Q rows aligned to the restricted KV domain, then return the requested
+    rows; it may not expand or alter the KV domain.
     """
-    from .softmax_provider import dispatch
+    from .softmax_provider import dispatch, has_v2
 
-    def attend(q, k, v, kind, aligned=False):
+    def attend(q, k, v, kind, aligned=False, **contract):
         return dispatch(transformer_options, lambda: W._sdpa(q, k, v, scale, None),
-                        q, k, v, kind=kind, scale=scale, square_aligned=aligned)
+                        q, k, v, kind=kind, scale=scale,
+                        square_aligned=aligned, **contract)
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
     resources = current_runtime_buffers()
@@ -221,21 +229,27 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         if global_count:
             torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
             torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
-        for group_index, (q_idx, win_idx) in enumerate(groups):
+        v2 = has_v2(transformer_options)
+        for group_index, (q_idx, win_idx, domain_idx, query_positions) in enumerate(groups):
             window_rows = win_idx.numel()
+            domain_rows = global_count + window_rows
             torch.index_select(
                 key, 0, win_idx,
-                out=k_scratch[global_count:global_count + window_rows])
+                out=k_scratch[global_count:domain_rows])
             torch.index_select(
                 value, 0, win_idx,
-                out=v_scratch[global_count:global_count + window_rows])
+                out=v_scratch[global_count:domain_rows])
             q_rows = query.index_select(0, q_idx)
+            square_q = query.index_select(0, domain_idx) if v2 else None
             out[q_idx] = attend(
                 q_rows,
-                k_scratch[:global_count + window_rows],
-                v_scratch[:global_count + window_rows],
+                k_scratch[:domain_rows],
+                v_scratch[:domain_rows],
                 "local",
                 plan["square_aligned"][group_index],
+                square_q=square_q,
+                query_positions=query_positions if v2 else None,
+                sink_rows=global_count,
             )
 
     for start, stop in plan["anchor_slices"]:
