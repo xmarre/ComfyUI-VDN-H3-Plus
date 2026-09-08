@@ -1,17 +1,53 @@
-# Optional softmax subcall providers
+# Optional attention subcall providers
 
 Companion: [Sol-H3 PR #1](https://github.com/xmarre/ComfyUI-Sol-H3/pull/1).
 
-`transformer_options["vdn_softmax_provider_v1"]` is an optional callable:
+VDN keeps ownership of its trained window/global/anchor geometry, learned softmax gate, output projection and learned linear complement. External providers can only operate on domains VDN has already selected.
+
+## v1
+
+`transformer_options["vdn_softmax_provider_v1"]` remains supported:
 
 ```python
 provider(native, q, k, v, *, kind, scale, square_aligned=False)
 ```
 
-It returns `[query_rows, heads, head_dim]` with unchanged dtype/device. `native()` executes the original operation. Model-level optimized-attention overrides are never passed to VDN's trained local SDPA helper.
+It returns `[query_rows, heads, head_dim]` with unchanged dtype/device. `native()` executes the original operation. `square_aligned=True` means Q and KV already describe the same ordered row domain, not merely equal tensor dimensions.
 
-VDN selects all row domains before dispatch. `kind` distinguishes local, global, anchor and flex_masked operations. `square_aligned` means query and KV refer to the same ordered row domain, not merely equal tensor dimensions. A square-QKV kernel may accelerate eligible local calls; rectangular windows, global/anchor queries and masked Flex must retain their native semantics when unrepresentable. Never replace local KV with unrestricted full-sequence KV.
+Normal MiniMax-H3 VDN windows include packed non-video/global rows in KV. Their requested video Q rows are therefore usually rectangular against the restricted KV domain, so v1 cannot feed a square-QKV-only kernel.
 
-Softmax gates, output projection, learned linear complement, API-1/API-2 validation and Flex-to-grouped fallback remain VDN-owned. `attention_history_v1(options, packed_layout)` on the patched forward describes the current geometry for an optional forecasting consumer. A missing/stale descriptor returns None and must not authorize forecasting.
+## v2 square-domain contract
 
-CPU suite: 133 passed, 12 skipped. Additional Sol-H3 tests exercise real VDN/H3/Spectrum dispatch with a CPU SOL oracle and the linear branch explicitly disabled. Existing VDN math/oracle tests are separate. No GPU SOL, Flex or media evidence is claimed. Typical local windows include prefix KV and remain rectangular/native; no local speedup is promised.
+`transformer_options["vdn_softmax_provider_v2"]` receives the same restricted operation plus an optional real square query domain:
+
+```python
+provider(
+    native, q, k, v,
+    *, kind, scale, square_aligned=False,
+    square_q=None, query_positions=None, sink_rows=0,
+)
+```
+
+For a grouped local call, VDN constructs K/V in its existing order `[global_rows, permitted_window_rows]`. `square_q`, when supplied, contains the real Q rows from those exact same packed indices and in the same order. `query_positions` maps the original requested Q rows into that square domain. A provider may evaluate the extra query rows only to satisfy its kernel shape contract and then return `square_output.index_select(0, query_positions)`.
+
+This does **not** broaden VDN attention. K/V remain the exact VDN-restricted local domain. Global and anchor operations remain separate. The extra square-domain query results are disposable implementation work and do not enter VDN state or the learned linear complement.
+
+`kind` distinguishes `local`, `global`, `anchor` and `flex_masked`. Masked Flex retains its native mask semantics unless a provider explicitly supports them. The current Sol-H3 companion uses v2 only for representable local grouped calls; global/anchor/Flex retain native execution.
+
+## Full-domain QKV preprocessing
+
+`transformer_options["vdn_attention_preprocess_v1"]` is an optional shape-preserving preprocessing callable:
+
+```python
+preprocess(q, k, v, *, heads, transformer_options)
+```
+
+It runs once on the full post-RoPE VDN tensors before local row gathering. This is required for transforms such as Untwist whose metadata uses original packed-row coordinates; applying those transforms after window gathering would make the coordinates wrong. Shape, dtype and device must remain unchanged.
+
+Generic model-level dense attention overrides still do not automatically leak into VDN's trained local operator. The explicit provider/preprocess contracts define composition instead.
+
+## Validation
+
+The v2 mirror suite passes **148 tests** against pinned ComfyUI and the official OpenVDN oracle, plus current-Comfy import smoke tests. Sol-H3's native interoperability suite uses the real Comfy `ModelPatcher` object-patch lifecycle and confirms that a VDN v2 object patch reaches SOL's square-domain provider with CPU SDPA substituted for the unavailable CUDA kernel.
+
+This establishes structural equivalence of the square-domain mapping, not GPU performance or decoded-media quality. Square expansion can increase query work; Sol-H3 reports requested versus kernel rows so RTX PRO 6000 validation can determine whether the sparse kernel still provides a useful net gain.
