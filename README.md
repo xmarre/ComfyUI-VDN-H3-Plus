@@ -36,6 +36,8 @@ The downloaded folder becomes the `vdn_checkpoint` entry.
 
 If the selected MiniMax-H3 diffusion model is one of Comfy-Org's `*_pruned_*` / curve-AdaLN checkpoints and the released VDN Turbo adapter is enabled, the VDN stage also needs the exact ~97 KB AdaLN pruning affine. The normal Comfy-Org `minimax_h3_*_pruned_bf16.safetensors` files do **not** contain `adaln_basis` or `adaln_mean`, so do not point `extract_h3_adaln_affine.py` at those files.
 
+**Recommended pruned base:** [xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI](https://huggingface.co/xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI). Its repaired BF16 checkpoint deliberately retains `adaln_basis` and `adaln_mean`. If that BF16 file is the selected base, or remains installed under `models/diffusion_models` while one of the matching INT8/INT8-ConvRot derivatives is selected, VDN-H3-Plus can resolve the affine from it automatically and verify it against the loaded curve table. In that setup, **skip the sidecar download/copy below**. Keeping the matching BF16 file beside the quantized derivative is the simplest arrangement. If only the quantized derivative is installed, the ~97 KB sidecar is still required.
+
 The matching sidecars are published by [multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned), whose provenance uses the corresponding Comfy-Org pruned curve tables unchanged:
 
 - T2VA / FL2VA base: `transformer/adaln_affine.safetensors`
