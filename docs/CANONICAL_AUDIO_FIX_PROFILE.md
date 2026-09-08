@@ -59,7 +59,19 @@ The one-update checkpoint loaded correctly at runtime (`audio_fix_strength=1.0`,
 
 Therefore step 1 proves only that the adapter loads and influences inference. It does **not** establish corrective audio behavior.
 
-A structural reason makes one update especially weak evidence: with LoRA `B=0` at initialization, the first backward pass has zero gradient for A and can update only B. The observed `nonzero_grad_tensors=150` is exactly consistent with one nonzero B-gradient tensor for each of the 150 target modules. A-side learning can begin only after B becomes nonzero.
+A structural reason makes one update especially weak evidence: with LoRA `B=0` at initialization, the first backward pass has zero gradient for A and can update only B. The observed `nonzero_grad_tensors=150` is exactly consistent with one nonzero B-gradient tensor for each of the 150 target modules. A-side learning can begin only after B becomes nonzero. The GPU trainer now reports A-side and B-side nonzero-gradient counts separately.
+
+## Optimizer warm-up matters to the short-run gate
+
+The trainer pins `prodigy-plus-schedule-free==2.0.1` and currently uses `d0=1e-6`, `d_limiter=True`, and `lr=1.0`. In that optimizer version, `d_limiter` caps each update of the adaptive `d` estimate to at most `2^(1/4)` times the previous value. Even under maximum allowed growth, the post-step ceilings are therefore approximately:
+
+```text
+step 8   4e-6
+step 16  16e-6
+step 24  64e-6
+```
+
+The step-1 checkpoint was consequently both B-only **and** in the deliberately tiny initial Prodigy regime. A null result at step 8 would still be weak evidence against the objective. The authoritative GPU trainer records `prodigy_d`, `prodigy_d_prev`, `nonzero_lora_a_grad_tensors`, and `nonzero_lora_b_grad_tensors` so the next short experiment can distinguish optimizer starvation from an ineffective learned direction.
 
 ## Spectrum deployment mismatch
 
@@ -73,18 +85,46 @@ progressive_handoff_emulated = false
 
 Live Spectrum H3 code confirms that a forecast call does not execute the normal H3 block stack. Spectrum predicts the compact target final-hidden state from history and applies the current timestep-conditioned H3 final/output head to that prediction. Because `audio_fix` lives inside H3 transformer blocks, it cannot execute directly on a forecast-only call; its influence reaches later forecasts through corrected actual hidden-state history.
 
-This is a real trajectory mismatch, but it does not yet justify implementing forecast-aware training before demonstrating that more than one all-actual update moves the correction in the intended direction.
+This is a real trajectory mismatch, but it does not yet justify implementing forecast-aware training before demonstrating that a short all-actual run can move the correction in the intended direction at all.
 
-## Next gate
+## Next gate: short 25, not full 250
 
-Do not start the 250-step run. The next experiment is a short eight-update canonical run from a fresh state, followed by decoded-media A/B on the permanent known-bad seed and control prompts.
+Do not start the 250-step run. The next experiment is a fresh **25-update** canonical run. The purpose is not to establish final quality; it is to determine whether the present teacher-restoration objective and target set produce any useful decoded-media direction once both LoRA factors are active and Prodigy's adaptive scale has had enough updates to leave the immediate `d0` regime.
 
-Using trainer seed `378` is deliberate: with the current deterministic train-index selector, the first eight updates visit all eight canonical RES locations exactly once in this order:
+Using trainer seed `378` is deliberate: the first eight updates visit all eight canonical RES locations exactly once:
 
 ```text
 0, 3, 2, 7, 6, 1, 5, 4
 ```
 
-That gives substantially more information than extending the previous seed-0 sequence, which does not cover the full grid early.
+The first 25 selected indices are:
 
-If the step-8 adapter shows no perceptible movement on the known-bad seed, do not continue to 16/32/250 merely because training loss is finite. The next work should then isolate objective/target insufficiency versus Spectrum transfer. If it clearly improves the known-bad case without damaging the controls, continue only through early checkpoints and then re-evaluate Spectrum transfer before any long run.
+```text
+0, 3, 2, 7, 6, 1, 5, 4, 3, 7, 0, 6, 0, 1, 7, 7, 5, 7, 7, 3, 6, 5, 7, 6, 5
+```
+
+This is 11,750 H3 block-equivalents in the progress model, about `21.36x` the already-passed train-index-6 `/550` smoke, before one-time setup and checkpoint I/O. The corrected smoke's wall-clock duration is not preserved in the repository, so a tighter wall-clock prediction would be fabricated. Use the per-step `seconds` telemetry from the new run for the actual ETA; do not extrapolate from the obsolete paged ~20-minute run.
+
+Checkpoints 8, 16, 24, and final 25 are retained. Step 8 is an **early-direction probe only**: improvement there is informative, but no improvement is not a rejection criterion because the optimizer scale is still tightly limited. Step 25 is the primary short-run media checkpoint.
+
+Training must remain structurally healthy:
+
+- finite loss and gradients;
+- no recurrence of the paging cliff;
+- step 1 should show B-side gradients and zero A-side gradient tensors;
+- by steps 2-4, A-side and B-side gradients should both be active;
+- `prodigy_d` must be recorded and interpreted together with media results;
+- exported checkpoints must load normally.
+
+If A-side gradients remain absent through step 4, stop. If `prodigy_d` remains effectively pinned to `d0` through the run, a negative media result is an optimizer-scaling result, not evidence that the semantic objective is wrong.
+
+After step 25, perform matched decoded-media A/B on the permanent known-bad seed and control prompts in the real Spectrum + Progressive/Continuum workflow. Vary only `audio_fix_strength=0` versus `1`. Evaluate unwanted speech/gibberish, vocal loudness, silence compliance, whisper compliance, requested normal dialogue, ambience/effects, and video/action/composition preservation.
+
+Decision after step 25:
+
+1. Production Spectrum improves clearly and controls remain intact: the current objective/targets have evidence of the right direction. Continue only through early checkpoints; resolve Spectrum transfer before any long run.
+2. An all-actual diagnostic improves but production Spectrum does not: prioritize Spectrum-trajectory emulation/robustness rather than widening LoRA targets.
+3. Neither path improves **and** A/B gradients are healthy **and** `prodigy_d` has materially escaped its initial floor: evidence shifts toward an insufficient teacher/objective signal or target set.
+4. `prodigy_d` remains near its initial floor: revise optimizer scaling or the diagnostic budget before drawing semantic conclusions.
+5. Chatter drops only by suppressing requested speech, whispering, or ambience: reject the checkpoint; do not promote a generic speech suppressor.
+6. Video/action/composition drifts materially: reject or strengthen preservation constraints before scaling training.
