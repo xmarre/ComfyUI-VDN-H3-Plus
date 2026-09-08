@@ -141,6 +141,7 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         grouped.setdefault((lo, hi), []).append(frame)
 
     groups = []
+    square_aligned = []
     max_kv_rows = global_idx.numel()
     for (lo, hi), frames in grouped.items():
         extra = [
@@ -151,11 +152,13 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         win_idx = torch.cat([frame_rows(frame) for frame in key_frames])
         q_idx = torch.cat([frame_rows(frame) for frame in frames])
         groups.append((q_idx, win_idx))
+        square_aligned.append(global_idx.numel() == 0 and frames == key_frames)
         max_kv_rows = max(max_kv_rows, global_idx.numel() + win_idx.numel())
 
     return {
         "global_idx": global_idx,
         "groups": groups,
+        "square_aligned": square_aligned,
         "anchor_slices": [
             (
                 video_start + frame * tokens_per_frame,
@@ -174,10 +177,14 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
 
     VDN's released local-window operator is exact SDPA. Model-level attention
     overrides (Sage/Kitchen/etc.) apply to native/base attention, but must not leak
-    into VDN's trained local-window branch. ``transformer_options`` is accepted for
-    API compatibility only and deliberately ignored here.
+    into VDN's trained local-window branch. Only the explicit
+    ``vdn_softmax_provider_v1`` subcall contract is consumed.
     """
-    del transformer_options
+    from .softmax_provider import dispatch
+
+    def attend(q, k, v, kind, aligned=False):
+        return dispatch(transformer_options, lambda: W._sdpa(q, k, v, scale, None),
+                        q, k, v, kind=kind, scale=scale, square_aligned=aligned)
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
     resources = current_runtime_buffers()
@@ -200,8 +207,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     global_idx = plan["global_idx"]
     global_count = global_idx.numel()
     if global_count:
-        out[global_idx] = W._sdpa(
-            query[global_idx], key, value, scale, None)
+        out[global_idx] = attend(query[global_idx], key, value, "global")
 
     groups = plan["groups"]
     if groups:
@@ -215,7 +221,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         if global_count:
             torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
             torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
-        for q_idx, win_idx in groups:
+        for group_index, (q_idx, win_idx) in enumerate(groups):
             window_rows = win_idx.numel()
             torch.index_select(
                 key, 0, win_idx,
@@ -224,15 +230,14 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                 value, 0, win_idx,
                 out=v_scratch[global_count:global_count + window_rows])
             q_rows = query.index_select(0, q_idx)
-            out[q_idx] = W._sdpa(
+            out[q_idx] = attend(
                 q_rows,
                 k_scratch[:global_count + window_rows],
                 v_scratch[:global_count + window_rows],
-                scale,
-                None,
+                "local",
+                plan["square_aligned"][group_index],
             )
 
     for start, stop in plan["anchor_slices"]:
-        out[start:stop] = W._sdpa(
-            query[start:stop], key, value, scale, None)
+        out[start:stop] = attend(query[start:stop], key, value, "anchor")
     return out

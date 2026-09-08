@@ -333,10 +333,18 @@ def make_vdn_forward(attn, state, block_index):
             if backend == "flex":
                 from vdn_h3.window import window_softmax_flex
                 try:
-                    softmax_out = window_softmax_flex(
-                        q, k, v, layout.video_start, layout.video_end,
-                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                        head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
+                    from vdn_h3.softmax_provider import dispatch
+                    def native_flex(q=q, k=k, v=v):
+                        return window_softmax_flex(
+                            q, k, v, layout.video_start, layout.video_end,
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
+                    try:
+                        softmax_out = dispatch(
+                            transformer_options, native_flex, q, k, v,
+                            kind="flex_masked", scale=head_dim ** -0.5)
+                    finally:
+                        del native_flex  # release QKV before the linear complement
                 except Exception as exc:
                     backend = "grouped"
                     _log.warning(
@@ -387,7 +395,18 @@ def make_vdn_forward(attn, state, block_index):
                 readout.type_as(x), weights["to_out_linear.weight"])
         return out
 
+    def attention_history(options, packed_layout):
+        layout = state.layout
+        if layout is None or layout.seq_len != getattr(packed_layout, "seq_len", None):
+            return None
+        return (state.softmax_backend, layout.full_cover, layout.video_start, layout.video_end,
+                layout.num_frames, layout.tokens_per_frame, tuple(map(tuple, layout.bounds)),
+                cfg["anchor_frames"], bool(cfg.get("linear_enabled", True)),
+                repr(options.get(VDN_EXTERNAL_SEQUENCE_KEY)))
+
+    vdn_forward.attention_history_v1 = attention_history
     vdn_forward._vdn_forward = True
+    vdn_forward._vdn_softmax_provider_api = 1
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     return vdn_forward
 
