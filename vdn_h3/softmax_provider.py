@@ -7,10 +7,11 @@ extra queries to satisfy square-QKV kernels, but VDN still owns the KV domain,
 gates, projections and learned linear complement.
 
 A separate preprocessing hook is limited to shape-preserving Q/K/V transforms and
-runs on the full post-RoPE VDN tensors before window gathering. This lets transforms
-whose metadata uses original packed-row coordinates compose without remapping those
-coordinates inside each local window.
+runs on the full post-RoPE VDN tensors before grouped-window gathering. This lets
+transforms whose metadata uses original packed-row coordinates compose without
+remapping those coordinates inside each local window.
 """
+PROVIDER_API_VERSION = 2
 KEY = "vdn_softmax_provider_v1"
 KEY_V2 = "vdn_softmax_provider_v2"
 PREPROCESS_KEY = "vdn_attention_preprocess_v1"
