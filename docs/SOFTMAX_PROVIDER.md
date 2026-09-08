@@ -4,6 +4,8 @@ Companion: [Sol-H3 PR #1](https://github.com/xmarre/ComfyUI-Sol-H3/pull/1).
 
 VDN keeps ownership of its trained window/global/anchor geometry, learned softmax gate, output projection and learned linear complement. External providers can only operate on domains VDN has already selected.
 
+This overlay is intentionally implemented in the grouped retained-attention layer rather than by replacing `vdn_h3/hybrid.py`. That keeps the provider contract composable with the earlier audio-fidelity overlay (#8), which owns substantial hybrid-forward behavior.
+
 ## v1
 
 `transformer_options["vdn_softmax_provider_v1"]` remains supported:
@@ -32,7 +34,7 @@ For a grouped local call, VDN constructs K/V in its existing order `[global_rows
 
 This does **not** broaden VDN attention. K/V remain the exact VDN-restricted local domain. Global and anchor operations remain separate. The extra square-domain query results are disposable implementation work and do not enter VDN state or the learned linear complement.
 
-`kind` distinguishes `local`, `global`, `anchor` and `flex_masked`. Masked Flex retains its native mask semantics unless a provider explicitly supports them. The current Sol-H3 companion uses v2 only for representable local grouped calls; global/anchor/Flex retain native execution.
+The current Sol-H3 companion uses v2 for representable grouped-local calls. Global and anchor operations retain native execution. Masked Flex remains VDN-native; if Flex falls back to grouped, that grouped execution can consume v2.
 
 ## Full-domain QKV preprocessing
 
@@ -42,12 +44,16 @@ This does **not** broaden VDN attention. K/V remain the exact VDN-restricted loc
 preprocess(q, k, v, *, heads, transformer_options)
 ```
 
-It runs once on the full post-RoPE VDN tensors before local row gathering. This is required for transforms such as Untwist whose metadata uses original packed-row coordinates; applying those transforms after window gathering would make the coordinates wrong. Shape, dtype and device must remain unchanged.
+For grouped execution it runs once on the complete post-RoPE packed tensors inside `window_softmax_grouped_runtime`, before VDN gathers local row domains. This is required for transforms such as Untwist whose metadata uses original packed-row coordinates. Shape, dtype and device must remain unchanged.
 
 Generic model-level dense attention overrides still do not automatically leak into VDN's trained local operator. The explicit provider/preprocess contracts define composition instead.
 
+## Overlay compatibility
+
+PR #11 is designed to be applied after PR #8. Their runtime changes are separated deliberately: #8 keeps its hybrid-forward/audio/training behavior, while #11 adds the provider contract in `retained.py` plus the new provider module. The two overlays no longer both edit `vdn_h3/hybrid.py`.
+
 ## Validation
 
-The v2 PR suite passes **148 tests** against pinned ComfyUI and the official OpenVDN oracle, plus current-Comfy import smoke tests and legacy workflow migration. Sol-H3's native interoperability suite uses the real Comfy `ModelPatcher` object-patch lifecycle and confirms that a VDN v2 object patch reaches SOL's square-domain provider with CPU SDPA substituted for the unavailable CUDA kernel.
+The provider suite checks restricted-domain equivalence, v1/v2 dispatch, square-domain mapping, and full-domain preprocessing before grouped row gathering. The normal VDN CI lanes cover the pinned Comfy/OpenVDN oracle, current-Comfy smoke and legacy workflow migration.
 
-This establishes structural equivalence of the square-domain mapping, not GPU performance or decoded-media quality. The correctly ordered production RTX PRO 6000 run that motivated v2 used the older contract and executed zero sparse SOL calls; it is failure-reproduction evidence, not a SOL timing result. Square expansion can increase query work, so Sol-H3 reports requested versus kernel rows for the fresh post-v2 GPU validation.
+This establishes structural equivalence of the provider mapping, not GPU performance or decoded-media quality. The correctly ordered production RTX PRO 6000 run that motivated v2 used the older contract and executed zero sparse SOL calls; it is failure-reproduction evidence, not a SOL timing result. Square expansion can increase query work, so Sol-H3 reports requested versus kernel rows for the fresh post-v2 GPU validation.
