@@ -187,7 +187,13 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     extra Q rows aligned to the restricted KV domain, then return the requested
     rows; it may not expand or alter the KV domain.
     """
-    from .softmax_provider import dispatch, has_v2
+    from .softmax_provider import dispatch, has_v2, preprocess
+
+    # This is still the complete post-RoPE packed sequence. Run explicit QKV
+    # preprocessing here, before any VDN row gathering, so transforms that depend
+    # on original packed coordinates (for example Untwist) remain well-defined.
+    query, key, value = preprocess(
+        transformer_options, query, key, value, query.shape[1])
 
     def attend(q, k, v, kind, aligned=False, **contract):
         return dispatch(transformer_options, lambda: W._sdpa(q, k, v, scale, None),
