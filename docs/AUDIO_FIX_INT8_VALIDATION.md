@@ -16,7 +16,7 @@ conditioning_video_context_strength  1.00
 sampler                              8-step res_multistep
 sigma table                          Comfy simple
 video shift                          12
- audio shift                         3
+audio shift                          3
 video latent frames                  52
 stereo audio latent frames           292
 Spectrum emulation                   no
@@ -82,6 +82,29 @@ dL/dA = B^T (...) = 0
 
 so only B can learn. With 150 target modules, `nonzero_grad_tensors=150` is the expected B-only result. After the optimizer makes B nonzero, A can begin receiving gradient. One update therefore cannot distinguish "wrong objective" from "correct objective but effectively only initialized one side of the factorization".
 
+The authoritative GPU trainer now reports `nonzero_lora_a_grad_tensors` and `nonzero_lora_b_grad_tensors` separately so the next run verifies this directly rather than inferring it from a total count.
+
+## Prodigy short-run audit
+
+The training dependency is pinned to `prodigy-plus-schedule-free==2.0.1`. The trainer configures:
+
+```text
+lr          1.0
+d0          1e-6
+d_limiter   true
+d_coef      1.0
+```
+
+In that optimizer version, `d_limiter` caps the candidate adaptive scale at `d * 2^(1/4)` per optimizer step. Thus even if every update hits the limiter ceiling, the post-step upper bounds are only:
+
+```text
+step 8   4e-6
+step 16  16e-6
+step 24  64e-6
+```
+
+Actual growth can be slower. This changes the interpretation of the previous step-8 proposal: a null media result at eight updates cannot safely reject the teacher-restoration objective, because the adapter is still in a deliberately conservative optimizer-start regime. The GPU trainer now records `prodigy_d` and `prodigy_d_prev` in every metrics row.
+
 ## Spectrum audit
 
 The live Spectrum implementation was rechecked before choosing the next experiment.
@@ -93,9 +116,9 @@ The live Spectrum implementation was rechecked before choosing the next experime
 
 The canonical trainer's all-actual rollout is consequently not identical to the production Spectrum trajectory. This remains an open transfer question, not evidence that Spectrum caused the original yapping.
 
-## Next experiment: short canonical run, not full250
+## Next experiment: 25 fresh canonical updates, not full250
 
-Run eight fresh optimizer updates before redesigning the objective. This experiment is justified because it answers a specific question that step 1 could not answer: once both LoRA factors can learn and all canonical RES locations have been touched, does the current teacher-restoration objective move decoded media in the correct direction at all?
+The next run is a short 25-update experiment from a fresh training state. The information target is specific: once both LoRA factors are active, all eight canonical RES positions have been visited, and the adaptive optimizer scale has had materially more room to grow, does the current dense-teacher restoration objective produce any useful decoded-media direction?
 
 Use seed `378`. Under the current deterministic selector its first eight rollout indices are:
 
@@ -103,24 +126,34 @@ Use seed `378`. Under the current deterministic selector its first eight rollout
 0, 3, 2, 7, 6, 1, 5, 4
 ```
 
-so every canonical grid location is trained exactly once. The eight updates represent 3400 H3 block-equivalents in total (average 425/update), versus 550 block-equivalents for the prior train-index-6 smoke. Ignoring one-time setup/checkpoint I/O, the compute is therefore about `6.18x` that corrected one-step smoke, not eight copies of the obsolete ~20-minute paged run. The exact corrected smoke `seconds` field is not preserved in the repository, so do not fabricate a tighter wall-clock estimate; use the trainer's per-step `seconds` telemetry from this run.
+so every canonical grid location is trained exactly once before repetition. The first 25 indices are:
+
+```text
+0, 3, 2, 7, 6, 1, 5, 4, 3, 7, 0, 6, 0, 1, 7, 7, 5, 7, 7, 3, 6, 5, 7, 6, 5
+```
+
+Under the trainer's progress accounting, these 25 updates represent 11,750 H3 block-equivalents. That is about `21.36x` the already-passed train-index-6 `/550` smoke. This is the defensible compute estimate. The corrected smoke's elapsed seconds were not preserved in the repository, so do not derive wall-clock time from the obsolete ~20-minute paged implementation. The new run logs `seconds` per update and provides its own real ETA after the first few steps.
 
 ### Training-side stop conditions
 
-Do not interpret decreasing training loss as success. Require only structural health during the eight updates:
+Do not interpret decreasing training loss as success. Require structural health:
 
 - finite loss and gradients;
 - no recurrence of the paging cliff;
-- by step 2-4, `nonzero_grad_tensors` should rise above the step-1 B-only count of 150, showing that A-side gradients are now active;
-- checkpoints 2, 4, and 8 must export and load normally.
+- step 1 should report B-side gradients with zero A-side nonzero-gradient tensors;
+- by step 2-4, both A-side and B-side nonzero-gradient counts should be positive;
+- `prodigy_d` and `prodigy_d_prev` must be present in metrics;
+- checkpoints 8, 16, 24, and final 25 must export and load normally.
 
-If A-side gradients remain absent through step 4, stop and debug the factorized update path rather than spending more GPU time.
+If A-side gradients remain absent through step 4, stop and debug the factorized update path. If `prodigy_d` remains effectively pinned near `d0`, do not treat a negative media result as proof that the objective or target set is wrong; that would instead identify optimizer starvation.
+
+Step 8 is only an early-direction checkpoint. Improvement there is positive evidence; no improvement is inconclusive. Step 25 is the primary short-run media checkpoint. Checkpoints 8 and 16 are retained so that an overshoot or late degradation at step 25 can be distinguished from a consistently wrong direction.
 
 ## Decoded-media acceptance criteria
 
 The primary deployment acceptance remains a matched A/B in the real workflow where **only** `audio_fix_strength` changes.
 
-Keep at least one permanent seed that reliably yaps. For the step-8 checkpoint compare:
+Keep at least one permanent seed that reliably yaps. For the step-25 checkpoint compare:
 
 ```text
 audio_fix_strength = 0.00
@@ -141,15 +174,16 @@ Evaluate all of:
 
 A clean seed is not evidence of success. The permanent known-bad seed must improve.
 
-## Decision after step 8
+## Decision after step 25
 
 Use the following decision rule before spending more training compute:
 
 1. **Production Spectrum improves clearly and controls remain intact:** current objective/targets have evidence of the right direction. Continue only through early checkpoints; still resolve Spectrum transfer before a long run.
 2. **All-actual diagnostic improves but production Spectrum does not:** prioritize Spectrum-trajectory emulation/robustness. Do not widen LoRA targets yet.
-3. **Neither production nor all-actual improves:** the evidence shifts toward an insufficient objective/teacher signal or target set. Inspect semantic supervision and target coverage before more updates.
-4. **Chatter drops only by suppressing requested speech/whisper/ambience:** reject the checkpoint and redesign the objective; do not promote a generic speech suppressor.
-5. **Video/action/composition drifts materially:** reject or strengthen preservation constraints before scaling training.
+3. **Neither production nor all-actual improves, A/B gradients are healthy, and `prodigy_d` has materially escaped the initial floor:** the evidence shifts toward an insufficient teacher/objective signal or target set. Inspect semantic supervision and target coverage before more updates.
+4. **`prodigy_d` remains near the initial floor:** revise optimizer scaling or the diagnostic budget before drawing semantic conclusions.
+5. **Chatter drops only by suppressing requested speech/whisper/ambience:** reject the checkpoint and redesign the objective; do not promote a generic speech suppressor.
+6. **Video/action/composition drifts materially:** reject or strengthen preservation constraints before scaling training.
 
 For the all-actual diagnostic only, Spectrum's `enabled=false` path is the correct way to force actual H3 execution. That diagnostic is for causal isolation; it is not a deployment success criterion.
 
@@ -160,4 +194,4 @@ Do not start 250 steps until decoded-media evidence shows that the correction di
 - it transfers through the production Spectrum + Progressive/Continuum trajectory, or
 - the trainer has been deliberately updated to reproduce the relevant forecast trajectory and that path has passed matched media validation.
 
-A changed Stage-B/Turbo profile, sampler grid, global gate, geometry, rank/alpha, prompt corpus, or rollout semantics belongs in a new training output directory. Do not resume optimizer state across those changes.
+A changed Stage-B/Turbo profile, sampler grid, global gate, geometry, rank/alpha, prompt corpus, optimizer profile, or rollout semantics belongs in a new training output directory. Do not resume optimizer state across those changes.
