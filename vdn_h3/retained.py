@@ -141,7 +141,9 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         grouped.setdefault((lo, hi), []).append(frame)
 
     groups = []
-    max_kv_rows = global_idx.numel()
+    square_aligned = []
+    global_count = global_idx.numel()
+    max_kv_rows = global_count
     for (lo, hi), frames in grouped.items():
         extra = [
             frame for frame in anchors
@@ -151,11 +153,13 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         win_idx = torch.cat([frame_rows(frame) for frame in key_frames])
         q_idx = torch.cat([frame_rows(frame) for frame in frames])
         groups.append((q_idx, win_idx))
-        max_kv_rows = max(max_kv_rows, global_idx.numel() + win_idx.numel())
+        square_aligned.append(global_count == 0 and frames == key_frames)
+        max_kv_rows = max(max_kv_rows, global_count + win_idx.numel())
 
     return {
         "global_idx": global_idx,
         "groups": groups,
+        "square_aligned": square_aligned,
         "anchor_slices": [
             (
                 video_start + frame * tokens_per_frame,
@@ -172,12 +176,24 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                                    anchor_frames="none", transformer_options=None):
     """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
 
-    VDN's released local-window operator is exact SDPA. Model-level attention
-    overrides (Sage/Kitchen/etc.) apply to native/base attention, but must not leak
-    into VDN's trained local-window branch. ``transformer_options`` is accepted for
-    API compatibility only and deliberately ignored here.
+    VDN's native local-window operator is exact SDPA. Generic model-level dense
+    overrides do not leak into the trained local branch. Explicit v1/v2/v3 providers
+    may consume only the row domains VDN already selected. v2 receives a square-Q
+    compatibility payload only when no v3 direct-rectangular provider is installed;
+    v3 receives requested Q directly and therefore adds no square-Q gather/allocation.
     """
-    del transformer_options
+    from .softmax_provider import dispatch, has_v2, has_v3, preprocess
+
+    # This is still the complete post-RoPE packed sequence. Run explicit QKV
+    # preprocessing here, before any VDN row gathering, so transforms that depend
+    # on original packed coordinates (for example Untwist) remain well-defined.
+    query, key, value = preprocess(
+        transformer_options, query, key, value, query.shape[1])
+
+    def attend(q, k, v, kind, aligned=False, **contract):
+        return dispatch(transformer_options, lambda: W._sdpa(q, k, v, scale, None),
+                        q, k, v, kind=kind, scale=scale,
+                        square_aligned=aligned, **contract)
     heads, head_dim = query.shape[1], query.shape[2]
     seq = query.shape[0]
     resources = current_runtime_buffers()
@@ -200,8 +216,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     global_idx = plan["global_idx"]
     global_count = global_idx.numel()
     if global_count:
-        out[global_idx] = W._sdpa(
-            query[global_idx], key, value, scale, None)
+        out[global_idx] = attend(query[global_idx], key, value, "global")
 
     groups = plan["groups"]
     if groups:
@@ -215,24 +230,38 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         if global_count:
             torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
             torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
-        for q_idx, win_idx in groups:
+        v3 = has_v3(transformer_options)
+        v2 = not v3 and has_v2(transformer_options)
+        for group_index, (q_idx, win_idx) in enumerate(groups):
             window_rows = win_idx.numel()
+            domain_rows = global_count + window_rows
             torch.index_select(
                 key, 0, win_idx,
-                out=k_scratch[global_count:global_count + window_rows])
+                out=k_scratch[global_count:domain_rows])
             torch.index_select(
                 value, 0, win_idx,
-                out=v_scratch[global_count:global_count + window_rows])
+                out=v_scratch[global_count:domain_rows])
             q_rows = query.index_select(0, q_idx)
-            out[q_idx] = W._sdpa(
+            contract = {"sink_rows": global_count}
+            if v2:
+                # Legacy v2 square-Q compatibility is now genuinely lazy. The
+                # current Sol-H3 stack publishes v3, so this gather/allocation is
+                # absent from production rectangular dispatch.
+                domain_idx = torch.cat((global_idx, win_idx)) if global_count else win_idx
+                query_positions = torch.searchsorted(win_idx, q_idx) + global_count
+                contract.update(
+                    square_q=query.index_select(0, domain_idx),
+                    query_positions=query_positions,
+                )
+            out[q_idx] = attend(
                 q_rows,
-                k_scratch[:global_count + window_rows],
-                v_scratch[:global_count + window_rows],
-                scale,
-                None,
+                k_scratch[:domain_rows],
+                v_scratch[:domain_rows],
+                "local",
+                plan["square_aligned"][group_index],
+                **contract,
             )
 
     for start, stop in plan["anchor_slices"]:
-        out[start:stop] = W._sdpa(
-            query[start:stop], key, value, scale, None)
+        out[start:stop] = attend(query[start:stop], key, value, "anchor")
     return out
