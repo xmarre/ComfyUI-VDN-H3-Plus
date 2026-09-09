@@ -102,10 +102,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          archive="ComfyUI-VDN-H3-v${VERSION}.zip"
+          archive="ComfyUI-VDN-H3-Plus-v${VERSION}.zip"
           git archive \
             --format=zip \
-            --prefix="ComfyUI-VDN-H3-v${VERSION}/" \
+            --prefix="ComfyUI-VDN-H3-Plus-v${VERSION}/" \
             --output="dist/${archive}" \
             HEAD
           (cd dist && sha256sum "${archive}" > SHA256SUMS)
@@ -120,9 +120,9 @@ jobs:
         shell: bash
         run: |
           gh release create "${TAG}" \
-            "dist/ComfyUI-VDN-H3-v${VERSION}.zip" \
+            "dist/ComfyUI-VDN-H3-Plus-v${VERSION}.zip" \
             dist/SHA256SUMS \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${RELEASE_SHA}" \
-            --title "ComfyUI-VDN-H3 ${TAG}" \
+            --title "ComfyUI-VDN-H3-Plus ${TAG}" \
             --notes-file CURRENT_RELEASE_NOTES.md

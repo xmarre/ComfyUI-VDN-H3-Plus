@@ -1,7 +1,7 @@
 [project]
-name = "comfyui-vdn-h3"
-version = "1.5.3"
-description = "VDN-H3 hybrid attention for ComfyUI MiniMax-H3 with pre-quantized or self-built INT8 ConvRot VDN stages"
+name = "comfyui-vdn-h3-plus"
+version = "1.5.4"
+description = "VDN-H3-Plus hybrid attention for ComfyUI MiniMax-H3 with pre-quantized or self-built INT8 ConvRot VDN stages"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
@@ -27,5 +27,5 @@ OpenVDN = "https://github.com/OpenVDN/vdn-minimax-h3"
 
 [tool.comfy]
 PublisherId = "xmarre"
-DisplayName = "ComfyUI-VDN-H3"
+DisplayName = "ComfyUI-VDN-H3-Plus"
 Icon = "https://avatars.githubusercontent.com/u/84208527"
