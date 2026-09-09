@@ -1,3 +1,35 @@
+# ComfyUI-VDN-H3-Plus v1.5.4
+
+v1.5.4 is a packaging/release follow-up to v1.5.3. Runtime VDN math and provider behavior are unchanged.
+
+## Dedicated Comfy Registry identity
+
+The Plus fork now publishes under the distinct registry package name `comfyui-vdn-h3-plus` with `PublisherId = "xmarre"` and display name `ComfyUI-VDN-H3-Plus`.
+
+The previous package metadata still used upstream's `comfyui-vdn-h3` project name while changing only the publisher. That name is already associated with Saganaki22's upstream package, so the Comfy Registry correctly rejected the Plus fork publication with HTTP 403 even when a valid xmarre registry token was present.
+
+This release therefore avoids claiming or overwriting upstream's registry identity. Existing Git installs are unaffected.
+
+## Release pipeline hardening
+
+Registry publication is now tied to a successfully completed GitHub release workflow instead of publishing immediately from an arbitrary `pyproject.toml` push.
+
+Before publishing, the workflow verifies that:
+
+- the requested/current release exists and is not a draft;
+- the release tag targets current `main` rather than a stale commit;
+- the release tag exactly matches `[project].version`;
+- the registry package name is `comfyui-vdn-h3-plus`;
+- the publisher is `xmarre`.
+
+Release ZIP names, archive prefixes and GitHub release titles now consistently use the `ComfyUI-VDN-H3-Plus` fork name.
+
+## Relationship to v1.5.3
+
+All v1.5.3 functionality remains intact: rectangular softmax-provider API v3, lazy v2 square-Q compatibility, exactly-once full-domain preprocessing, INT8 ConvRot stage support/documentation, pruned AdaLN affine handling, and the production-validated Sol-H3 composition contract.
+
+The separate PR #8 audio-fidelity experiment remains unreleased and is still not a dependency of this release.
+
 # ComfyUI-VDN-H3 v1.5.3
 
 v1.5.3 adds the composable VDN softmax-provider API used by ComfyUI-Sol-H3 v0.1.0, removes the historical square-Q compatibility cost for rectangular providers, and includes the post-v1.5.2 setup/documentation fixes for INT8 ConvRot stages and pruned AdaLN affine sidecars.
