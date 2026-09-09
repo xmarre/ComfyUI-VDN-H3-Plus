@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-vdn-h3"
-version = "1.5.2"
+version = "1.5.3"
 description = "VDN-H3 hybrid attention for ComfyUI MiniMax-H3 with pre-quantized or self-built INT8 ConvRot VDN stages"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
