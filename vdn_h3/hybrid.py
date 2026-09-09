@@ -16,6 +16,7 @@ import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
+from vdn_h3 import compiler_guard
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
@@ -412,3 +413,9 @@ def apply_vdn(new_model, state):
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))
+    # Must be OUTER_SAMPLE, not DIFFUSION_MODEL: core decides whether to open an
+    # AIMDO malloc graph before it runs any DIFFUSION_MODEL wrapper. See
+    # vdn_h3.compiler_guard for the exact core lines.
+    new_model.add_wrapper_with_key(
+        WrappersMP.OUTER_SAMPLE, "vdn_h3_compiler_guard",
+        compiler_guard.make_outer_sample_wrapper())

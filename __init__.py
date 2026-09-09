@@ -12,11 +12,7 @@ _PKG = os.path.dirname(__file__)
 if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
-from vdn_h3.compiler_guard import install_layout_guard as _install_layout_guard
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
-
-_install_layout_guard()
-del _install_layout_guard
 
 # Frontend compatibility shim for legacy ApplyVDNH3Advanced positional workflows.
 WEB_DIRECTORY = "./web"
