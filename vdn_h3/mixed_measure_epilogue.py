@@ -69,21 +69,33 @@ def _scope_softmax_gate(gate: torch.Tensor, video_start: int, mode: str) -> torc
     return scoped
 
 
-def _validate_external_attention_controls(state) -> str:
-    """Reject audio diagnostics the unprojected-softmax ABI cannot reproduce."""
+def _validate_external_attention_controls(state, *, branch_present: bool, gate_expected: bool) -> str:
+    """Reject branch diagnostics the unprojected-softmax ABI cannot reproduce."""
+    if not branch_present:
+        # The normal VDN forward exits to native attention for branchless blocks, so
+        # none of PR #8's branch-only diagnostic controls apply there either.
+        return "checkpoint"
+
     cfg = getattr(state, "cfg", {})
-    gate_mode = cfg.get("global_gate_mode", "checkpoint")
-    if gate_mode not in ("checkpoint", "video_only"):
-        raise RuntimeError(
-            f"VDN Mixed-Grid epilogue does not support global_gate_mode={gate_mode!r}")
     for name in ("audio_video_context_strength", "conditioning_video_context_strength"):
-        strength = float(cfg.get(name, 1.0))
+        try:
+            strength = float(cfg.get(name, 1.0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"VDN Mixed-Grid epilogue received invalid {name}") from exc
         if strength != 1.0:
             raise RuntimeError(
                 f"VDN Mixed-Grid epilogue cannot preserve {name}={strength:g}; the external "
                 "unprojected-softmax path does not expose the alternate K/V domain required "
                 "by this diagnostic. Restore it to 1.0 or disable the Mixed-Grid provider."
             )
+
+    if not gate_expected:
+        # global_gate_mode is semantically dormant when the learned softmax gate is disabled.
+        return "checkpoint"
+    gate_mode = cfg.get("global_gate_mode", "checkpoint")
+    if gate_mode not in ("checkpoint", "video_only"):
+        raise RuntimeError(
+            f"VDN Mixed-Grid epilogue does not support global_gate_mode={gate_mode!r}")
     return gate_mode
 
 
@@ -236,10 +248,14 @@ class ExternalSoftmaxEpilogueCapability:
             raise RuntimeError("VDN Mixed-Grid epilogue weight ownership changed after capability attachment")
         if _digest(_config_identity(self.state, block_index, branch)) != self.config_digest:
             raise RuntimeError("VDN Mixed-Grid epilogue configuration changed after capability attachment")
-        global_gate_mode = _validate_external_attention_controls(self.state)
+        gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
+        global_gate_mode = _validate_external_attention_controls(
+            self.state,
+            branch_present=branch is not None,
+            gate_expected=gate_expected,
+        )
         contract = (options or {}).get(EXTERNAL_SEQUENCE_KEY)
         normalized = _validate_external_contract(contract, layout, int(x.shape[0]), rope_freqs)
-        gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
         return BoundVDNEpilogue(
             state=self.state,
             block_index=block_index,

@@ -18,7 +18,7 @@ class CountingProjection(torch.nn.Module):
 
 
 class State:
-    def __init__(self, **cfg):
+    def __init__(self, branch=True, **cfg):
         self.name = "audio-mixed-grid-test"
         self.cfg = {
             "enable_softmax_gate": True,
@@ -27,7 +27,7 @@ class State:
             "conditioning_video_context_strength": 1.0,
             **cfg,
         }
-        self.branches = [object()]
+        self.branches = [object() if branch else None]
         self.managed_weights = None
         self._layout = SimpleNamespace(
             seq_len=18,
@@ -104,3 +104,26 @@ def test_external_mixed_grid_fails_closed_for_unrepresentable_context_diagnostic
 
     with pytest.raises(RuntimeError, match=name):
         capability.prepare(x, rope, options(), 0)
+
+
+def test_branchless_block_ignores_branch_only_audio_diagnostics_like_normal_vdn_forward():
+    state = State(
+        branch=False,
+        audio_video_context_strength=0.0,
+        conditioning_video_context_strength=0.0,
+    )
+    projection = CountingProjection(8)
+    capability = ExternalSoftmaxEpilogueCapability(
+        state, 0, projection, heads=2, head_dim=4
+    )
+    x = torch.randn(24, 8)
+    rope = torch.zeros(1, 24, 1, 1)
+    softmax = torch.randn(24, 2, 4)
+
+    bound = capability.prepare(x, rope, options(), 0)
+    got = bound.apply(softmax, x)
+
+    torch.testing.assert_close(got, softmax.reshape(24, 8))
+    assert state.weight_calls == 0
+    assert projection.calls == 1
+    assert bound.gate_calls == 0
