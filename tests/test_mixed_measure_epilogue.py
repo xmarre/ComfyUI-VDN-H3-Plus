@@ -3,7 +3,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vdn_h3.mixed_measure_epilogue import ExternalSoftmaxEpilogueCapability
+from vdn_h3.mixed_measure_epilogue import (
+    EPILOGUE_KEY,
+    ExternalSoftmaxEpilogueCapability,
+    attach_external_softmax_epilogue,
+)
 
 
 class CountingProjection(torch.nn.Module):
@@ -60,6 +64,25 @@ def options(**overrides):
     }
     contract.update(overrides)
     return {"vdn_h3_external_sequence_v1": contract}
+
+
+def test_capability_attaches_to_concrete_vdn_forward_once():
+    state = State()
+    projection = CountingProjection(8)
+
+    def forward(*args, **kwargs):
+        raise AssertionError("attachment must not execute the forward")
+
+    capability = attach_external_softmax_epilogue(
+        forward, state, 0, projection, heads=2, head_dim=4
+    )
+    assert getattr(forward, EPILOGUE_KEY) is capability
+    assert capability.state is state
+    assert capability.out_proj is projection
+    with pytest.raises(RuntimeError, match="already attached"):
+        attach_external_softmax_epilogue(
+            forward, state, 0, projection, heads=2, head_dim=4
+        )
 
 
 def test_nontrivial_gate_and_projection_are_applied_exactly_once():
