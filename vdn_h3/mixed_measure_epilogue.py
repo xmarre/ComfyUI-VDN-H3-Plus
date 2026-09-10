@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 EPILOGUE_KEY = "vdn_h3_external_softmax_epilogue_v1"
+EPILOGUE_RECEIPTS_KEY = "vdn_h3_external_softmax_epilogue_receipts_v1"
 EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 EXTERNAL_SEQUENCE_API = 2
 EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
@@ -107,6 +108,7 @@ class BoundVDNEpilogue:
     weight_owner_digest: str
     external_digest: str
     gate_expected: bool
+    receipt_sink: list | None = None
     projection_calls: int = 0
     gate_calls: int = 0
     completed: bool = False
@@ -149,6 +151,8 @@ class BoundVDNEpilogue:
         if not torch.is_tensor(result) or result.ndim != 2 or result.shape[0] != self.rows:
             raise RuntimeError("VDN Mixed-Grid output projection returned incompatible geometry")
         self.completed = True
+        if self.receipt_sink is not None:
+            self.receipt_sink.append((self.block_index, self.receipt_fields()))
         return result
 
     def receipt_fields(self) -> tuple[tuple[str, Any], ...]:
@@ -202,7 +206,11 @@ class ExternalSoftmaxEpilogueCapability:
             raise RuntimeError("VDN Mixed-Grid epilogue weight ownership changed after capability attachment")
         if _digest(_config_identity(self.state, block_index, branch)) != self.config_digest:
             raise RuntimeError("VDN Mixed-Grid epilogue configuration changed after capability attachment")
-        contract = (options or {}).get(EXTERNAL_SEQUENCE_KEY)
+        option_map = options or {}
+        receipt_sink = option_map.get(EPILOGUE_RECEIPTS_KEY)
+        if receipt_sink is not None and not isinstance(receipt_sink, list):
+            raise RuntimeError("VDN Mixed-Grid epilogue receipt sink must be a list")
+        contract = option_map.get(EXTERNAL_SEQUENCE_KEY)
         normalized = _validate_external_contract(contract, layout, int(x.shape[0]), rope_freqs)
         gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
         return BoundVDNEpilogue(
@@ -217,6 +225,7 @@ class ExternalSoftmaxEpilogueCapability:
             weight_owner_digest=self.weight_owner_digest,
             external_digest=_digest(normalized),
             gate_expected=gate_expected,
+            receipt_sink=receipt_sink,
         )
 
 
@@ -233,6 +242,7 @@ def attach_external_softmax_epilogue(forward, state, block_index: int, out_proj,
 
 __all__ = [
     "EPILOGUE_KEY",
+    "EPILOGUE_RECEIPTS_KEY",
     "BoundVDNEpilogue",
     "ExternalSoftmaxEpilogueCapability",
     "attach_external_softmax_epilogue",
