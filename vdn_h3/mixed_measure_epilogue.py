@@ -41,6 +41,21 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _config_identity(state, block_index: int, branch) -> dict[str, Any]:
+    return {
+        "name": getattr(state, "name", None),
+        "cfg": getattr(state, "cfg", None),
+        "block_index": block_index,
+        "branch_present": branch is not None,
+        "branch_type": None if branch is None else f"{type(branch).__module__}.{type(branch).__qualname__}",
+    }
+
+
+def _weight_owner(state, branch):
+    managed = getattr(state, "managed_weights", None)
+    return managed if managed is not None else branch
+
+
 def _validate_external_contract(contract, layout, rows: int, rope_freqs) -> dict[str, int]:
     if not isinstance(contract, Mapping):
         raise RuntimeError("VDN Mixed-Grid epilogue requires an external-sequence contract")
@@ -164,17 +179,12 @@ class ExternalSoftmaxEpilogueCapability:
         self.head_dim = int(head_dim)
         self.owner_generation = f"vdn-epilogue-{uuid.uuid4().hex}"
         branch = state.branches[block_index]
-        self.config_digest = _digest({
-            "name": getattr(state, "name", None),
-            "cfg": getattr(state, "cfg", None),
-            "block_index": block_index,
-            "branch_present": branch is not None,
-            "branch_type": None if branch is None else f"{type(branch).__module__}.{type(branch).__qualname__}",
-        })
-        weight_owner = getattr(state, "managed_weights", None) or branch
+        self.branch_owner = branch
+        self.weight_owner = _weight_owner(state, branch)
+        self.config_digest = _digest(_config_identity(state, block_index, branch))
         self.weight_owner_digest = _digest({
             "epilogue_owner_generation": self.owner_generation,
-            "owner_type": None if weight_owner is None else f"{type(weight_owner).__module__}.{type(weight_owner).__qualname__}",
+            "owner_type": None if self.weight_owner is None else f"{type(self.weight_owner).__module__}.{type(self.weight_owner).__qualname__}",
             "block_index": block_index,
             "branch_present": branch is not None,
         })
@@ -187,9 +197,13 @@ class ExternalSoftmaxEpilogueCapability:
         layout = self.state.layout
         if layout is None:
             raise RuntimeError("VDN Mixed-Grid epilogue called outside the VDN execution lifetime")
+        branch = self.state.branches[block_index]
+        if branch is not self.branch_owner or _weight_owner(self.state, branch) is not self.weight_owner:
+            raise RuntimeError("VDN Mixed-Grid epilogue weight ownership changed after capability attachment")
+        if _digest(_config_identity(self.state, block_index, branch)) != self.config_digest:
+            raise RuntimeError("VDN Mixed-Grid epilogue configuration changed after capability attachment")
         contract = (options or {}).get(EXTERNAL_SEQUENCE_KEY)
         normalized = _validate_external_contract(contract, layout, int(x.shape[0]), rope_freqs)
-        branch = self.state.branches[block_index]
         gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
         return BoundVDNEpilogue(
             state=self.state,
