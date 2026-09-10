@@ -2,7 +2,7 @@
 
 The external Mixed-Grid path keeps VDN's released learned softmax gate and the
 native attention output projection even when a companion provider computes the
-unprojected softmax result directly.  This module owns only that epilogue: it
+unprojected softmax result directly. This module owns only that epilogue: it
 never performs attention and never invokes VDN's geometry-dependent linear
 complement.
 """
@@ -112,13 +112,10 @@ class BoundVDNEpilogue:
             raise RuntimeError("VDN Mixed-Grid epilogue softmax and hidden state must share a device")
 
         branch = self.state.branches[self.block_index]
-        weights = None
-        if branch is not None:
-            weights = self.state.weights_on(self.block_index, x.device, x.dtype)
-
         if self.gate_expected:
-            if branch is None or weights is None:
+            if branch is None:
                 raise RuntimeError("VDN Mixed-Grid epilogue expected a learned gate but has no branch weights")
+            weights = self.state.weights_on(self.block_index, x.device, x.dtype)
             try:
                 gate_weight = weights["softmax_gate.up.weight"]
                 gate_bias = weights["softmax_gate.up.bias"]
@@ -176,6 +173,7 @@ class ExternalSoftmaxEpilogueCapability:
         })
         weight_owner = getattr(state, "managed_weights", None) or branch
         self.weight_owner_digest = _digest({
+            "epilogue_owner_generation": self.owner_generation,
             "owner_type": None if weight_owner is None else f"{type(weight_owner).__module__}.{type(weight_owner).__qualname__}",
             "block_index": block_index,
             "branch_present": branch is not None,
