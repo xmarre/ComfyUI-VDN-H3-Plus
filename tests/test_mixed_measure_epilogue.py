@@ -117,9 +117,7 @@ def test_disabled_gate_still_projects_once_and_does_not_read_gate_weights():
     bound = capability.prepare(x, rope, options(), 0)
     got = bound.apply(softmax, x)
     torch.testing.assert_close(got, softmax.reshape(24, 8))
-    # The branch weight owner is still resolved for parity with normal VDN state,
-    # but no gate tensor is evaluated when the configured gate is disabled.
-    assert state.weight_calls == 1
+    assert state.weight_calls == 0
     assert bound.gate_calls == 0
     assert projection.calls == 1
 
