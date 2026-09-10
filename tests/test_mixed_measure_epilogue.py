@@ -163,6 +163,29 @@ def test_prepare_rejects_wrong_block_stale_geometry_and_missing_execution_lifeti
         capability.prepare(x, rope, options(), 0)
 
 
+def test_prepare_rejects_mutated_branch_weight_owner_and_config():
+    x = torch.randn(24, 8)
+    rope = torch.zeros(1, 24, 1, 1)
+
+    state = State()
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, CountingProjection(8), heads=2, head_dim=4)
+    state.branches[0] = object()
+    with pytest.raises(RuntimeError, match="weight ownership changed"):
+        capability.prepare(x, rope, options(), 0)
+
+    state = State()
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, CountingProjection(8), heads=2, head_dim=4)
+    state.managed_weights = object()
+    with pytest.raises(RuntimeError, match="weight ownership changed"):
+        capability.prepare(x, rope, options(), 0)
+
+    state = State()
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, CountingProjection(8), heads=2, head_dim=4)
+    state.cfg["enable_softmax_gate"] = False
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        capability.prepare(x, rope, options(), 0)
+
+
 def test_apply_rejects_wrong_softmax_shape_before_projection():
     state = State()
     projection = CountingProjection(8)
