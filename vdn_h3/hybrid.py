@@ -16,6 +16,7 @@ import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
+from vdn_h3.compiler_guard import apply_model_wrapper
 from vdn_h3.mixed_measure_epilogue import attach_external_softmax_epilogue
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
@@ -40,18 +41,51 @@ def _once(key, message):
     _log.info("[vdn] %s", message)
 
 
+def _scope_softmax_gate(gate, video_start, mode):
+    """Apply an inference-only gate scope without changing checkpoint defaults.
+
+    OpenVDN's learned softmax gate is trained on the whole packed sequence even though
+    global text/reference/audio queries already use dense attention. ``video_only`` is
+    therefore a targeted audio-fidelity ablation: global rows are forced to unit gate,
+    while every generated video row keeps the released learned gate exactly.
+    """
+    if mode == "checkpoint":
+        return gate
+    if mode != "video_only":
+        raise ValueError(f"unsupported VDN global_gate_mode {mode!r}")
+    if video_start <= 0:
+        return gate
+    scoped = gate.clone()
+    scoped[:video_start] = 1.0
+    return scoped
+
+
+def _blend_audio_context(full, isolated, strength):
+    """Output-space interpolation between normal and isolated dense attention."""
+    strength = float(strength)
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("context strength must be in [0, 1]")
+    if strength == 1.0:
+        return full
+    if strength == 0.0:
+        return isolated
+    return isolated + (full - isolated) * strength
+
+
 class VDNLayout:
     __slots__ = (
-        "video_start", "video_end", "num_frames", "tokens_per_frame",
-        "frame_size", "text_start", "text_len", "bounds", "full_cover",
-        "seq_len", "anchor_frames",
+        "video_start", "video_end", "audio_start", "audio_end",
+        "num_frames", "tokens_per_frame", "frame_size", "text_start", "text_len",
+        "bounds", "full_cover", "seq_len", "anchor_frames",
     )
 
-    def __init__(self, video_start, video_end, num_frames, tokens_per_frame,
-                 frame_size, text_start, text_len, seq_len, radius, chunk,
-                 anchor_frames):
+    def __init__(self, video_start, video_end, audio_start, audio_end,
+                 num_frames, tokens_per_frame, frame_size, text_start, text_len,
+                 seq_len, radius, chunk, anchor_frames):
         self.video_start = video_start
         self.video_end = video_end
+        self.audio_start = audio_start
+        self.audio_end = audio_end
         self.num_frames = num_frames
         self.tokens_per_frame = tokens_per_frame
         self.frame_size = frame_size
@@ -128,10 +162,14 @@ def layout_from_payload(payload, x, context, cfg):
             text_len, latent_t, lat_h, lat_w, audio_t,
             keyframes=payload.get("keyframes"), refs=payload.get("refs"))
     video_seg = next(s for s in layout.segments if s[2] == "video")
+    audio_seg = next(s for s in layout.segments if s[2] == "audio")
     text_seg = next(s for s in layout.segments if s[2] == "text")
+    if audio_seg[1] != video_seg[0]:
+        raise RuntimeError(
+            "VDN expected MiniMax-H3 target audio immediately before target video")
     tokens_per_frame = (lat_h // 2) * (lat_w // 2)
     return VDNLayout(
-        video_seg[0], video_seg[1],
+        video_seg[0], video_seg[1], audio_seg[0], audio_seg[1],
         (video_seg[1] - video_seg[0]) // tokens_per_frame,
         tokens_per_frame, (lat_h // 2, lat_w // 2),
         text_seg[0], text_seg[1] - text_seg[0], layout.seq_len,
@@ -148,16 +186,15 @@ def make_layout_wrapper(state):
             _once(
                 ("layout", layout.seq_len, layout.num_frames, layout.tokens_per_frame,
                  tuple(layout.bounds), layout.anchor_frames, state.retain_buffers),
-                f"layout: seq {layout.seq_len}, video [{layout.video_start}, "
-                f"{layout.video_end}), F={layout.num_frames}, S={layout.tokens_per_frame}, "
+                f"layout: seq {layout.seq_len}, audio [{layout.audio_start}, "
+                f"{layout.audio_end}), video [{layout.video_start}, {layout.video_end}), "
+                f"F={layout.num_frames}, S={layout.tokens_per_frame}, "
                 f"window={'dense' if layout.full_cover else layout.bounds[0]}, "
                 f"buffers={'retained' if state.retain_buffers else 'transient'}",
             )
             try:
                 return executor(*args, **kwargs)
             except comfy.model_management.InterruptProcessingException:
-                # All persistent scratch belongs to this VDNState, so a cancelled
-                # execution can release it without touching another node/model.
                 state.runtime.clear()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -240,6 +277,17 @@ def _external_reduced_sequence_active(transformer_options, layout, sequence_rows
     return True
 
 
+def _dense_subset_attention(q, k, v, heads, head_dim, transformer_options):
+    """Exact dense attention for a query subset against an explicit K/V subset."""
+    qc = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
+    kc = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
+    vc = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
+    return optimized_attention(
+        qc, kc, vc, heads, mask=None, skip_reshape=True,
+        transformer_options=transformer_options,
+    ).squeeze(0).reshape(q.shape[0], heads, head_dim)
+
+
 def make_vdn_forward(attn, state, block_index):
     heads, head_dim = attn.heads, attn.head_dim
     inner = heads * head_dim
@@ -254,8 +302,6 @@ def make_vdn_forward(attn, state, block_index):
         if layout is None or base_branch is None:
             return _base_attention(attn, x, rope_freqs, transformer_options)
 
-        # ModelPatcher clones share VDNState. Keep the small lazy backend selector on
-        # an execution-local shallow branch copy so simultaneous geometry cannot race.
         branch = copy.copy(base_branch)
         branch._backend = None
         branch._backend_key = None
@@ -284,7 +330,7 @@ def make_vdn_forward(attn, state, block_index):
         text_x = text_k_raw = text_v_raw = None
         if linear_active:
             a, b = layout.video_start, layout.video_end
-            resources = state.runtime.current()
+            resources = None if comfy.model_management.in_training else state.runtime.current()
             text_rows = layout.text_len if branch.enable_text_state else 0
             scratch = (
                 resources.activation_scratch(
@@ -321,42 +367,107 @@ def make_vdn_forward(attn, state, block_index):
             qw = comfy.model_management.cast_to(q_norm.weight, device=device)
             kw = comfy.model_management.cast_to(k_norm.weight, device=device)
             rot = rope_freqs.shape[-3] * 2
-            comfy.quant_ops.ck.rms_rope_split_half_(
-                q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
+            if comfy.model_management.in_training:
+                q4, k4 = comfy.quant_ops.ck.rms_rope_split_half(
+                    q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
+            else:
+                comfy.quant_ops.ck.rms_rope_split_half_(
+                    q4, k4, rope_freqs, qw, kw, epsilon=q_norm.eps, rot_dim=rot)
             q, k = q4[0], k4[0]
+            del q4, k4
         else:
             q = q_norm(q_raw)
             k = k_norm(k_raw)
-        v = v.clone()
 
         if window_active:
-            backend = state.softmax_backend
-            if backend == "flex":
-                from vdn_h3.window import window_softmax_flex
-                try:
-                    softmax_out = window_softmax_flex(
-                        q, k, v, layout.video_start, layout.video_end,
-                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                        head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
-                except Exception as exc:
-                    backend = "grouped"
-                    _log.warning(
-                        "[vdn] flex attention failed (%s); falling back to grouped SDPA "
-                        "for this execution", exc)
-            if backend != "flex":
-                from vdn_h3.retained import window_softmax_grouped_runtime
-                softmax_out = window_softmax_grouped_runtime(
+            if comfy.model_management.in_training:
+                # Retained grouped attention uses inference-owned preallocated scratch.
+                # Training instead uses the exact grouped reference partition so all
+                # Q/K/V dependencies stay in a normal autograd graph. Model-level
+                # attention overrides remain excluded, matching VDN inference semantics.
+                from vdn_h3.window import window_softmax_grouped
+                softmax_out = window_softmax_grouped(
                     q, k, v, layout.video_start, layout.video_end,
                     layout.num_frames, layout.tokens_per_frame, layout.bounds,
                     head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
-                    transformer_options=transformer_options)
+                    transformer_options=None)
+            else:
+                backend = state.softmax_backend
+                if backend == "flex":
+                    from vdn_h3.window import window_softmax_flex
+                    try:
+                        softmax_out = window_softmax_flex(
+                            q, k, v, layout.video_start, layout.video_end,
+                            layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                            head_dim ** -0.5, anchor_frames=cfg["anchor_frames"])
+                    except Exception as exc:
+                        backend = "grouped"
+                        _log.warning(
+                            "[vdn] flex attention failed (%s); falling back to grouped SDPA "
+                            "for this execution", exc)
+                if backend != "flex":
+                    from vdn_h3.retained import window_softmax_grouped_runtime
+                    softmax_out = window_softmax_grouped_runtime(
+                        q, k, v, layout.video_start, layout.video_end,
+                        layout.num_frames, layout.tokens_per_frame, layout.bounds,
+                        head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
+                        transformer_options=transformer_options)
         else:
-            qc = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
-            kc = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
-            vc = AttentionTensorContainer(v.transpose(0, 1).unsqueeze(0))
-            softmax_out = optimized_attention(
-                qc, kc, vc, heads, mask=None, skip_reshape=True,
-                transformer_options=transformer_options).squeeze(0).reshape(s, heads, head_dim)
+            softmax_out = _dense_subset_attention(
+                q, k, v, heads, head_dim, transformer_options)
+
+        conditioning_video_context_strength = float(
+            cfg.get("conditioning_video_context_strength", 1.0))
+        if conditioning_video_context_strength != 1.0:
+            ca, cb = 0, layout.audio_start
+            if not 0 <= ca <= cb <= layout.video_start <= s:
+                raise RuntimeError(
+                    "VDN conditioning/video layout is invalid for directional feedback isolation")
+            if cb:
+                # Recompute only the pre-target conditioning queries without generated-video
+                # K/V. Target audio remains available as context, and video queries themselves
+                # remain completely untouched. This isolates the indirect
+                # generated-video -> conditioning -> target-audio feedback loop.
+                if window_active:
+                    from vdn_h3.window import _sdpa
+                    isolated_conditioning = _sdpa(
+                        q[ca:cb], k[:layout.video_start], v[:layout.video_start],
+                        head_dim ** -0.5, None)
+                else:
+                    isolated_conditioning = _dense_subset_attention(
+                        q[ca:cb], k[:layout.video_start], v[:layout.video_start],
+                        heads, head_dim, transformer_options)
+                softmax_out[ca:cb] = _blend_audio_context(
+                    softmax_out[ca:cb], isolated_conditioning,
+                    conditioning_video_context_strength)
+                _once(
+                    ("conditioning-video-context", conditioning_video_context_strength),
+                    f"video-to-conditioning feedback attenuation active: strength="
+                    f"{conditioning_video_context_strength:.3f}; target audio/video query "
+                    "attention paths unchanged",
+                )
+
+        audio_video_context_strength = float(cfg.get("audio_video_context_strength", 1.0))
+        if audio_video_context_strength != 1.0:
+            aa, ab = layout.audio_start, layout.audio_end
+            if ab != layout.video_start or not 0 <= aa < ab <= s:
+                raise RuntimeError("VDN target-audio/video layout is invalid for audio context isolation")
+            if window_active:
+                from vdn_h3.window import _sdpa
+                no_video_audio = _sdpa(
+                    q[aa:ab], k[:layout.video_start], v[:layout.video_start],
+                    head_dim ** -0.5, None)
+            else:
+                no_video_audio = _dense_subset_attention(
+                    q[aa:ab], k[:layout.video_start], v[:layout.video_start],
+                    heads, head_dim, transformer_options)
+            softmax_out[aa:ab] = _blend_audio_context(
+                softmax_out[aa:ab], no_video_audio, audio_video_context_strength)
+            _once(
+                ("audio-video-context", audio_video_context_strength),
+                f"generated-audio video-context attenuation active: strength="
+                f"{audio_video_context_strength:.3f}; video attention/adapter path unchanged",
+            )
 
         del q, k, v, q_raw, k_raw
         weights = state.weights_on(block_index, device, dtype)
@@ -365,6 +476,14 @@ def make_vdn_forward(attn, state, block_index):
             gate = torch.sigmoid(F.linear(
                 x, weights["softmax_gate.up.weight"],
                 weights["softmax_gate.up.bias"]))
+            gate_mode = cfg.get("global_gate_mode", "checkpoint")
+            gate = _scope_softmax_gate(gate, layout.video_start, gate_mode)
+            if gate_mode != "checkpoint":
+                _once(
+                    ("global-gate-mode", gate_mode),
+                    "global gate preservation active: text/reference/audio rows keep "
+                    "unit softmax gate; generated video rows keep checkpoint gating",
+                )
             flat = (
                 softmax_out
                 * gate.view(s, heads, 1).to(softmax_out.dtype)
@@ -372,7 +491,7 @@ def make_vdn_forward(attn, state, block_index):
         else:
             flat = softmax_out.reshape(s, -1)
         out = out_proj(flat.type_as(x))
-        del softmax_out
+        del softmax_out, flat
 
         if linear_active:
             readout = branch.readout(
@@ -384,8 +503,17 @@ def make_vdn_forward(attn, state, block_index):
                 text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
                 skip_ends=(cfg["anchor_frames"] == "both"),
             )
-            out[layout.video_start:layout.video_end] += F.linear(
-                readout.type_as(x), weights["to_out_linear.weight"])
+            # The branch has consumed its raw Q/K/V copies. Do not keep them alive
+            # through the final projection, where their storage can add to the peak.
+            del q_raw_video, k_raw_video, v_video, text_k_raw, text_v_raw
+            branch_out = F.linear(readout.type_as(x), weights["to_out_linear.weight"])
+            if comfy.model_management.in_training:
+                # Avoid version-counter mutations on the attention output while the
+                # generated-audio correction graph is live.
+                a, b = layout.video_start, layout.video_end
+                out = torch.cat((out[:a], out[a:b] + branch_out, out[b:]), dim=0)
+            else:
+                out[layout.video_start:layout.video_end] += branch_out
         return out
 
     vdn_forward._vdn_forward = True
@@ -414,5 +542,9 @@ def apply_vdn(new_model, state):
                 f"VDN cannot safely replace existing object patch {key}; compose the "
                 "other provider through Comfy transformer/model patch APIs instead")
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
+    # The AIMDO allocation graph starts outside DIFFUSION_MODEL. Guard the entire
+    # MiniMax model call and let compiler_guard preserve user/global state in finally.
+    new_model.add_wrapper_with_key(
+        WrappersMP.APPLY_MODEL, "vdn_h3_compiler", apply_model_wrapper)
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))

@@ -14,9 +14,15 @@ if _PKG not in sys.path:
 
 from vdn_h3.compiler_guard import install_layout_guard as _install_layout_guard
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from vdn_h3.audio_node import ApplyVDNH3AdvancedAudioSafe
 
 _install_layout_guard()
 del _install_layout_guard
+
+# Preserve the established node id/workflow schema while extending the Advanced node
+# with generated-audio-only adapter scoping. Existing workflows default to strength 1.0
+# and therefore keep the original released execution path exactly.
+NODE_CLASS_MAPPINGS["ApplyVDNH3Advanced"] = ApplyVDNH3AdvancedAudioSafe
 
 # Frontend compatibility shim for legacy ApplyVDNH3Advanced positional workflows.
 WEB_DIRECTORY = "./web"
