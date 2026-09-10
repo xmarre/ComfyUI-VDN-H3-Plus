@@ -206,4 +206,20 @@ class ExternalSoftmaxEpilogueCapability:
         )
 
 
-__all__ = ["EPILOGUE_KEY", "BoundVDNEpilogue", "ExternalSoftmaxEpilogueCapability"]
+def attach_external_softmax_epilogue(forward, state, block_index: int, out_proj, heads: int, head_dim: int):
+    """Attach one explicit owner-bound Mixed-Grid epilogue to a VDN forward."""
+    if not callable(forward):
+        raise TypeError("VDN Mixed-Grid epilogue owner must be callable")
+    if hasattr(forward, EPILOGUE_KEY):
+        raise RuntimeError("VDN Mixed-Grid epilogue capability is already attached")
+    capability = ExternalSoftmaxEpilogueCapability(state, block_index, out_proj, heads, head_dim)
+    setattr(forward, EPILOGUE_KEY, capability)
+    return capability
+
+
+__all__ = [
+    "EPILOGUE_KEY",
+    "BoundVDNEpilogue",
+    "ExternalSoftmaxEpilogueCapability",
+    "attach_external_softmax_epilogue",
+]
