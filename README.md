@@ -4,7 +4,7 @@
 
 A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
 
-This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate).
+This xmarre fork keeps the released VDN checkpoint/math contract while adding current pruned/INT8 H3 support, stricter Comfy lifecycle handling, and the external mixed-grid sequence contract used by [MiniMax-H3 Flow-Aligned Regenerate](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate). For the 8-step DMD stage, users can either download the ready-made Comfy Kitchen INT8 ConvRot build or reproduce the same supported stage conversion locally with the included quantizer.
 
 > The VDN model weights are separate from this repository and retain their upstream license. See [NOTICE](NOTICE) for implementation provenance and attribution.
 
@@ -17,7 +17,53 @@ git clone https://github.com/xmarre/ComfyUI-VDN-H3-Plus.git ComfyUI-VDN-H3
 
 Restart ComfyUI.
 
-Download an official VDN stage under `ComfyUI/models/vdn/` while preserving its directory structure, for example:
+### Recommended: pre-quantized INT8 ConvRot VDN stage
+
+For the released 8-step DMD/Turbo stage, the simplest path is the existing pre-quantized build:
+
+[**drbaph/vdn-minimax-h3-int8-convrot-comfyui**](https://huggingface.co/drbaph/vdn-minimax-h3-int8-convrot-comfyui)
+
+```bash
+hf download drbaph/vdn-minimax-h3-int8-convrot-comfyui \
+  --local-dir <ComfyUI>/models/vdn/vdn-minimax-h3-int8-convrot-comfyui
+```
+
+This is a pre-quantized build of the same released OpenVDN `stage-dmd-step-250` VDN stage, using the Comfy Kitchen INT8 ConvRot branch format supported by this node. It is not a separately trained VDN model. Use this unless you specifically want to reproduce the conversion yourself or quantize another supported stage.
+
+The downloaded folder becomes the `vdn_checkpoint` entry.
+
+#### Required companion for pruned/curve MiniMax-H3 bases
+
+If the selected MiniMax-H3 diffusion model is one of Comfy-Org's `*_pruned_*` / curve-AdaLN checkpoints and the released VDN Turbo adapter is enabled, the VDN stage also needs the exact ~97 KB AdaLN pruning affine. The normal Comfy-Org `minimax_h3_*_pruned_bf16.safetensors` files do **not** contain `adaln_basis` or `adaln_mean`, so do not point `extract_h3_adaln_affine.py` at those files.
+
+**Recommended pruned MiniMax-H3 model:** [xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI](https://huggingface.co/xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI). For normal use, select its **INT8 ConvRot** checkpoint. That is the recommended variant because it provides the speed advantage of the quantized model while remaining only slightly below the BF16 base in quality, and it preserves quality much better than the plain INT8 checkpoint. The plain INT8 variant is therefore not recommended when INT8 ConvRot is available.
+
+The repaired BF16 checkpoint in the same repository deliberately retains `adaln_basis` and `adaln_mean`. You do **not** need to run the BF16 model to benefit from that: if the BF16 file remains installed under `models/diffusion_models` while the matching INT8 ConvRot derivative is selected, VDN-H3-Plus can resolve the affine from the BF16 sibling automatically and verify it against the loaded curve table. In that setup, **skip the sidecar download/copy below**. Keeping the repaired BF16 file beside the recommended INT8 ConvRot model is the simplest arrangement. If only the INT8 ConvRot derivative is installed, the ~97 KB sidecar is still required. The same affine discovery also works with the plain INT8 derivative, although that variant is not the recommended quality/speed trade-off.
+
+The matching sidecars are published by [multimodalart/MiniMax-H3-Pruned](https://huggingface.co/multimodalart/MiniMax-H3-Pruned), whose provenance uses the corresponding Comfy-Org pruned curve tables unchanged:
+
+- T2VA / FL2VA base: `transformer/adaln_affine.safetensors`
+- Ref2VA base: `transformer_ref/adaln_affine.safetensors`
+
+Install the one matching the loaded base as `<VDN stage>/adaln_affine.safetensors`. For example, for FL2VA/T2VA with the recommended INT8 ConvRot VDN stage:
+
+```bash
+TMP="$(mktemp -d)"
+hf download multimodalart/MiniMax-H3-Pruned \
+  transformer/adaln_affine.safetensors \
+  --local-dir "$TMP"
+cp "$TMP/transformer/adaln_affine.safetensors" \
+  <ComfyUI>/models/vdn/vdn-minimax-h3-int8-convrot-comfyui/adaln_affine.safetensors
+rm -rf "$TMP"
+```
+
+For Ref2VA, replace `transformer/adaln_affine.safetensors` with `transformer_ref/adaln_affine.safetensors` in both lines.
+
+Dense/non-pruned MiniMax-H3 bases do not need this companion because their AdaLN input remains full-width.
+
+### Official BF16 stages
+
+You can instead download the original OpenVDN stage under `ComfyUI/models/vdn/` while preserving its directory structure, for example:
 
 ```bash
 hf download OpenVDN/vdn-minimax-h3 \
@@ -29,6 +75,39 @@ Official stages include:
 
 - `stage-dmd-step-250` — released 8-step DMD/Turbo stage;
 - `stage-b-step-2000` — released Stage-B/default stage.
+
+### Alternative: build your own INT8 ConvRot VDN stage
+
+This repository includes `tools/quantize_vdn_branch_int8.py`, which converts an official OpenVDN stage into the same Comfy Kitchen INT8 ConvRot format already supported by the node.
+
+After downloading the official stage, run from this repository checkout:
+
+```bash
+python tools/quantize_vdn_branch_int8.py \
+  <ComfyUI>/models/vdn/stage-dmd-step-250
+```
+
+By default this creates the sibling stage:
+
+```text
+<ComfyUI>/models/vdn/stage-dmd-step-250-int8_convrot_comfyui/
+```
+
+with the quantized branch file:
+
+```text
+linear_branch/model_int8_convrot_comfyui.safetensors
+```
+
+The source stage is never modified. `model_spec.json`, adapters, and non-eligible tensors are preserved; only the supported VDN branch `F.linear` weights are quantized to Comfy Kitchen tensor-wise INT8 with ConvRot. The resulting stage is discovered through the normal `vdn_checkpoint` selector and works with the existing `branch_weights=auto` / `stream` paths.
+
+Useful options:
+
+```text
+--out <dir>     choose a different output stage directory
+--overwrite     replace an existing output directory
+--cpu           quantize on CPU instead of CUDA (slower)
+```
 
 ## Nodes
 
@@ -97,13 +176,17 @@ Ownership depends on adapter mode:
 
 This distinction matters on quantized/pruned H3. Earlier v1.5.x candidates that materialized the projected AdaLN terms in bypass mode were part of the remaining VDN-specific execution preceding the production CUDA failure boundary. The bypass path now avoids that base-weight mutation entirely.
 
-If a matching BF16 source checkpoint remains beside an INT8 derivative, VDN can read only the small affine tensors from it. Otherwise use:
+For the standard Comfy-Org `*_pruned_*` single-file checkpoints, use the published ~97 KB sidecar described in [Required companion for pruned/curve MiniMax-H3 bases](#required-companion-for-prunedcurve-minimax-h3-bases). Those Comfy-Org files contain the collapsed curve table but omit `adaln_basis` and `adaln_mean`, so the extraction tool cannot recover the affine from them.
+
+`tools/extract_h3_adaln_affine.py` remains available only for a matching source checkpoint that actually contains `adaln_basis` and `adaln_mean` (for example, a repaired/private artifact that deliberately retained the pruning auxiliaries):
 
 ```bash
 python tools/extract_h3_adaln_affine.py \
-  <matching-pruned-bf16.safetensors> \
+  <source-containing-adaln_basis-and-adaln_mean.safetensors> \
   <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors
 ```
+
+If that source also contains `adaln_t_table` / `time_embedder.table`, the tool records the table identity in the sidecar. Otherwise a deliberately stage-local sidecar is treated as an explicit companion. VDN still fails closed on any verified table mismatch and never silently drops the 51 released AdaLN updates.
 
 ## Branch weights and retained buffers
 

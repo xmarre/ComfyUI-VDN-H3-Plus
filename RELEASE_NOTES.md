@@ -1,92 +1,110 @@
-# ComfyUI-VDN-H3 v1.5.2
+# ComfyUI-VDN-H3-Plus v1.5.4
 
-v1.5.2 is the production-correctness repair for VDN bypass on the stacked quantized MiniMax-H3 workflow. It replaces the remaining VDN-owned mutable/weight-materializing bypass paths with non-mutating runtime residuals, fixes cross-stream prefetch lifetime under `cudaMallocAsync`, and restores the released exact-SDPA semantics for retained VDN local-window attention.
+v1.5.4 is a packaging/release follow-up to v1.5.3. Runtime VDN math and provider behavior are unchanged.
 
-## Runtime-bypass ownership
+## Dedicated Comfy Registry identity
 
-- Ordinary VDN LoRA residuals use PyTorch forward **post-hooks**.
-- VDN does **not** replace, splice, save, or restore `module.forward`.
-- VDN does **not** use `ModelPatcher.weight_function` / `add_weight_wrapper`.
-- One post-hook is registered per affected module, with all VDN terms fused into one exact low-rank residual for that module.
-- Registration handles are generation-owned across clone-shared models: a newer VDN clone replaces the old registration, while stale ejects cannot remove the newer generation.
-- Independently managed Comfy `BypassForwardHook` providers remain outside VDN's ownership; VDN never enters their mutable forward chain.
-- Fused INT8 `mlp.fc2` targets retain native Comfy patch ownership because the H3 fused path bypasses `module.forward`.
+The Plus fork now publishes under the distinct registry package name `comfyui-vdn-h3-plus` with `PublisherId = "xmarre"` and display name `ComfyUI-VDN-H3-Plus`.
 
-This supersedes both failed v1.5.x bypass topologies: the v1.5.0 runtime weight-wrapper path and the v1.5.1 VDN-owned mutable `BypassForwardHook` chain.
+The previous package metadata still used upstream's `comfyui-vdn-h3` project name while changing only the publisher. That name is already associated with Saganaki22's upstream package, so the Comfy Registry correctly rejected the Plus fork publication with HTTP 403 even when a valid xmarre registry token was present.
 
-## Pruned / curve AdaLN bypass
+This release therefore avoids claiming or overwriting upstream's registry identity. Existing Git installs are unaffected.
 
-The exact pruning affine remains:
+## Release pipeline hardening
 
-```text
-dense(t) ≈ mean + curve(t) @ basis
-A_pruned   = A @ basis.T
-bias_delta = B @ (A @ mean)
+Registry publication is now tied to a successfully completed GitHub release workflow instead of publishing immediately from an arbitrary `pyproject.toml` push.
+
+Before publishing, the workflow verifies that:
+
+- the requested/current release exists and is not a draft;
+- the release tag targets current `main` rather than a stale commit;
+- the release tag exactly matches `[project].version`;
+- the registry package name is `comfyui-vdn-h3-plus`;
+- the publisher is `xmarre`.
+
+Release ZIP names, archive prefixes and GitHub release titles now consistently use the `ComfyUI-VDN-H3-Plus` fork name.
+
+## Relationship to v1.5.3
+
+All v1.5.3 functionality remains intact: rectangular softmax-provider API v3, lazy v2 square-Q compatibility, exactly-once full-domain preprocessing, INT8 ConvRot stage support/documentation, pruned AdaLN affine handling, and the production-validated Sol-H3 composition contract.
+
+The separate PR #8 audio-fidelity experiment remains unreleased and is still not a dependency of this release.
+
+# ComfyUI-VDN-H3 v1.5.3
+
+v1.5.3 adds the composable VDN softmax-provider API used by ComfyUI-Sol-H3 v0.1.0, removes the historical square-Q compatibility cost for rectangular providers, and includes the post-v1.5.2 setup/documentation fixes for INT8 ConvRot stages and pruned AdaLN affine sidecars.
+
+## VDN softmax-provider API v3
+
+The preferred provider contract is:
+
+```python
+provider(
+    native, q, k, v,
+    *, kind, scale, square_aligned=False, sink_rows=0,
+)
 ```
 
-In `bypass`, the projected low-rank curve-coordinate residual and required constant bias are added after `adaln_proj.linear` without mutating the pruned base AdaLN weight or bias. In `merge`, the exact projected weight+bias terms continue to use ordinary native Comfy patches.
+For grouped local attention:
 
-This removes the remaining bypass-mode base-weight materialization that was still present in the first v1.5.2 candidate.
+- `q` contains only the VDN query rows actually requested by the trained local operator;
+- `k/v` remain VDN's exact already-restricted K/V domain and ordering;
+- `sink_rows` identifies the leading global/prefix K/V rows;
+- VDN retains ownership of window membership, global/anchor operations, learned softmax gate, learned linear complement and output projection.
 
-## Adapter staging
+Dispatch remains `v3 -> v2 -> v1 -> native`. The v2-only `square_q` / `query_positions` payload is now lazy and is built only when an actual v2-only provider is selected. Masked Flex remains VDN-native.
 
-Runtime VDN factors are staged synchronously onto the intended compute device when the VDN `PatcherInjection` is injected, before the first H3 module forward. Ordinary VDN post-hooks therefore do not perform their normal adapter H2D setup during the first model call. An unexpected device/dtype change retains a synchronous correctness fallback.
+`vdn_attention_preprocess_v1` also runs once on the complete post-RoPE packed Q/K/V tensors before grouped row gathering, allowing composable transforms such as Untwisting RoPE to retain original packed-row semantics without being applied twice.
 
-## `cudaMallocAsync` prefetch lifetime
+## Production result with Sol-H3 v0.1.0
 
-VDN's one-block branch prefetch allocates/copies branch weights on a producer CUDA stream and consumes them on the model stream. v1.5.2 records the actual consumer stream for every returned prefetched tensor and for quantized backing/scale tensors under both the native allocator and `cudaMallocAsync`.
+The released [ComfyUI-Sol-H3 v0.1.0](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.0) production stack on RTX PRO 6000 Blackwell confirms API v3 is active and direct rectangular VDN execution is 1:1 in requested/kernel Q rows:
 
-This avoids premature storage reuse across the producer/consumer stream boundary while retaining the existing bounded one-block prefetch architecture.
+| Stage | Rectangular SOL calls | Requested Q rows | Kernel Q rows | Square expansion |
+|---|---:|---:|---:|---:|
+| Native low | 1,584 | 3,744,000 | 3,744,000 | 0 |
+| Native high | 1,056 | 4,972,800 | 4,972,800 | 0 |
+| Later native high | 1,248 | 5,967,360 | 5,967,360 | 0 |
 
-## Exact VDN local-window attention
+The old v2 compatibility bridge expanded Q kernel work by roughly **4.4–5.4x** in affected stages. v1.5.3 removes that provider-side expansion without broadening VDN's attention domain or changing its trained gating/output semantics.
 
-A separate reconciliation audit found that retained grouped-window execution had started forwarding model-level `transformer_options` into VDN's local-window SDPA helper. That was semantic drift: the released VDN local-window operator is exact SDPA, while Sage/Kitchen/model-level attention overrides belong to the native/base attention path.
+Flow's separate external mixed-grid API-2 route remained direct at `144` SOL calls and `6,270,480` requested/kernel Q rows 1:1. The final Spectrum schedule was:
 
-v1.5.2 therefore deliberately ignores model-level attention overrides for retained VDN local windows and passes `None` to the local `_sdpa` calls. Regression coverage verifies both no override leakage and numerical parity with the exact grouped-window reference path.
+```text
+sampler_logical_calls       18
+transformer_actual_nfe      14
+spectrum_forecast_calls      4
 
-## Model-aware runtime metadata
+low:    8 actual / 2 forecast
+high:   4 actual / 2 forecast
+probe:  2 actual / 0 forecast
+```
 
-Read-only, zero-copy runtime adapter descriptors remain published for model-aware consumers such as Spectrum. They expose the effective runtime LoRA and constant-offset perturbations without taking execution ownership, changing adapter math, or mutating `module.forward`.
+Those counters validate composition across VDN, Sol-H3, Spectrum, Untwist, Diff-Aid and Flow. They do not transfer ownership of Flow's external route or Spectrum's forecast policy to VDN.
+
+## INT8 ConvRot stage setup
+
+The documentation now leads users to the existing pre-quantized INT8 ConvRot VDN stage while retaining the in-repository converter as the reproducible path for building a supported stage directly from the official OpenVDN checkpoint. The recommended Ref-Delta INT8 ConvRot base and auto-discovery behavior are clarified.
+
+This is documentation/package guidance around functionality already present in the repository; it does not introduce a second incompatible VDN model format.
+
+## Pruned / curve AdaLN affine setup
+
+Standard Comfy-Org `*_pruned_*` MiniMax-H3 checkpoints do not contain `adaln_basis` / `adaln_mean`, so the extractor no longer instructs users to derive those auxiliaries from files that cannot provide them. The docs point to the matching published FL2VA/Ref2VA affine sidecars, and the extraction tool now fails with actionable guidance when those tensors are absent.
+
+## Relationship to PR #8
+
+The separate PR #8 audio-fidelity experiment remains unreleased and semantically unvalidated. v1.5.3 does **not** include or depend on that experiment. The softmax-provider work lives outside `vdn_h3/hybrid.py`, so #8 may still be stacked independently for research without being a prerequisite for this release.
 
 ## Validation
 
-PR #4's final pre-release head passed CI run **232**, including current-Comfy smoke, pinned Comfy/OpenVDN oracle coverage, bypass lifecycle/math regressions, projected curve-AdaLN coverage, allocator/prefetch lifetime checks, runtime introspection, and exact retained-window attention tests.
+- Provider tests cover v1/v2/v3 dispatch, restricted-domain equivalence, lazy v2 construction, direct rectangular v3 routing and full-domain preprocessing order.
+- The normal VDN CI lanes retain pinned Comfy/OpenVDN oracle coverage, current-Comfy smoke and legacy workflow migration.
+- Sol-H3 v0.1.0's pinned native-interop suite exercised this exact VDN provider contract together with Untwist, Spectrum, Diff-Aid and Flow.
+- Real SM120 production execution established the row-accounting and 18/14/4 schedule above with zero VDN square-Q expansion.
 
-The corrected production RTX PRO 6000 workflow was then re-run on current ComfyUI with the intended Untwist RoPE configuration (`high_scale_end=1.00`) and completed successfully. The release acceptance criteria are satisfied:
-
-- no CUDA illegal-memory-access regression;
-- normal artifact-free decoded video quality in the production stack.
-
-No speed or VRAM claim is inferred from the CPU/oracle suite; historical benchmark numbers remain historical until separately re-measured.
-
-# ComfyUI-VDN-H3 v1.5.1
-
-v1.5.1 is a hotfix for a production regression introduced by v1.5.0's `lora_mode=bypass` implementation.
-
-## Fixed: stacked runtime adapters on quantized H3
-
-v1.5.0 moved VDN bypass adapters from Comfy's activation-side `BypassForwardHook` mechanism to `ModelPatcher.add_weight_wrapper()` / `weight_function`. On quantized MiniMax-H3 layers, a weight function forces Comfy through a copied/dequantized compute-weight path.
-
-In the production RTX PRO 6000 workflow using:
-
-- an INT8 ConvRot MiniMax-H3 base;
-- VDN `lora_mode=bypass`;
-- an independent runtime-bypass DoRA/LoRA provider on the same H3 modules;
-- `cudaMallocAsync`;
-- Continuum + Flow Mixed-Grid + Spectrum/SA-PECE;
-
-the first actual H3 evaluation hard-aborted with `CUDA error: an illegal memory access was encountered`. The fatal Python stack was inside the external Comfy `BypassForwardHook`/LoRA `F.linear` chain. CUDA errors are asynchronous, so that stack alone does not identify the exact originating kernel.
-
-v1.5.1 restored the older VDN `BypassForwardHook` architecture, including stack-safe linked-list insertion/removal. A later production run showed that this was not sufficient: the same stacked workflow still aborted. v1.5.1 is therefore superseded by the v1.5.2 work above.
-
-## Pruned / curve AdaLN behavior
-
-The v1.5 exact pruning-affine work was retained. Full-width released AdaLN LoRAs were projected through the resolved `adaln_basis` + `adaln_mean` pair. v1.5.1 materialized those projected curve weight/bias terms as ordinary Comfy patches in both adapter modes; the revised v1.5.2 bypass path no longer does so.
+v1.5.2's non-mutating bypass ownership, pruned-AdaLN runtime residual math, `cudaMallocAsync` prefetch lifetime fix, exact retained-window SDPA semantics and model-aware metadata remain unchanged.
 
 ---
 
-# ComfyUI-VDN-H3 v1.5.0
-
-v1.5.0 was the correctness/lifecycle and Flow-interoperability release of the xmarre fork. It added the mixed-grid API used by MiniMax-H3 Flow-Aligned Regenerate, current pruned/INT8 MiniMax-H3 support, exact curve-AdaLN projection, branch/runtime lifecycle hardening, upstream v1.4.3 reconciliation, and backwards-compatible Advanced-node workflow migration.
-
-Its `lora_mode=bypass` weight-wrapper implementation is superseded because of the stacked runtime-adapter regression described above. `merge` behavior was not implicated.
+Previous release notes through v1.5.2 are preserved verbatim in `docs/RELEASE_NOTES_v1.5.2_AND_EARLIER.md`.

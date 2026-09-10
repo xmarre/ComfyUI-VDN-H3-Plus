@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Extract the tiny AdaLN pruning affine needed for released full-width H3 LoRAs.
 
-The repaired pruned BF16 Comfy checkpoint can retain ``adaln_basis`` and
-``adaln_mean`` even though native inference does not use them. Quantized derivatives
-may omit those auxiliaries. This tool writes only the two small tensors to
-``adaln_affine.safetensors`` and records the matching curve-table SHA-256 when the
-source checkpoint also contains ``adaln_t_table``/``time_embedder.table``.
+This tool is only for source checkpoints that actually retain ``adaln_basis`` and
+``adaln_mean``. The standard Comfy-Org MiniMax-H3 ``*_pruned_*`` single-file
+checkpoints contain the collapsed curve table but intentionally omit those two
+auxiliary tensors, so they are not valid extraction sources. For those public
+checkpoints, install the matching published ~97 KB ``adaln_affine.safetensors``
+sidecar instead; see the repository README.
+
+Quantized derivatives may also omit the auxiliaries. This tool writes only the two
+small tensors to ``adaln_affine.safetensors`` and records the matching curve-table
+SHA-256 when the source checkpoint also contains ``adaln_t_table`` or
+``time_embedder.table``.
 """
 from __future__ import annotations
 
@@ -26,9 +32,38 @@ def tensor_hash(t: torch.Tensor) -> str:
     return h.hexdigest()
 
 
+def missing_affine_message(source: Path, missing: list[str]) -> str:
+    name = source.name.lower()
+    if "ref2va" in name:
+        sidecar = "transformer_ref/adaln_affine.safetensors"
+    elif "fl2va" in name:
+        sidecar = "transformer/adaln_affine.safetensors"
+    else:
+        sidecar = "transformer/adaln_affine.safetensors (T2VA/FL2VA) or transformer_ref/adaln_affine.safetensors (Ref2VA)"
+
+    return (
+        f"{source}: missing {missing}\n\n"
+        "This file cannot be used as an AdaLN-affine extraction source. "
+        "The standard Comfy-Org MiniMax-H3 *_pruned_* checkpoints contain the "
+        "collapsed curve table but do not contain adaln_basis/adaln_mean.\n\n"
+        "For those public pruned checkpoints, download the matching ~97 KB sidecar "
+        "from multimodalart/MiniMax-H3-Pruned instead:\n"
+        f"  {sidecar}\n"
+        "and place it as <ComfyUI>/models/vdn/<stage>/adaln_affine.safetensors.\n\n"
+        "Use this extractor only with a matching source checkpoint that actually "
+        "retained adaln_basis and adaln_mean."
+    )
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source", type=Path, help="matching pruned BF16/source safetensors")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract adaln_basis/adaln_mean from a source checkpoint that retained "
+            "the pruning auxiliaries. Standard Comfy-Org *_pruned_* checkpoints are "
+            "not extraction sources; use the published affine sidecar for them."
+        )
+    )
+    parser.add_argument("source", type=Path, help="matching source safetensors containing adaln_basis/adaln_mean")
     parser.add_argument(
         "output", type=Path, nargs="?", default=Path("adaln_affine.safetensors"))
     args = parser.parse_args()
@@ -38,7 +73,7 @@ def main():
         keys = set(handle.keys())
         missing = [key for key in ("adaln_basis", "adaln_mean") if key not in keys]
         if missing:
-            raise SystemExit(f"{args.source}: missing {missing}")
+            raise SystemExit(missing_affine_message(args.source, missing))
         basis = handle.get_tensor("adaln_basis").to(torch.float32).clone().contiguous()
         mean = handle.get_tensor("adaln_mean").to(torch.float32).clone().contiguous()
         table = None

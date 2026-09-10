@@ -17,6 +17,7 @@ from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_atte
 from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.compiler_guard import apply_model_wrapper
+from vdn_h3.mixed_measure_epilogue import attach_external_softmax_epilogue
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
@@ -517,6 +518,9 @@ def make_vdn_forward(attn, state, block_index):
 
     vdn_forward._vdn_forward = True
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
+    attach_external_softmax_epilogue(
+        vdn_forward, state, block_index, out_proj, heads, head_dim
+    )
     return vdn_forward
 
 

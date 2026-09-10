@@ -1,7 +1,7 @@
 [project]
-name = "comfyui-vdn-h3"
-version = "1.5.2"
-description = "VDN-H3 hybrid attention for ComfyUI's native MiniMax-H3 model"
+name = "comfyui-vdn-h3-plus"
+version = "1.5.4"
+description = "VDN-H3-Plus hybrid attention for ComfyUI MiniMax-H3 with pre-quantized or self-built INT8 ConvRot VDN stages"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
@@ -25,9 +25,9 @@ training = [
 ]
 
 # This repository is a flat-layout ComfyUI custom node and also contains non-Python
-# top-level directories (web/assets/example_workflows).  Setuptools' automatic flat
+# top-level directories (web/assets/example_workflows). Setuptools' automatic flat
 # discovery rejects that layout, which made `pip install -e '.[training]'` fail before
-# it could install the optional trainer dependency.  Only vdn_h3 is an installable
+# it could install the optional trainer dependency. Only vdn_h3 is an installable
 # Python package; the custom-node checkout itself continues to own the root __init__.py
 # and frontend/assets in place.
 [tool.setuptools.packages.find]
@@ -42,5 +42,5 @@ OpenVDN = "https://github.com/OpenVDN/vdn-minimax-h3"
 
 [tool.comfy]
 PublisherId = "xmarre"
-DisplayName = "ComfyUI-VDN-H3"
+DisplayName = "ComfyUI-VDN-H3-Plus"
 Icon = "https://avatars.githubusercontent.com/u/84208527"
