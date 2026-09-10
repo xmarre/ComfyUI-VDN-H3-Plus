@@ -5,6 +5,7 @@ import torch
 
 from vdn_h3.mixed_measure_epilogue import (
     EPILOGUE_KEY,
+    EPILOGUE_RECEIPTS_KEY,
     ExternalSoftmaxEpilogueCapability,
     attach_external_softmax_epilogue,
 )
@@ -110,6 +111,68 @@ def test_nontrivial_gate_and_projection_are_applied_exactly_once():
     with pytest.raises(RuntimeError, match="more than once"):
         bound.apply(softmax, x)
     assert projection.calls == 1
+
+
+def test_completion_receipt_is_forwarded_only_after_success():
+    state = State(gated=True, branch=True)
+    projection = CountingProjection(8)
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, projection, heads=2, head_dim=4)
+    x = torch.randn(24, 8)
+    rope = torch.zeros(1, 24, 1, 1)
+    softmax = torch.randn(24, 2, 4)
+    receipt_sink = []
+    prepared_options = options()
+    prepared_options[EPILOGUE_RECEIPTS_KEY] = receipt_sink
+
+    bound = capability.prepare(x, rope, prepared_options, 0)
+    assert receipt_sink == []
+    bound.apply(softmax, x)
+
+    assert len(receipt_sink) == 1
+    block_index, receipt_fields = receipt_sink[0]
+    assert block_index == 0
+    fields = dict(receipt_fields)
+    assert fields["vdn_owner_generation"] == capability.owner_generation
+    assert fields["vdn_config_digest"] == capability.config_digest
+    assert fields["vdn_weight_owner_digest"] == capability.weight_owner_digest
+    assert fields["vdn_gate_expected"] is True
+    assert fields["vdn_gate_calls"] == 1
+    assert fields["vdn_projection_calls"] == 1
+    assert fields["vdn_completed"] is True
+
+    with pytest.raises(RuntimeError, match="more than once"):
+        bound.apply(softmax, x)
+    assert len(receipt_sink) == 1
+
+
+def test_failed_apply_does_not_forward_completion_receipt():
+    state = State()
+    projection = CountingProjection(8)
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, projection, heads=2, head_dim=4)
+    x = torch.randn(24, 8)
+    receipt_sink = []
+    prepared_options = options()
+    prepared_options[EPILOGUE_RECEIPTS_KEY] = receipt_sink
+    bound = capability.prepare(x, torch.zeros(1, 24, 1, 1), prepared_options, 0)
+
+    with pytest.raises(RuntimeError, match="softmax tensor"):
+        bound.apply(torch.randn(24, 8), x)
+    assert receipt_sink == []
+    assert projection.calls == 0
+
+
+def test_prepare_rejects_invalid_receipt_sink_before_binding():
+    state = State()
+    capability = ExternalSoftmaxEpilogueCapability(state, 0, CountingProjection(8), heads=2, head_dim=4)
+    prepared_options = options()
+    prepared_options[EPILOGUE_RECEIPTS_KEY] = ()
+    with pytest.raises(RuntimeError, match="receipt sink must be a list"):
+        capability.prepare(
+            torch.randn(24, 8),
+            torch.zeros(1, 24, 1, 1),
+            prepared_options,
+            0,
+        )
 
 
 def test_branchless_block_uses_native_projection_without_gate_or_weight_load():
