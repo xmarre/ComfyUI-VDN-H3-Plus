@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from vdn_h3 import runtime
@@ -23,12 +24,7 @@ def test_prefetch_records_consumer_stream_without_allocator_special_case():
 
 
 def test_prefetch_records_consumer_stream_even_when_cuda_malloc_async(monkeypatch):
-    """cudaMallocAsync still tracks non-creation usage streams in PyTorch.
-
-    The prefetch producer stream and model consumer stream are different, so VDN must
-    record the consumer regardless of allocator backend. This test deliberately makes
-    the allocator query return cudaMallocAsync; _record_stream must not branch on it.
-    """
+    """cudaMallocAsync still tracks non-creation usage streams in PyTorch."""
     monkeypatch.setattr(
         runtime.torch.cuda,
         "get_allocator_backend",
@@ -71,5 +67,16 @@ def test_prefetch_records_quantized_backing_storages(monkeypatch):
 
     runtime._StreamPrefetcher._record_stream(wrapper, stream)
 
-    assert wrapper.streams == [stream]
+    # The wrapper is not the allocation consumed by the quantized kernel. Record its
+    # backing storages directly, matching PyTorch's lifetime contract.
+    assert wrapper.streams == []
     assert {tensor_id for tensor_id, got_stream in calls if got_stream is stream} == expected_children
+
+
+def test_prefetch_record_failure_is_not_hidden():
+    class Broken:
+        def record_stream(self, stream):
+            raise RuntimeError("stream registration failed")
+
+    with pytest.raises(RuntimeError, match="stream registration failed"):
+        runtime._StreamPrefetcher._record_stream(Broken(), object())

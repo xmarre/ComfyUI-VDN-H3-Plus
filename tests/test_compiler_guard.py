@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 import comfy.cli_args
 
-from vdn_h3 import compiler_guard
+from vdn_h3 import compiler_guard, hybrid
 
 
 @pytest.fixture(autouse=True)
@@ -66,9 +69,38 @@ def test_nested_owned_guards_restore_only_after_outer_exit(monkeypatch):
     assert comfy.cli_args.args.disable_comfy_compiler is False
 
 
-def test_layout_guard_install_is_idempotent():
-    from vdn_h3 import hybrid
+def test_apply_model_wrapper_encloses_outer_forward(monkeypatch):
+    monkeypatch.setattr(compiler_guard, "_compiler_stack_present", lambda: True)
+    comfy.cli_args.args.disable_comfy_compiler = False
 
-    compiler_guard.install_layout_guard()
-    assert getattr(hybrid.make_layout_wrapper, "_vdn_compiler_guard_installed", False)
-    assert compiler_guard.install_layout_guard() is False
+    def execute(*args, **kwargs):
+        assert comfy.cli_args.args.disable_comfy_compiler is True
+        return "done"
+
+    assert compiler_guard.apply_model_wrapper(execute, 1, value=2) == "done"
+    assert comfy.cli_args.args.disable_comfy_compiler is False
+
+
+def test_apply_vdn_registers_outer_compiler_and_inner_layout_wrappers():
+    attn = SimpleNamespace(
+        heads=2,
+        head_dim=4,
+        qkv_proj=torch.nn.Linear(8, 24, bias=False),
+        out_proj=torch.nn.Linear(8, 8, bias=False),
+        q_norm=torch.nn.RMSNorm(4, eps=1e-6),
+        k_norm=torch.nn.RMSNorm(4, eps=1e-6),
+    )
+    dm = SimpleNamespace(blocks=[SimpleNamespace(attn=attn)])
+    wrappers = {}
+    patcher = SimpleNamespace(
+        object_patches={},
+        get_model_object=lambda key: dm,
+        add_object_patch=lambda *args: None,
+        add_wrapper_with_key=lambda kind, key, fn: wrappers.update({kind: fn}),
+    )
+    state = hybrid.VDNState("test", {}, [SimpleNamespace()], 2, 4)
+
+    hybrid.apply_vdn(patcher, state)
+
+    assert wrappers[hybrid.WrappersMP.APPLY_MODEL] is compiler_guard.apply_model_wrapper
+    assert hybrid.WrappersMP.DIFFUSION_MODEL in wrappers

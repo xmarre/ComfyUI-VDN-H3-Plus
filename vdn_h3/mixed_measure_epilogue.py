@@ -57,6 +57,49 @@ def _weight_owner(state, branch):
     return managed if managed is not None else branch
 
 
+def _scope_softmax_gate(gate: torch.Tensor, video_start: int, mode: str) -> torch.Tensor:
+    """Match the normal VDN forward's checkpoint/video-only gate policy."""
+    if mode == "checkpoint":
+        return gate
+    if mode != "video_only":
+        raise RuntimeError(f"VDN Mixed-Grid epilogue does not support global_gate_mode={mode!r}")
+    if video_start <= 0:
+        return gate
+    scoped = gate.clone()
+    scoped[:video_start] = 1.0
+    return scoped
+
+
+def _validate_external_attention_controls(state, *, branch_present: bool, gate_expected: bool) -> str:
+    """Reject branch diagnostics the unprojected-softmax ABI cannot reproduce."""
+    if not branch_present:
+        # The normal VDN forward exits to native attention for branchless blocks, so
+        # none of PR #8's branch-only diagnostic controls apply there either.
+        return "checkpoint"
+
+    cfg = getattr(state, "cfg", {})
+    for name in ("audio_video_context_strength", "conditioning_video_context_strength"):
+        try:
+            strength = float(cfg.get(name, 1.0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"VDN Mixed-Grid epilogue received invalid {name}") from exc
+        if strength != 1.0:
+            raise RuntimeError(
+                f"VDN Mixed-Grid epilogue cannot preserve {name}={strength:g}; the external "
+                "unprojected-softmax path does not expose the alternate K/V domain required "
+                "by this diagnostic. Restore it to 1.0 or disable the Mixed-Grid provider."
+            )
+
+    if not gate_expected:
+        # global_gate_mode is semantically dormant when the learned softmax gate is disabled.
+        return "checkpoint"
+    gate_mode = cfg.get("global_gate_mode", "checkpoint")
+    if gate_mode not in ("checkpoint", "video_only"):
+        raise RuntimeError(
+            f"VDN Mixed-Grid epilogue does not support global_gate_mode={gate_mode!r}")
+    return gate_mode
+
+
 def _validate_external_contract(contract, layout, rows: int, rope_freqs) -> dict[str, int]:
     if not isinstance(contract, Mapping):
         raise RuntimeError("VDN Mixed-Grid epilogue requires an external-sequence contract")
@@ -103,6 +146,8 @@ class BoundVDNEpilogue:
     rows: int
     heads: int
     head_dim: int
+    video_start: int
+    global_gate_mode: str
     owner_generation: str
     config_digest: str
     weight_owner_digest: str
@@ -141,6 +186,7 @@ class BoundVDNEpilogue:
             gate = torch.sigmoid(F.linear(x, gate_weight, gate_bias))
             if gate.ndim != 2 or tuple(gate.shape) != (self.rows, self.heads):
                 raise RuntimeError("VDN Mixed-Grid softmax gate returned incompatible geometry")
+            gate = _scope_softmax_gate(gate, self.video_start, self.global_gate_mode)
             flat = (softmax_out * gate.view(self.rows, self.heads, 1).to(softmax_out.dtype)).reshape(self.rows, -1)
             self.gate_calls += 1
         else:
@@ -210,9 +256,14 @@ class ExternalSoftmaxEpilogueCapability:
         receipt_sink = option_map.get(EPILOGUE_RECEIPTS_KEY)
         if receipt_sink is not None and not isinstance(receipt_sink, list):
             raise RuntimeError("VDN Mixed-Grid epilogue receipt sink must be a list")
+        gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
+        global_gate_mode = _validate_external_attention_controls(
+            self.state,
+            branch_present=branch is not None,
+            gate_expected=gate_expected,
+        )
         contract = option_map.get(EXTERNAL_SEQUENCE_KEY)
         normalized = _validate_external_contract(contract, layout, int(x.shape[0]), rope_freqs)
-        gate_expected = bool(branch is not None and self.state.cfg.get("enable_softmax_gate", True))
         return BoundVDNEpilogue(
             state=self.state,
             block_index=block_index,
@@ -220,6 +271,8 @@ class ExternalSoftmaxEpilogueCapability:
             rows=int(x.shape[0]),
             heads=self.heads,
             head_dim=self.head_dim,
+            video_start=normalized["video_start"],
+            global_gate_mode=global_gate_mode,
             owner_generation=self.owner_generation,
             config_digest=self.config_digest,
             weight_owner_digest=self.weight_owner_digest,
