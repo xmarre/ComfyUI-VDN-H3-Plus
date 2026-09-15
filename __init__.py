@@ -12,6 +12,14 @@ _PKG = os.path.dirname(__file__)
 if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
+# Diagnostic-only W overlay. It is a strict no-op unless Flow publishes the
+# first-high operator request, but it must install before node construction so
+# ApplyVDN captures the diagnostic-aware VDN forward factories.
+from vdn_h3.first_high_operator_diagnostic import install as _install_first_high_operator_diagnostic
+
+_install_first_high_operator_diagnostic()
+del _install_first_high_operator_diagnostic
+
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from vdn_h3.audio_node import ApplyVDNH3AdvancedAudioSafe
 
