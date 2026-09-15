@@ -71,13 +71,21 @@ def _synthetic_sol_module(name: str, path: Path, calls: list[tuple]) -> ModuleTy
     return module
 
 
+def _hide_loaded_sol_companions(monkeypatch) -> None:
+    bare = bridge._MODULE_NAME
+    suffix = f".{bare}"
+    for name in tuple(sys.modules):
+        if name == bare or name.endswith(suffix):
+            monkeypatch.delitem(sys.modules, name, raising=False)
+
+
 def test_e_bridge_resolves_loaded_comfyui_namespaced_sol_companion(monkeypatch, tmp_path):
     bare = bridge._MODULE_NAME
     synthetic_name = f"custom_nodes.synthetic_sol.{bare}"
     calls: list[tuple] = []
     module = _synthetic_sol_module(synthetic_name, tmp_path / "first_high_sol_local_diagnostic.py", calls)
 
-    original_bare = sys.modules.pop(bare, None)
+    _hide_loaded_sol_companions(monkeypatch)
     monkeypatch.setitem(sys.modules, synthetic_name, module)
     monkeypatch.setattr(bridge, "_RESOLVED", None)
 
@@ -85,15 +93,11 @@ def test_e_bridge_resolves_loaded_comfyui_namespaced_sol_companion(monkeypatch, 
         raise AssertionError(f"bare import must not be used for loaded namespaced Sol companion: {name}")
 
     monkeypatch.setattr(bridge.importlib, "import_module", deny_import)
-    try:
-        options = {"marker": object()}
-        metadata = {"block_index": 2, "group_index": 0}
-        token = bridge.enter_local_group(options, metadata)
-        parsed = bridge.parse_sol_request(options)
-        bridge.exit_local_group(token)
-    finally:
-        if original_bare is not None:
-            sys.modules[bare] = original_bare
+    options = {"marker": object()}
+    metadata = {"block_index": 2, "group_index": 0}
+    token = bridge.enter_local_group(options, metadata)
+    parsed = bridge.parse_sol_request(options)
+    bridge.exit_local_group(token)
 
     assert token == "token"
     assert parsed == {"mode": "all_selected_e"}
@@ -111,16 +115,12 @@ def test_e_bridge_fails_closed_on_distinct_namespaced_sources(monkeypatch, tmp_p
         f"custom_nodes.synthetic_sol_b.{bare}", tmp_path / "b.py", []
     )
 
-    original_bare = sys.modules.pop(bare, None)
+    _hide_loaded_sol_companions(monkeypatch)
     monkeypatch.setitem(sys.modules, first.__name__, first)
     monkeypatch.setitem(sys.modules, second.__name__, second)
     monkeypatch.setattr(bridge, "_RESOLVED", None)
-    try:
-        with pytest.raises(RuntimeError, match="resolves ambiguously"):
-            bridge._functions()
-    finally:
-        if original_bare is not None:
-            sys.modules[bare] = original_bare
+    with pytest.raises(RuntimeError, match="resolves ambiguously"):
+        bridge._functions()
 
 
 def test_e_bridge_deduplicates_same_file_aliases_and_caches(monkeypatch, tmp_path):
@@ -134,16 +134,12 @@ def test_e_bridge_deduplicates_same_file_aliases_and_caches(monkeypatch, tmp_pat
     second.exit_local_group = first.exit_local_group
     second.parse_request = first.parse_request
 
-    original_bare = sys.modules.pop(bare, None)
+    _hide_loaded_sol_companions(monkeypatch)
     monkeypatch.setitem(sys.modules, first.__name__, first)
     monkeypatch.setitem(sys.modules, second.__name__, second)
     monkeypatch.setattr(bridge, "_RESOLVED", None)
-    try:
-        first_resolution = bridge._functions()
-        second_resolution = bridge._functions()
-    finally:
-        if original_bare is not None:
-            sys.modules[bare] = original_bare
+    first_resolution = bridge._functions()
+    second_resolution = bridge._functions()
 
     assert first_resolution is second_resolution
     assert first_resolution["enter_local_group"] is first.enter_local_group
