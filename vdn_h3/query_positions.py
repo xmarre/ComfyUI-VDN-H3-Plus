@@ -79,6 +79,7 @@ class WindowGeometry:
 class QueryPositionPlan:
     tag: str
     schema: int
+    mode: str
     owner_generation: str
     plan_digest: str
     seq_len: int
@@ -96,7 +97,6 @@ def _validate_anchor_mode(anchor_frames: str) -> str:
     return anchor_frames
 
 
-@functools.lru_cache(maxsize=8)
 def describe_window_geometry(
     video_start: int,
     video_end: int,
@@ -107,6 +107,31 @@ def describe_window_geometry(
     seq_len: int,
 ) -> WindowGeometry:
     """Describe exactly the grouped gather topology without allocating tensors."""
+    return _describe_window_geometry_cached(
+        GEOMETRY_SCHEMA,
+        video_start,
+        video_end,
+        num_frames,
+        tokens_per_frame,
+        bounds,
+        anchor_frames,
+        seq_len,
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _describe_window_geometry_cached(
+    geometry_schema: str,
+    video_start: int,
+    video_end: int,
+    num_frames: int,
+    tokens_per_frame: int,
+    bounds: tuple[tuple[int, int], ...],
+    anchor_frames: str,
+    seq_len: int,
+) -> WindowGeometry:
+    if geometry_schema != GEOMETRY_SCHEMA:
+        raise ValueError("VDN query-position geometry schema is unsupported")
     video_start = _strict_int(video_start, "video_start")
     video_end = _strict_int(video_end, "video_end")
     num_frames = _strict_int(num_frames, "num_frames", minimum=1)
@@ -124,8 +149,12 @@ def describe_window_geometry(
     for index, pair in enumerate(bounds):
         if not isinstance(pair, (tuple, list)) or len(pair) != 2:
             raise ValueError(f"VDN bound {index} must contain (lo, hi)")
-        lo = _strict_int(max(int(pair[0]), 0), f"bounds[{index}].lo")
-        hi = _strict_int(min(int(pair[1]), num_frames - 1), f"bounds[{index}].hi")
+        if type(pair[0]) is not int or type(pair[1]) is not int:
+            raise ValueError(f"VDN bound {index} must use integer endpoints")
+        lo = max(pair[0], 0)
+        hi = min(pair[1], num_frames - 1)
+        _strict_int(lo, f"bounds[{index}].lo")
+        _strict_int(hi, f"bounds[{index}].hi")
         if lo > hi:
             raise ValueError(f"VDN bound {index} is empty after clamping")
         normalized_bounds.append((lo, hi))
@@ -155,6 +184,10 @@ def describe_window_geometry(
             if anchor_frames in {"columns", "both"} and not lo <= frame <= hi
         )
         key_frames = tuple(sorted(set(range(lo, hi + 1)) | set(extra)))
+        if len(key_frames) != len(set(key_frames)) or any(
+            first >= second for first, second in zip(key_frames, key_frames[1:])
+        ):
+            raise ValueError("VDN grouped key-frame domain is not sorted and unique")
         rank = {frame: index for index, frame in enumerate(key_frames)}
         if any(frame not in rank for frame in query_frames):
             raise ValueError("VDN grouped query frame is absent from its restricted K/V domain")
@@ -199,7 +232,7 @@ def describe_window_geometry(
         for frame in anchor_rows
     )
     plan_payload = {
-        "schema": GEOMETRY_SCHEMA,
+        "schema": geometry_schema,
         "seq_len": seq_len,
         "video_start": video_start,
         "video_end": video_end,
@@ -224,7 +257,7 @@ def describe_window_geometry(
         "anchor_slices": anchor_slices,
     }
     return WindowGeometry(
-        schema=GEOMETRY_SCHEMA,
+        schema=geometry_schema,
         seq_len=seq_len,
         video_start=video_start,
         video_end=video_end,
@@ -281,17 +314,24 @@ def _layout_parts(layout: Any) -> tuple[int, int, int, int, int]:
         text = next(segment for segment in segments if segment[2] == "text")
     except (StopIteration, IndexError, TypeError) as exc:
         raise ValueError("VDN PackedLayout is missing text/audio/video segments") from exc
-    video_start, video_end = int(video[0]), int(video[1])
-    if int(audio[1]) != video_start or int(text[1]) - int(text[0]) != text_len:
+    for segment in (video, audio, text):
+        if len(segment) < 3 or type(segment[0]) is not int or type(segment[1]) is not int:
+            raise ValueError("VDN PackedLayout segment bounds must be integers")
+    video_start, video_end = video[0], video[1]
+    if audio[1] != video_start or text[1] - text[0] != text_len:
         raise ValueError("VDN PackedLayout segment ordering does not match the native contract")
     tokens_per_frame = (lat_h // 2) * (lat_w // 2)
     if video_end - video_start != latent_t * tokens_per_frame:
         raise ValueError("VDN PackedLayout video rows do not match its signature")
-    return video_start, video_end, latent_t, tokens_per_frame, int(layout.seq_len)
+    seq_len = getattr(layout, "seq_len", None)
+    _strict_int(seq_len, "seq_len", minimum=1)
+    if video_end > seq_len:
+        raise ValueError("VDN PackedLayout video rows exceed sequence length")
+    return video_start, video_end, latent_t, tokens_per_frame, seq_len
 
 
 def native_plan_summary(layout: Any, cfg: dict[str, Any], owner_generation: str) -> QueryPositionPlan:
-    """Derive the exact upcoming grouped plan from the supplied native layout.
+    """Derive the exact upcoming native/grouped plan from the supplied layout.
 
     This function intentionally does not read VDNState.layout.  Spectrum calls it
     during preflight, before the actual VDN layout wrapper may install execution
@@ -299,6 +339,8 @@ def native_plan_summary(layout: Any, cfg: dict[str, Any], owner_generation: str)
     """
     if not isinstance(cfg, dict):
         raise ValueError("VDN query-position preflight requires a configuration dictionary")
+    if not isinstance(owner_generation, str) or not owner_generation:
+        raise ValueError("VDN query-position owner generation is missing")
     video_start, video_end, num_frames, tokens_per_frame, seq_len = _layout_parts(layout)
     radius = _strict_int(cfg.get("radius"), "radius")
     chunk = _strict_int(cfg.get("chunk"), "chunk")
@@ -322,10 +364,16 @@ def native_plan_summary(layout: Any, cfg: dict[str, Any], owner_generation: str)
         anchor_frames,
         seq_len,
     )
-    maps = tuple(bind_query_map(geometry, index, owner_generation) for index in range(len(geometry.groups)))
+    full_cover = all(lo == 0 and hi == num_frames - 1 for lo, hi in geometry.bounds)
+    mode = "native" if full_cover else "grouped"
+    maps = () if full_cover else tuple(
+        bind_query_map(geometry, index, owner_generation)
+        for index in range(len(geometry.groups))
+    )
     return QueryPositionPlan(
         tag=PLAN_TAG,
         schema=PLAN_SCHEMA,
+        mode=mode,
         owner_generation=owner_generation,
         plan_digest=geometry.plan_digest,
         seq_len=seq_len,
