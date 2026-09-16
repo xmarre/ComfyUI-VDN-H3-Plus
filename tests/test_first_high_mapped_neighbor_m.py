@@ -38,7 +38,11 @@ def test_mapping_fails_closed_on_noncontiguous_or_inconsistent_plan():
 
     broken = positions.clone()
     broken[32:] += 1
+    broken_q_idx = domain.index_select(0, broken)
     with pytest.raises(RuntimeError, match="contiguous"):
+        m._mapped_intervals(broken_q_idx, domain, broken)
+
+    with pytest.raises(RuntimeError, match="map back"):
         m._mapped_intervals(q_idx, domain, broken)
 
     wrong_q = q_idx.clone()
