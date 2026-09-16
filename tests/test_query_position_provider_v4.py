@@ -26,8 +26,23 @@ def _expand_runs(wire):
     return positions
 
 
+def _layout(text_len=5, frames=12, lat_h=4, lat_w=6, audio_t=8):
+    per_frame = (lat_h // 2) * (lat_w // 2)
+    audio_start = text_len
+    video_start = audio_start + audio_t
+    video_end = video_start + frames * per_frame
+    return SimpleNamespace(
+        signature=(text_len, frames, lat_h, lat_w, audio_t),
+        seq_len=video_end,
+        segments=(
+            (0, text_len, "text"),
+            (audio_start, video_start, "audio"),
+            (video_start, video_end, "video"),
+        ),
+    )
+
+
 def test_geometry_map_is_the_exact_restricted_domain_mapping():
-    # Small nontrivial packed layout with globals on both sides and endpoint anchors.
     geometry = describe_window_geometry(
         7, 7 + 12 * 6, 12, 6, _bounds(12), "both", 84
     )
@@ -52,8 +67,6 @@ def test_geometry_map_is_the_exact_restricted_domain_mapping():
 
 
 def test_group10_shape_and_affine_mapping_for_production_style_52_frames():
-    # The exact token count is intentionally arbitrary here. The contract must be
-    # scale-independent and the terminal chunk must remain represented exactly.
     geometry = describe_window_geometry(
         9, 9 + 52 * 17, 52, 17, _bounds(), "both", 900
     )
@@ -67,29 +80,49 @@ def test_group10_shape_and_affine_mapping_for_production_style_52_frames():
 
 
 def test_native_plan_summary_uses_supplied_layout_not_runtime_state():
-    text_len, frames, lat_h, lat_w, audio_t = 5, 12, 4, 6, 8
-    per_frame = (lat_h // 2) * (lat_w // 2)
-    audio_start = text_len
-    video_start = audio_start + audio_t
-    video_end = video_start + frames * per_frame
-    layout = SimpleNamespace(
-        signature=(text_len, frames, lat_h, lat_w, audio_t),
-        seq_len=video_end,
-        segments=(
-            (0, text_len, "text"),
-            (audio_start, video_start, "audio"),
-            (video_start, video_end, "video"),
-        ),
-    )
+    layout = _layout()
     summary = native_plan_summary(
         layout,
         {"radius": 1, "chunk": 5, "anchor_frames": "both"},
         "owner-summary",
     )
+    assert summary.mode == "grouped"
     assert summary.owner_generation == "owner-summary"
-    assert summary.seq_len == video_end
+    assert summary.seq_len == layout.seq_len
     assert len(summary.groups) == 3
     assert all(group[2] == "owner-summary" for group in summary.groups)
+
+
+def test_full_coverage_preflight_is_explicit_native_without_mapped_groups():
+    layout = _layout(frames=4)
+    summary = native_plan_summary(
+        layout,
+        {"radius": 99, "chunk": 0, "anchor_frames": "both"},
+        "owner-native",
+    )
+    assert summary.mode == "native"
+    assert summary.groups == ()
+    assert summary.owner_generation == "owner-native"
+    assert len(summary.plan_digest) == 64
+
+
+def test_invalid_bool_geometry_is_not_accepted_as_integer():
+    layout = _layout()
+    bad = SimpleNamespace(
+        signature=(5, True, 4, 6, 8),
+        seq_len=layout.seq_len,
+        segments=layout.segments,
+    )
+    try:
+        native_plan_summary(
+            bad,
+            {"radius": 1, "chunk": 5, "anchor_frames": "both"},
+            "owner-summary",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bool latent_t must not alias integer geometry")
 
 
 def test_v4_has_priority_and_malformed_presence_fails_to_native_not_v3():
