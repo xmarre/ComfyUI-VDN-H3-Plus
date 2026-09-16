@@ -12,6 +12,7 @@ Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM)
 recurrence in fp32 via preallocated banks, bf16 features and readout.
 """
 import collections
+import functools
 import logging
 import math
 
@@ -101,17 +102,50 @@ def _tf32_matmul():
     return _Ctx()
 
 
+_STATISTICS_WORKSPACE_BYTES = 1 << 30
+
+
 def frame_statistics(kf, vf, beta, a_fp32=True):
-    """A[f,h,k,l] = sum_s k beta k,  B[f,h,v,k] = sum_s v beta k, over one chunk's
-    rows. A in fp32 (bf16's 8 mantissa bits break the conditioning I+A needs), B left
-    in bf16 for the tensor-core GEMM and promoted on the store. Operates with autocast
-    off implicitly -- callers run under inference no_grad, no ambient autocast."""
+    """Prepare independent frame statistics in bounded batches.
+
+    Long clips otherwise materialize several full-clip FP32 temporaries at once.
+    Batching changes only allocation lifetime: every frame keeps its complete token
+    reduction, original precision, and recurrence semantics.
+    """
+    frames, heads, tokens, dim = kf.shape
+    # K repack, FP32 K and weighted K, plus weighted-V multiply/repack.
+    per_frame = heads * tokens * (
+        dim * (kf.element_size() + (8 if a_fp32 else kf.element_size()))
+        + 2 * vf.shape[-1] * vf.element_size())
+    batch = max(1, _STATISTICS_WORKSPACE_BYTES // max(1, per_frame))
+    if frames <= batch:
+        return _frame_statistics_chunk(kf, vf, beta, a_fp32)
+    a = torch.empty((frames, heads, dim, dim), device=kf.device, dtype=torch.float32)
+    b = torch.empty((frames, heads, vf.shape[-1], dim),
+                    device=kf.device, dtype=torch.float32)
+    for start in range(0, frames, batch):
+        stop = min(start + batch, frames)
+        ac, bc = _frame_statistics_chunk(
+            kf[start:stop], vf[start:stop], beta[start:stop], a_fp32)
+        a[start:stop].copy_(ac)
+        b[start:stop].copy_(bc)
+        del ac, bc
+    return a, b
+
+
+def _frame_statistics_chunk(kf, vf, beta, a_fp32=True):
+    """A[f,h,k,l] = sum_s k beta k, B[f,h,v,k] = sum_s v beta k.
+
+    A stays fp32 for the conditioned I+A solve. B uses the original bf16/fp16
+    tensor-core reduction and is promoted only on store. The contiguous K repack is
+    shared by both GEMMs instead of recreating/retaining the original strided view.
+    """
     with torch.autocast(device_type=kf.device.type, enabled=False):
         kf16 = kf.contiguous()
-        kf32 = kf16.float()
-        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
         vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
         if a_fp32:
+            kf32 = kf16.float()
+            scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
             prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
             try:
@@ -119,10 +153,11 @@ def frame_statistics(kf, vf, beta, a_fp32=True):
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = prev
         else:
+            # Preserve the existing non-fp32 A path exactly.
             a = torch.matmul((kf * beta.unsqueeze(-1).to(kf.dtype)).contiguous()
                              .transpose(-1, -2), kf).float()
         a = 0.5 * (a + a.transpose(-1, -2))
-        b = torch.matmul(vb.transpose(-1, -2), kf).float()
+        b = torch.matmul(vb.transpose(-1, -2), kf16).float()
         return a, b
 
 
@@ -285,7 +320,10 @@ def _temporal_shift(x, w, kernel):
     out = None
     for dt in range(kernel):
         part = xp[dt:dt + x.shape[0]] * w[:, dt].view(1, 1, -1)
-        out = part if out is None else out + part
+        if out is None:
+            out = part
+        else:
+            out.add_(part)
     return out
 
 
@@ -320,6 +358,12 @@ def rms_norm(x, weight, eps):
     ms = torch.linalg.vector_norm(
         x, dim=-1, keepdim=True, dtype=torch.float32).pow(2) / x.shape[-1]
     return x * torch.rsqrt(ms + eps).to(x.dtype) * weight.to(x.dtype)
+
+
+@functools.lru_cache(maxsize=4)
+def _readout_eps(dtype):
+    """Return the checkpoint-dtype-rounded epsilon without a device `.item()` sync."""
+    return torch.tensor(1e-6, dtype=dtype, device="cpu").item()
 
 
 def _linear_epilogue_body(readout_fhsd, norm_weight, gate, eps):
@@ -387,7 +431,11 @@ class LinearBranch:
         pre-RoPE features. q_fhsd (fast_kernels) stores q frame-major [F, H, S, d]
         straight out of the fused activation; n/a when q itself is convolved."""
         conv = self.short_conv
-        if q_fhsd and not (conv and "q" in conv):
+        if conv and "q" in conv:
+            query = conv_features(q_raw, w["short_conv.q_sp.weight"],
+                                  w["short_conv.q_tm.weight"], num_frames, frame_size,
+                                  l2norm=True)
+        elif q_fhsd:
             query = _run_compiled(("act_fhsd", True), _activate_fhsd_body, q_raw,
                                   True, num_frames, q_raw.shape[0] // num_frames)
         else:
@@ -475,7 +523,7 @@ class LinearBranch:
 
         query, key, value = self._features(w, *qkv_raw, num_frames, frame_size,
                                            q_fhsd=self.fuse_epilogue)
-        key_by_frame = key.view(shape).permute(0, 2, 1, 3)       # [F, H, S, d]
+        key_by_frame = key.view(shape).permute(0, 2, 1, 3)
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta = torch.sigmoid(F.linear(xv, w["beta_proj.weight"]))
         beta = beta.view(num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)
@@ -490,8 +538,10 @@ class LinearBranch:
                            w["alpha.dt_bias"], w["alpha.A_log"], n_heads, head_dim)
 
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
-        prefix_states, suffix_states = run_scans(backend, alpha, a, b,
-                                                text_state=text_state)
+        prefix_states, suffix_states = run_scans(
+            backend, alpha, a, b, text_state=text_state)
+        del a, b, key, value, key_by_frame, value_by_frame, beta, frame_mean
+
         gate = torch.sigmoid(F.linear(xv, w["output_gate.down.weight"])
                              @ w["output_gate.up.weight"].T
                              + w["output_gate.up.bias"])
@@ -504,10 +554,10 @@ class LinearBranch:
         # before the batched matmul. fast_kernels stored q frame-major already
         # (the official inference body), skipping the permute-in copy.
         if query.dim() == 4:
-            query_fhsd = query                                   # [F, H, S, d]
+            query_fhsd = query
         else:
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(query_fhsd, linear_state.transpose(-1, -2))
-        return linear_epilogue(readout, w["norm.weight"], gate,
-                               w["norm.weight"].new_tensor(1e-6).item(),
-                               fuse=self.fuse_epilogue)
+        return linear_epilogue(
+            readout, w["norm.weight"], gate, _readout_eps(w["norm.weight"].dtype),
+            fuse=self.fuse_epilogue)

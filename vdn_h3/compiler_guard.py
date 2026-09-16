@@ -1,25 +1,23 @@
 """Scoped compatibility guard for Comfy's AIMDO model compiler.
 
-Upstream VDN-H3 v1.4.3 identified a Comfy build family where the AIMDO
-malloc-graph compiler cannot execute VDN-patched MiniMax-H3 forwards.  Comfy
-currently exposes only a process-global ``args.disable_comfy_compiler`` switch,
-so this module keeps the unavoidable mutation as narrow and reversible as
-possible:
+Upstream VDN-H3 identified a Comfy build family where the AIMDO malloc-graph
+compiler cannot execute VDN-patched MiniMax-H3 forwards. Comfy currently exposes
+only a process-global ``args.disable_comfy_compiler`` switch, so this module keeps
+the unavoidable mutation as narrow and reversible as possible:
 
 * detection is lazy and fail-open on older Comfy builds;
 * a user-provided ``--disable-comfy-compiler`` setting is never changed;
-* VDN-owned disables are reference-counted across nested/overlapping VDN
-  wrappers and restored in ``finally``;
+* VDN-owned disables are reference-counted across nested/overlapping VDN calls and
+  restored in ``finally``;
 * no Comfy function is monkey-patched and no unload hook is installed.
 
-The guard is installed around VDN's own DIFFUSION_MODEL wrapper, so the switch is
-active before the native MiniMax-H3 forward asks ``model_prefetch`` whether to
-start a malloc graph and is restored immediately after that wrapped forward.
+The guard is registered as an ``APPLY_MODEL`` wrapper. This boundary is intentional:
+MiniMax starts its AIMDO allocation graph before ``DIFFUSION_MODEL`` wrappers run, so
+guarding only VDN's layout wrapper is too late on affected builds.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
-import functools
 import logging
 import threading
 
@@ -39,8 +37,6 @@ def _compiler_stack_present() -> bool:
             return False
         import comfy.model_prefetch as model_prefetch
 
-        # Match upstream v1.4.3's final detector. ``import comfy_aimdo.malloc_graph``
-        # binds the package on current Comfy; older builds lack this compiler path.
         aimdo = getattr(model_prefetch, "comfy_aimdo", None)
         return aimdo is not None and hasattr(aimdo, "malloc_graph")
     except Exception:
@@ -49,19 +45,17 @@ def _compiler_stack_present() -> bool:
 
 @contextmanager
 def disabled_for_vdn():
-    """Temporarily disable Comfy's compiler for one VDN model forward.
+    """Temporarily disable Comfy's compiler for one complete VDN model call.
 
     The CLI flag is process-global, so true concurrent non-VDN execution cannot be
-    isolated by any consumer-side workaround.  Comfy's normal prompt executor is
-    serialized; reference counting prevents nested/overlapping VDN wrappers from
-    restoring the flag while another VDN forward still owns it.
+    isolated by any consumer-side workaround. Reference counting prevents nested or
+    overlapping VDN wrappers from restoring the flag while another VDN call owns it.
     """
     global _active_owned_guards, _warned
 
     args = comfy.cli_args.args
     owns = False
-    affected = _compiler_stack_present()
-    if affected:
+    if _compiler_stack_present():
         with _lock:
             if _active_owned_guards > 0:
                 _active_owned_guards += 1
@@ -74,7 +68,7 @@ def disabled_for_vdn():
                     _warned = True
                     _log.warning(
                         "[vdn] this Comfy build's AIMDO model compiler is incompatible "
-                        "with VDN-H3; disabling it only for VDN model forwards")
+                        "with VDN-H3; disabling it only for VDN model calls")
 
     try:
         yield owns
@@ -86,30 +80,7 @@ def disabled_for_vdn():
                     args.disable_comfy_compiler = False
 
 
-def install_layout_guard() -> bool:
-    """Wrap VDN's own layout-wrapper factory exactly once.
-
-    ``vdn_h3.hybrid.apply_vdn`` resolves ``make_layout_wrapper`` from its module
-    globals when Apply executes, so installing after node imports is sufficient and
-    avoids modifying or wrapping any ComfyUI core callable.
-    """
-    from vdn_h3 import hybrid
-
-    current = hybrid.make_layout_wrapper
-    if getattr(current, "_vdn_compiler_guard_installed", False):
-        return False
-
-    @functools.wraps(current)
-    def guarded_factory(state):
-        inner = current(state)
-
-        @functools.wraps(inner)
-        def guarded(executor, *args, **kwargs):
-            with disabled_for_vdn():
-                return inner(executor, *args, **kwargs)
-
-        return guarded
-
-    guarded_factory._vdn_compiler_guard_installed = True
-    hybrid.make_layout_wrapper = guarded_factory
-    return True
+def apply_model_wrapper(executor, *args, **kwargs):
+    """Comfy ``APPLY_MODEL`` wrapper that encloses the outer MiniMax forward."""
+    with disabled_for_vdn():
+        return executor(*args, **kwargs)

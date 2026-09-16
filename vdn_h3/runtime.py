@@ -72,29 +72,22 @@ class _StreamPrefetcher:
 
     @staticmethod
     def _record_stream(tensor, stream):
-        """Record the consumer stream for every storage backing a streamed weight.
+        """Record every CUDA storage consumed on a stream other than its producer.
 
-        Prefetched weights are allocated on a dedicated CUDA stream and later read
-        by the model's current stream. Both PyTorch's native caching allocator and
-        its ``cudaMallocAsync`` allocator require the non-creation usage stream to
-        be recorded so storage cannot be recycled before the consumer finishes.
-        QuantizedTensor wrappers may own several underlying CUDA tensors; record all
-        of them best-effort.
+        QuantizedTensor is a wrapper rather than the allocation that kernels read;
+        record its qdata plus any scale/original-weight/bias tensors directly. A
+        registration failure is a correctness failure: silently continuing would
+        allow either allocator backend to recycle storage before the consumer ends.
         """
-        seen = [tensor]
         inner = getattr(tensor, "_qdata", None)
-        if isinstance(inner, torch.Tensor):
-            seen.append(inner)
+        seen = [inner if isinstance(inner, torch.Tensor) else tensor]
         params = getattr(tensor, "_params", None)
         for name in ("scale", "orig_weight", "bias"):
             child = getattr(params, name, None)
             if isinstance(child, torch.Tensor):
                 seen.append(child)
         for item in seen:
-            try:
-                item.record_stream(stream)
-            except Exception:
-                pass
+            item.record_stream(stream)
 
     @staticmethod
     def _fetch(generation, index, fetch):

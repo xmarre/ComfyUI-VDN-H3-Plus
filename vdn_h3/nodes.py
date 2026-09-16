@@ -16,6 +16,67 @@ import vdn_h3.spec as spec
 
 _log = logging.getLogger("comfy.vdn")
 
+_ADAPTER_ABLATION_TARGETS = {
+    "none": None,
+    "stage_b_dit_off": ("default", "dit"),
+    "stage_b_refiner_off": ("default", "refiner"),
+    "turbo_attention_off": ("turbo", "attention"),
+    "turbo_mlp_off": ("turbo", "mlp"),
+    "turbo_adaln_off": ("turbo", "adaln"),
+    "turbo_refiner_off": ("turbo", "refiner"),
+}
+
+
+def _adapter_target_group(path):
+    """Classify converted Comfy targets for targeted diagnostic ablations."""
+    if path.startswith("token_refiner."):
+        return "refiner"
+    if path.endswith(".adaln_proj.linear"):
+        return "adaln"
+    if ".mlp." in path:
+        return "mlp"
+    if ".attn." in path:
+        return "attention"
+    if path.startswith("blocks."):
+        return "dit"
+    return "other"
+
+
+def _apply_adapter_ablation(converted_by_name, ablation):
+    """Remove one adapter target class without changing any surviving tensor/scale."""
+    if ablation not in _ADAPTER_ABLATION_TARGETS:
+        raise ValueError(f"invalid adapter_ablation {ablation!r}")
+    target = _ADAPTER_ABLATION_TARGETS[ablation]
+    if target is None:
+        return converted_by_name, {}
+
+    adapter_name, group = target
+    if adapter_name not in converted_by_name:
+        raise ValueError(
+            f"adapter_ablation={ablation!r} requires adapter {adapter_name!r} to be enabled")
+
+    filtered = {}
+    removed = {}
+    for name, modules in converted_by_name.items():
+        if name != adapter_name:
+            filtered[name] = modules
+            continue
+        keep = {}
+        count = 0
+        for path, term in modules.items():
+            path_group = _adapter_target_group(path)
+            matches = (path_group != "refiner") if group == "dit" else (path_group == group)
+            if matches:
+                count += 1
+            else:
+                keep[path] = term
+        if not count:
+            raise RuntimeError(
+                f"adapter_ablation={ablation!r} matched no converted {adapter_name!r} targets")
+        filtered[name] = keep
+        removed[name] = count
+    return filtered, removed
+
 
 def _validate_branch_shapes(path, branches, cfg, hidden, heads, head_dim):
     """Validate every enabled trained tensor on every block against the loaded base."""
@@ -96,9 +157,14 @@ def _effective_free_vram(model):
 
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
-               cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
+               cfg_overrides=None, fast_kernels=False, retain_buffers="auto",
+               global_gate_mode="checkpoint", adapter_ablation="none"):
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
+    if global_gate_mode not in ("checkpoint", "video_only"):
+        raise ValueError(f"invalid global_gate_mode {global_gate_mode!r}")
+    if adapter_ablation not in _ADAPTER_ABLATION_TARGETS:
+        raise ValueError(f"invalid adapter_ablation {adapter_ablation!r}")
     if branch_weights == "cache_gpu":
         _log.warning("[vdn] branch_weights=cache_gpu is deprecated; using resident")
         branch_weights = "resident"
@@ -123,6 +189,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         path, prefer_int8=prefer_int8)
     cfg = dict(cfg)
     cfg.setdefault("linear_enabled", True)
+    cfg["global_gate_mode"] = global_gate_mode
 
     if retain_buffers == "auto":
         retain = policy.auto_retain_policy(path, prefer_int8, free)
@@ -220,6 +287,14 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         if verbose:
             _log.info("[vdn] adapter %s converted: %d modules", name, len(converted[name]))
 
+    converted, removed = _apply_adapter_ablation(converted, adapter_ablation)
+    if removed:
+        _log.warning(
+            "[vdn] diagnostic adapter ablation %s removed targets: %s",
+            adapter_ablation,
+            ", ".join(f"{name}={count}" for name, count in sorted(removed.items())),
+        )
+
     report = apply_adapters(
         new_model,
         converted,
@@ -230,7 +305,8 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     )
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
-        "branch=%s/%s buffers=%s backend=%s lora_mode=%s adapters=%s",
+        "branch=%s/%s buffers=%s backend=%s lora_mode=%s global_gate=%s "
+        "adapter_ablation=%s adapters=%s",
         vdn_checkpoint,
         len(branches),
         cfg["radius"],
@@ -242,6 +318,8 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         "retained" if retain else "transient",
         attention_backend,
         lora_mode,
+        global_gate_mode,
+        adapter_ablation,
         report,
     )
     return (new_model,)
@@ -351,6 +429,17 @@ class ApplyVDNH3Advanced:
                 "default": False,
                 "tooltip": "Compile selected mathematically equivalent branch helpers; "
                            "first run includes compile cost and eager remains fallback."}),
+            "global_gate_mode": (["checkpoint", "video_only"], {
+                "default": "checkpoint",
+                "tooltip": "Audio-fidelity diagnostic. checkpoint reproduces the released "
+                           "VDN gate on every packed row. video_only forces the already-dense "
+                           "text/reference/audio rows to unit gate while retaining learned "
+                           "gating on generated video rows."}),
+            "adapter_ablation": (list(_ADAPTER_ABLATION_TARGETS), {
+                "default": "none",
+                "tooltip": "Diagnostic target-class ablation. Removes exactly one Stage-B "
+                           "or Turbo target class after adapter conversion; surviving targets "
+                           "and strengths are unchanged."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -358,13 +447,14 @@ class ApplyVDNH3Advanced:
     CATEGORY = "model_patch/video"
     DESCRIPTION = (
         "VDN-H3 advanced controls. Checkpoint architecture is the default; ablations "
-        "are applied only after selecting architecture_mode=override.")
+        "are opt-in and leave released-checkpoint behavior unchanged by default.")
 
     def apply(self, model, vdn_checkpoint, apply_turbo_adapter, stage_b_strength,
               turbo_strength, lora_mode, branch_weights, retain_buffers,
               attention_backend, verbose, architecture_mode="checkpoint",
               window_radius=1, window_chunk=5, anchor_frames="both", text_state=True,
-              linear_branch=True, fast_kernels=False):
+              linear_branch=True, fast_kernels=False, global_gate_mode="checkpoint",
+              adapter_ablation="none"):
         if architecture_mode not in ("checkpoint", "override"):
             raise ValueError(f"invalid architecture_mode {architecture_mode!r}")
         overrides = None
@@ -383,7 +473,9 @@ class ApplyVDNH3Advanced:
             apply_turbo_adapter=apply_turbo_adapter,
             cfg_overrides=overrides,
             fast_kernels=fast_kernels,
-            retain_buffers=retain_buffers)
+            retain_buffers=retain_buffers,
+            global_gate_mode=global_gate_mode,
+            adapter_ablation=adapter_ablation)
 
 
 NODE_CLASS_MAPPINGS = {
