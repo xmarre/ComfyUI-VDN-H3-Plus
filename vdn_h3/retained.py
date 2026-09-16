@@ -7,13 +7,16 @@ execution-local ``RuntimeBuffers`` lease when retention is enabled.
 """
 from __future__ import annotations
 
-import collections
-
 import torch
 import torch.nn.functional as F
 
 from vdn_h3 import branch as B
 from vdn_h3 import window as W
+from vdn_h3.query_positions import (
+    GEOMETRY_SCHEMA,
+    bind_query_map,
+    describe_window_geometry,
+)
 from vdn_h3.runtime import current_runtime_buffers
 
 
@@ -84,8 +87,6 @@ class RuntimeLinearBranch(B.LinearBranch):
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
-        # These no longer participate after the scans. Releasing them here keeps the
-        # statistics workspace and feature copies out of the gate/readout peak.
         del a, b, key, value, key_by_frame, value_by_frame, beta, frame_mean
 
         gate = torch.sigmoid(
@@ -122,76 +123,59 @@ class RuntimeLinearBranch(B.LinearBranch):
 
 def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
                        bounds, anchor_frames, seq, device):
-    """Build immutable row-index geometry for one packed-sequence window layout."""
-    def frame_rows(frame):
-        start = video_start + frame * tokens_per_frame
-        return torch.arange(start, start + tokens_per_frame, device=device)
+    """Materialize row tensors from the same pure geometry exported to provider v4."""
+    geometry = describe_window_geometry(
+        int(video_start),
+        int(video_end),
+        int(num_frames),
+        int(tokens_per_frame),
+        tuple(tuple(int(value) for value in pair) for pair in bounds),
+        str(anchor_frames),
+        int(seq),
+    )
 
-    global_idx = torch.cat([
-        torch.arange(video_start, device=device),
-        torch.arange(video_end, seq, device=device),
-    ])
-    anchors = (0, num_frames - 1)
-    anchor_rows = sorted(
-        frame for frame in anchors
-        if anchor_frames in ("rows", "both"))
-    anchor_set = set(anchor_rows)
-
-    grouped = collections.OrderedDict()
-    for frame in range(num_frames):
-        if frame in anchor_set:
-            continue
-        lo = max(bounds[frame][0], 0)
-        hi = min(bounds[frame][1], num_frames - 1)
-        grouped.setdefault((lo, hi), []).append(frame)
-
+    global_idx = torch.tensor(geometry.global_rows, dtype=torch.long, device=device)
     groups = []
     square_aligned = []
-    global_count = global_idx.numel()
-    max_kv_rows = global_count
-    for (lo, hi), frames in grouped.items():
-        extra = [
-            frame for frame in anchors
-            if anchor_frames in ("columns", "both") and not lo <= frame <= hi
-        ]
-        key_frames = sorted(set(range(lo, hi + 1)) | set(extra))
-        win_idx = torch.cat([frame_rows(frame) for frame in key_frames])
-        q_idx = torch.cat([frame_rows(frame) for frame in frames])
+    for group in geometry.groups:
+        q_parts = []
+        for frame in group.query_frames:
+            start = geometry.video_start + frame * geometry.tokens_per_frame
+            q_parts.append(torch.arange(start, start + geometry.tokens_per_frame, device=device))
+        k_parts = []
+        for frame in group.key_frames:
+            start = geometry.video_start + frame * geometry.tokens_per_frame
+            k_parts.append(torch.arange(start, start + geometry.tokens_per_frame, device=device))
+        q_idx = torch.cat(q_parts) if q_parts else torch.empty(0, dtype=torch.long, device=device)
+        win_idx = torch.cat(k_parts) if k_parts else torch.empty(0, dtype=torch.long, device=device)
         groups.append((q_idx, win_idx))
-        square_aligned.append(global_count == 0 and frames == key_frames)
-        max_kv_rows = max(max_kv_rows, global_count + win_idx.numel())
+        square_aligned.append(group.square_aligned)
 
     return {
+        "geometry_schema": GEOMETRY_SCHEMA,
+        "geometry": geometry,
+        "plan_digest": geometry.plan_digest,
         "global_idx": global_idx,
         "groups": groups,
         "square_aligned": square_aligned,
-        "anchor_slices": [
-            (
-                video_start + frame * tokens_per_frame,
-                video_start + (frame + 1) * tokens_per_frame,
-            )
-            for frame in anchor_rows
-        ],
-        "max_kv_rows": max_kv_rows,
+        "anchor_slices": list(geometry.anchor_slices),
+        "max_kv_rows": geometry.max_kv_rows,
     }
 
 
 def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                                    num_frames, tokens_per_frame, bounds, scale,
-                                   anchor_frames="none", transformer_options=None):
+                                   anchor_frames="none", transformer_options=None,
+                                   query_position_owner=None):
     """Grouped exact window softmax with execution-owned plan/KV scratch reuse.
 
-    VDN's native local-window operator is exact SDPA. Generic model-level dense
-    overrides do not leak into the trained local branch. Explicit v1/v2/v3 providers
-    may consume only the row domains VDN already selected. v2 receives a square-Q
-    compatibility payload only when no v3 direct-rectangular provider is installed;
-    v3 receives requested Q directly and therefore adds no square-Q gather/allocation.
+    v4 receives VDN-owned query positions in the exact restricted K/V domain used
+    by the gather below. v3 remains a direct rectangular ABI; v2 remains the legacy
+    lazy square-Q compatibility ABI. A present but malformed v4 suppresses v2/v3
+    routing and is handled by v4 dispatch as native for that call.
     """
-    from .softmax_provider import dispatch, has_v2, has_v3, preprocess
+    from .softmax_provider import dispatch, has_v2, has_v3, has_v4, preprocess
 
-    # This is still the complete post-RoPE packed sequence. Run explicit QKV
-    # preprocessing here, before any VDN row gathering, so transforms that depend
-    # on original packed coordinates (for example Untwist) remain well-defined.
     query, key, value = preprocess(
         transformer_options, query, key, value, query.shape[1])
 
@@ -203,6 +187,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     seq = query.shape[0]
     resources = current_runtime_buffers()
     plan_key = (
+        GEOMETRY_SCHEMA,
         video_start,
         video_end,
         num_frames,
@@ -235,8 +220,9 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         if global_count:
             torch.index_select(key, 0, global_idx, out=k_scratch[:global_count])
             torch.index_select(value, 0, global_idx, out=v_scratch[:global_count])
-        v3 = has_v3(transformer_options)
-        v2 = not v3 and has_v2(transformer_options)
+        v4 = has_v4(transformer_options)
+        v3 = not v4 and has_v3(transformer_options)
+        v2 = not v4 and not v3 and has_v2(transformer_options)
         for group_index, (q_idx, win_idx) in enumerate(groups):
             window_rows = win_idx.numel()
             domain_rows = global_count + window_rows
@@ -247,11 +233,15 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                 value, 0, win_idx,
                 out=v_scratch[global_count:domain_rows])
             q_rows = query.index_select(0, q_idx)
-            contract = {"sink_rows": global_count}
-            if v2:
-                # Legacy v2 square-Q compatibility is now genuinely lazy. The
-                # current Sol-H3 stack publishes v3, so this gather/allocation is
-                # absent from production rectangular dispatch.
+            contract = {"sink_rows": int(global_count)}
+            if v4:
+                query_position_map = None
+                if isinstance(query_position_owner, str) and query_position_owner:
+                    query_position_map = bind_query_map(
+                        plan["geometry"], group_index, query_position_owner
+                    )
+                contract["query_position_map"] = query_position_map
+            elif v2:
                 domain_idx = torch.cat((global_idx, win_idx)) if global_count else win_idx
                 query_positions = torch.searchsorted(win_idx, q_idx) + global_count
                 contract.update(
