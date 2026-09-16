@@ -5,6 +5,7 @@ import collections
 import contextvars
 import copy
 import logging
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.compiler_guard import apply_model_wrapper
 from vdn_h3.mixed_measure_epilogue import attach_external_softmax_epilogue
+from vdn_h3.query_positions import native_plan_summary
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
@@ -109,6 +111,9 @@ class VDNState:
         self.head_dim = head_dim
         self.managed_weights = managed_weights
         self.softmax_backend = "grouped"
+        # Opaque ownership identity is intentionally per VDNState/Apply result. It
+        # never enters geometry digests and is stable for this model ownership only.
+        self.query_position_owner_generation = "vdn-" + uuid.uuid4().hex
         self.runtime = RuntimeBufferOwner(retain_buffers)
         self._layout = contextvars.ContextVar(f"vdn_layout_{id(self)}", default=None)
 
@@ -381,10 +386,6 @@ def make_vdn_forward(attn, state, block_index):
 
         if window_active:
             if comfy.model_management.in_training:
-                # Retained grouped attention uses inference-owned preallocated scratch.
-                # Training instead uses the exact grouped reference partition so all
-                # Q/K/V dependencies stay in a normal autograd graph. Model-level
-                # attention overrides remain excluded, matching VDN inference semantics.
                 from vdn_h3.window import window_softmax_grouped
                 softmax_out = window_softmax_grouped(
                     q, k, v, layout.video_start, layout.video_end,
@@ -411,7 +412,8 @@ def make_vdn_forward(attn, state, block_index):
                         q, k, v, layout.video_start, layout.video_end,
                         layout.num_frames, layout.tokens_per_frame, layout.bounds,
                         head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
-                        transformer_options=transformer_options)
+                        transformer_options=transformer_options,
+                        query_position_owner=state.query_position_owner_generation)
         else:
             softmax_out = _dense_subset_attention(
                 q, k, v, heads, head_dim, transformer_options)
@@ -424,10 +426,6 @@ def make_vdn_forward(attn, state, block_index):
                 raise RuntimeError(
                     "VDN conditioning/video layout is invalid for directional feedback isolation")
             if cb:
-                # Recompute only the pre-target conditioning queries without generated-video
-                # K/V. Target audio remains available as context, and video queries themselves
-                # remain completely untouched. This isolates the indirect
-                # generated-video -> conditioning -> target-audio feedback loop.
                 if window_active:
                     from vdn_h3.window import _sdpa
                     isolated_conditioning = _sdpa(
@@ -503,21 +501,34 @@ def make_vdn_forward(attn, state, block_index):
                 text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
                 skip_ends=(cfg["anchor_frames"] == "both"),
             )
-            # The branch has consumed its raw Q/K/V copies. Do not keep them alive
-            # through the final projection, where their storage can add to the peak.
             del q_raw_video, k_raw_video, v_video, text_k_raw, text_v_raw
             branch_out = F.linear(readout.type_as(x), weights["to_out_linear.weight"])
             if comfy.model_management.in_training:
-                # Avoid version-counter mutations on the attention output while the
-                # generated-audio correction graph is live.
                 a, b = layout.video_start, layout.video_end
                 out = torch.cat((out[:a], out[a:b] + branch_out, out[b:]), dim=0)
             else:
                 out[layout.video_start:layout.video_end] += branch_out
         return out
 
+    def query_position_plan(options, layout):
+        # Spectrum invokes this before an actual transformer call. Only the native
+        # grouped path is preflight-provable. External/reduced and Flex paths stay
+        # actual-only; no state.layout read is allowed here.
+        if base_branch is None or state.softmax_backend != "grouped":
+            return None
+        options = options or {}
+        if options.get(VDN_EXTERNAL_SEQUENCE_KEY) is not None:
+            return None
+        try:
+            return native_plan_summary(
+                layout, cfg, state.query_position_owner_generation
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
     vdn_forward._vdn_forward = True
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
+    vdn_forward.vdn_query_position_plan_v1 = query_position_plan
     attach_external_softmax_epilogue(
         vdn_forward, state, block_index, out_proj, heads, head_dim
     )
@@ -542,8 +553,6 @@ def apply_vdn(new_model, state):
                 f"VDN cannot safely replace existing object patch {key}; compose the "
                 "other provider through Comfy transformer/model patch APIs instead")
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
-    # The AIMDO allocation graph starts outside DIFFUSION_MODEL. Guard the entire
-    # MiniMax model call and let compiler_guard preserve user/global state in finally.
     new_model.add_wrapper_with_key(
         WrappersMP.APPLY_MODEL, "vdn_h3_compiler", apply_model_wrapper)
     new_model.add_wrapper_with_key(
