@@ -13,8 +13,8 @@ if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
 # Diagnostic-only overlays install before node construction so ApplyVDN captures
-# their forwarding factories. E installs after W; M retargets only E's immutable
-# request mode and replaces only E's local-window diagnostic dispatcher.
+# their forwarding factories. E installs after W; M multiplexes only its own
+# separately versioned request mode and replaces only E's local-window dispatcher.
 from vdn_h3.first_high_operator_diagnostic import install as _install_first_high_operator_diagnostic
 from vdn_h3.first_high_operator_sol_bridge import install as _install_first_high_operator_sol_bridge
 from vdn_h3.first_high_sol_local_diagnostic import install as _install_first_high_sol_local_diagnostic
@@ -26,18 +26,32 @@ _install_first_high_operator_diagnostic()
 _install_first_high_operator_sol_bridge()
 _install_first_high_sol_local_diagnostic()
 
+_ORIGINAL_E_PARSE_REQUEST = _first_high_sol_local_diagnostic.parse_request
 
-def _parse_mapped_neighbor_request(options):
-    options = options or {}
-    if options.get(_first_high_sol_local_diagnostic.REQUEST_KEY) is None:
+
+def _raw_request_mode(value):
+    if not isinstance(value, tuple):
         return None
+    modes = [
+        item[1]
+        for item in value
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "mode"
+    ]
+    return modes[0] if len(modes) == 1 else None
+
+
+def _parse_e_or_m_request(options):
+    options = options or {}
+    raw = options.get(_first_high_sol_local_diagnostic.REQUEST_KEY)
+    if _raw_request_mode(raw) != "mapped_neighbor_m":
+        return _ORIGINAL_E_PARSE_REQUEST(options)
     request = _parse_sol_request(dict(options))
     if not isinstance(request, dict) or request.get("mode") != "mapped_neighbor_m":
         raise RuntimeError("mapped-neighbor M VDN request differs from the Sol companion")
     return request
 
 
-_first_high_sol_local_diagnostic.parse_request = _parse_mapped_neighbor_request
+_first_high_sol_local_diagnostic.parse_request = _parse_e_or_m_request
 _install_first_high_mapped_neighbor_diagnostic()
 
 del _install_first_high_operator_diagnostic
