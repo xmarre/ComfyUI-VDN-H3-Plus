@@ -16,16 +16,21 @@ if _PKG not in sys.path:
 # their forwarding factories. Both remain strict no-ops without their request.
 # E installs after W and therefore can preserve W's evidence wrapper underneath
 # while independently selecting the ordinary restricted VDN production path.
+# M installs last and replaces only E's local-window diagnostic dispatch when the
+# separately identified mapped-neighbor request is active.
 from vdn_h3.first_high_operator_diagnostic import install as _install_first_high_operator_diagnostic
 from vdn_h3.first_high_operator_sol_bridge import install as _install_first_high_operator_sol_bridge
 from vdn_h3.first_high_sol_local_diagnostic import install as _install_first_high_sol_local_diagnostic
+from vdn_h3.first_high_mapped_neighbor_diagnostic import install as _install_first_high_mapped_neighbor_diagnostic
 
 _install_first_high_operator_diagnostic()
 _install_first_high_operator_sol_bridge()
 _install_first_high_sol_local_diagnostic()
+_install_first_high_mapped_neighbor_diagnostic()
 del _install_first_high_operator_diagnostic
 del _install_first_high_operator_sol_bridge
 del _install_first_high_sol_local_diagnostic
+del _install_first_high_mapped_neighbor_diagnostic
 
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from vdn_h3.audio_node import ApplyVDNH3AdvancedAudioSafe
