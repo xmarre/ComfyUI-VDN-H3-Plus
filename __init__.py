@@ -20,13 +20,14 @@ from vdn_h3.first_high_operator_sol_bridge import install as _install_first_high
 from vdn_h3.first_high_sol_local_diagnostic import install as _install_first_high_sol_local_diagnostic
 from vdn_h3 import first_high_sol_local_diagnostic as _first_high_sol_local_diagnostic
 from vdn_h3.first_high_sol_local_bridge import parse_sol_request as _parse_sol_request
-from vdn_h3.first_high_mapped_neighbor_diagnostic import install as _install_first_high_mapped_neighbor_diagnostic
+from vdn_h3 import first_high_mapped_neighbor_diagnostic as _first_high_mapped_neighbor_diagnostic
 
 _install_first_high_operator_diagnostic()
 _install_first_high_operator_sol_bridge()
 _install_first_high_sol_local_diagnostic()
 
 _ORIGINAL_E_PARSE_REQUEST = _first_high_sol_local_diagnostic.parse_request
+_ORIGINAL_M_REQUEST = _first_high_mapped_neighbor_diagnostic._request
 
 
 def _raw_request_mode(value):
@@ -51,13 +52,21 @@ def _parse_e_or_m_request(options):
     return request
 
 
+def _mapped_neighbor_request_only(options):
+    options = options or {}
+    raw = options.get(_first_high_sol_local_diagnostic.REQUEST_KEY)
+    if _raw_request_mode(raw) != "mapped_neighbor_m":
+        return None
+    return _ORIGINAL_M_REQUEST(options)
+
+
 _first_high_sol_local_diagnostic.parse_request = _parse_e_or_m_request
-_install_first_high_mapped_neighbor_diagnostic()
+_first_high_mapped_neighbor_diagnostic._request = _mapped_neighbor_request_only
+_first_high_mapped_neighbor_diagnostic.install()
 
 del _install_first_high_operator_diagnostic
 del _install_first_high_operator_sol_bridge
 del _install_first_high_sol_local_diagnostic
-del _install_first_high_mapped_neighbor_diagnostic
 
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from vdn_h3.audio_node import ApplyVDNH3AdvancedAudioSafe
