@@ -69,8 +69,15 @@ def _validate_inputs(
     expected = (rows, heads, head_dim)
     if any(tuple(tensor.shape) != expected for tensor in (q_raw, k_raw, v_raw)):
         raise RuntimeError("partitioned VDN linear raw QKV rows do not match frame geometry")
+    frame_count = len(frame_sizes)
     for index, ((lo, hi), scale) in enumerate(zip(bounds, measure_scales, strict=True)):
-        if type(lo) is not int or type(hi) is not int or not 0 <= lo <= hi < len(frame_sizes):
+        if (
+            type(lo) is not int
+            or type(hi) is not int
+            or lo > hi
+            or lo > frame_count - 1
+            or hi < 0
+        ):
             raise RuntimeError(f"partitioned VDN linear bound {index} is invalid")
         scale = float(scale)
         if not math.isfinite(scale) or not 0.0 < scale <= 1.0:
