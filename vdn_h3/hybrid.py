@@ -384,7 +384,7 @@ def make_vdn_forward(attn, state, block_index):
                 q_raw_video, k_raw_video, v_video,
                 layout.num_frames, layout.tokens_per_frame, layout.bounds,
                 frame_size=layout.frame_size,
-                text_x=text_x, text_k_raw=text_k_raw, text_v_raw=v_video if False else text_v_raw,
+                text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
                 skip_ends=(cfg["anchor_frames"] == "both"),
             )
             out[layout.video_start:layout.video_end] += F.linear(
