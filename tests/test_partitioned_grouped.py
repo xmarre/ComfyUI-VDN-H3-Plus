@@ -1,6 +1,7 @@
 from vdn_h3.partitioned_grouped import build_partitioned_grouped_plan
 from vdn_h3.partitioned_sequence import PartitionedSequence
 from vdn_h3.query_positions import WIRE_SCHEMA, WIRE_TAG
+from vdn_h3.window import window_bounds
 
 
 def test_partitioned_grouped_geometry_keeps_target_prefix_and_source_suffix_rows():
@@ -39,6 +40,29 @@ def test_partitioned_grouped_geometry_keeps_target_prefix_and_source_suffix_rows
         all((frame < flow.prefix_t) == group.query_prefix_domain for frame in group.query_frames)
         for group in grouped.groups
     )
+
+
+def test_partitioned_grouped_geometry_clamps_released_window_bounds_identically():
+    flow = PartitionedSequence(
+        video_start=7,
+        temporal=5,
+        prefix_t=2,
+        source_grid_h=2,
+        source_grid_w=3,
+        target_grid_h=3,
+        target_grid_w=4,
+    )
+    raw = window_bounds(flow.temporal, radius=1, chunk=1)
+    assert raw[0][0] < 0
+    assert raw[-1][1] >= flow.temporal
+
+    grouped = build_partitioned_grouped_plan(
+        flow,
+        bounds=raw,
+        anchor_frames="none",
+        semantic_digest="d" * 64,
+    )
+    assert grouped.bounds == ((0, 1), (0, 2), (1, 3), (2, 4), (3, 4))
 
 
 def test_partitioned_group_wire_maps_requested_rows_into_gathered_domain():
