@@ -128,15 +128,10 @@ def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPl
     )
 
 
-def _indices_from_ranges(ranges, *, device):
-    import torch
-
-    parts = [torch.arange(start, end, device=device) for start, end in ranges if end > start]
-    if not parts:
-        return torch.empty(0, dtype=torch.long, device=device)
-    if len(parts) == 1:
-        return parts[0]
-    return torch.cat(parts)
+def _indices_from_ranges(ranges, *, device, resources, identity):
+    if resources is None:
+        raise RuntimeError("partitioned exact-prefix VDN requires active runtime buffers")
+    return resources.partition_indices(identity, ranges, device)
 
 
 def _partitioned_query_summary(current, values, options, layout):
@@ -220,6 +215,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     cfg = values["cfg"]
     s = int(x.shape[0])
     device, dtype = x.device, x.dtype
+    resources = state.runtime.current()
+    if resources is None:
+        raise RuntimeError("partitioned exact-prefix VDN requires an active runtime-buffer lease")
+    index_identity = ("partitioned_exact_prefix_v1", grouped.plan_digest)
 
     q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
     v = v.view(s, heads, head_dim)
@@ -265,7 +264,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     covered_rows = grouped.video_start
 
     if grouped.video_start:
-        global_index = torch.arange(grouped.video_start, device=device)
+        global_index = _indices_from_ranges(
+            ((0, grouped.video_start),),
+            device=device,
+            resources=resources,
+            identity=(*index_identity, "global"),
+        )
         softmax_out[global_index] = partitioned_request_attention(
             q[global_index],
             k,
@@ -283,9 +287,19 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     owner = state.query_position_owner_generation
     for group in grouped.groups:
-        q_index = _indices_from_ranges(group.q_ranges, device=device)
+        q_index = _indices_from_ranges(
+            group.q_ranges,
+            device=device,
+            resources=resources,
+            identity=(*index_identity, "q", group.group_index),
+        )
         global_range = ((0, grouped.video_start),) if grouped.video_start else ()
-        k_index = _indices_from_ranges((*global_range, *group.key_ranges), device=device)
+        k_index = _indices_from_ranges(
+            (*global_range, *group.key_ranges),
+            device=device,
+            resources=resources,
+            identity=(*index_identity, "k", group.group_index),
+        )
         if q_index.numel() != group.q_rows or k_index.numel() != group.kv_rows:
             raise RuntimeError("partitioned VDN runtime gather does not match the CPU geometry plan")
         wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
@@ -311,7 +325,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         covered_rows += group.q_rows
 
     if grouped.anchor_slices:
-        anchor_index = _indices_from_ranges(grouped.anchor_slices, device=device)
+        anchor_index = _indices_from_ranges(
+            grouped.anchor_slices,
+            device=device,
+            resources=resources,
+            identity=(*index_identity, "anchor"),
+        )
         softmax_out[anchor_index] = partitioned_request_attention(
             q[anchor_index],
             k,
