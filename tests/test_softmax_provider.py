@@ -5,6 +5,7 @@ from vdn_h3.softmax_provider import (
     KEY,
     KEY_V2,
     KEY_V3,
+    KEY_V4,
     PREPROCESS_KEY,
     PROVIDER_API_VERSION,
     dispatch,
@@ -79,7 +80,7 @@ def test_v2_square_domain_matches_native_rectangular_attention():
 
 
 def test_v3_direct_rectangular_domain_avoids_square_payload():
-    assert PROVIDER_API_VERSION == 3
+    assert PROVIDER_API_VERSION == 4
     torch.manual_seed(19)
     q, k, v = (torch.randn(13, 2, 4) for _ in range(3))
     bounds = window.window_bounds(4, 0, 2)
@@ -102,7 +103,7 @@ def test_v3_direct_rectangular_domain_avoids_square_payload():
     assert seen and all(requested < restricted_kv for requested, restricted_kv in seen)
 
 
-def test_provider_precedence_v3_then_v2_then_v1():
+def test_provider_precedence_v4_then_v3_then_v2_then_v1():
     q = torch.randn(4, 2, 4)
     calls = []
     def v1(native, q, k, v, **contract):
@@ -114,6 +115,14 @@ def test_provider_precedence_v3_then_v2_then_v1():
     def v3(native, q, k, v, **contract):
         calls.append("v3")
         return native()
+    def v4(native, q, k, v, **contract):
+        calls.append("v4")
+        return native()
+
+    dispatch({KEY: v1, KEY_V2: v2, KEY_V3: v3, KEY_V4: v4},
+             lambda: q, q, q, q, kind="local", scale=.5)
+    assert calls == ["v4"]
+    calls.clear()
     dispatch({KEY: v1, KEY_V2: v2, KEY_V3: v3}, lambda: q, q, q, q, kind="local", scale=.5)
     assert calls == ["v3"]
     calls.clear()
@@ -122,6 +131,20 @@ def test_provider_precedence_v3_then_v2_then_v1():
     calls.clear()
     dispatch({KEY: v1}, lambda: q, q, q, q, kind="local", scale=.5)
     assert calls == ["v1"]
+
+
+def test_present_malformed_v4_fails_native_instead_of_downgrading():
+    q = torch.randn(4, 2, 4)
+    calls = []
+    def v3(native, q, k, v, **contract):
+        calls.append("v3")
+        return native()
+    def native():
+        calls.append("native")
+        return q
+    assert dispatch({KEY_V4: None, KEY_V3: v3}, native, q, q, q,
+                    kind="local", scale=.5) is q
+    assert calls == ["native"]
 
 
 def test_full_domain_preprocess_is_shape_preserving_and_explicit():

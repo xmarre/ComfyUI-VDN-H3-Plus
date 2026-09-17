@@ -1,10 +1,10 @@
 # Optional attention subcall providers
 
-Production companion: [ComfyUI-Sol-H3 v0.1.0](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.0).
+Production companion: [ComfyUI-Sol-H3 v0.1.5](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.5).
 
 VDN keeps ownership of its trained window/global/anchor geometry, learned softmax gate, output projection and learned linear complement. External providers can only operate on domains VDN has already selected.
 
-The provider contract is implemented in grouped retained attention rather than `vdn_h3/hybrid.py`. It therefore remains independent of the separate experimental audio-fidelity work in PR #8; #8 is not required for this provider contract or for v1.5.3.
+The provider contract is implemented in grouped retained attention. Full-domain preprocessing still occurs before VDN gathers local domains, and VDN remains responsible for the gather/scatter topology.
 
 ## v1
 
@@ -36,7 +36,7 @@ This path does not broaden VDN attention, but it evaluates extra disposable Q ro
 
 ## v3 direct rectangular contract
 
-`transformer_options["vdn_softmax_provider_v3"]` is the preferred contract for providers that accept rectangular attention:
+`transformer_options["vdn_softmax_provider_v3"]` remains the direct rectangular contract for providers that do not need physical query-position metadata:
 
 ```python
 provider(
@@ -47,9 +47,42 @@ provider(
 
 For local calls, `q` contains only the requested VDN query rows while `k/v` contain the exact already-restricted VDN K/V domain. `sink_rows` is the leading global/prefix K/V row count. No `square_q` or `query_positions` payload is constructed.
 
-Dispatch order is v3, then v2, then v1. Sol-H3 v0.1.0 publishes v3, so production rectangular SOL no longer pays the v2 square-Q gather/allocation. v2 construction is lazy and occurs only when an actual v2-only provider is installed.
+## v4 mapped query positions
 
-Global and anchor operations remain separate. Masked Flex remains VDN-native; if Flex falls back to grouped, that grouped execution can consume the explicit provider contract.
+`transformer_options["vdn_softmax_provider_v4"]` extends the v3 rectangular tensors with VDN-owned query positions in the already-gathered restricted K/V domain:
+
+```python
+provider(
+    native, q, k, v,
+    *, kind, scale, square_aligned=False, sink_rows=0,
+    query_position_map=None,
+)
+```
+
+For a grouped local call, `query_position_map` is the immutable tagged tuple:
+
+```text
+("vdn_query_positions", 1,
+ owner_generation, plan_digest, group_index,
+ q_rows, kv_rows, sink_rows,
+ query_position_runs)
+```
+
+Each run is `(q_begin, q_end, kv_begin)` and means that requested query rows `[q_begin:q_end]` correspond, in order, to restricted-domain K/V positions starting at `kv_begin`. Runs cover every requested Q row exactly once. The map describes positions only; it does not broaden or reorder the K/V domain.
+
+VDN builds these maps from the same CPU window geometry that drives the actual grouped gather. `owner_generation` is specific to one Apply-VDN state, while `plan_digest` identifies the immutable grouped geometry. Consumers must validate ownership, group/count/sink agreement and the complete mapping before using it.
+
+The v4 key has fail-closed precedence. If it is present but non-callable, VDN executes the supplied `native()` callback for that subcall rather than silently downgrading to an older sparse provider. A callable v4 provider can likewise reject a missing, malformed or unsupported map by invoking `native()` on the already-restricted Q/K/V domain.
+
+When v4 is present, VDN does not construct v2's square-Q compatibility payload. Global and anchor calls carry no mapped local-domain contract and remain VDN-native. Training/reference grouped execution is unchanged.
+
+Current dispatch order is v4 when present, then v3, v2, v1, and finally native. Older consumers that do not publish v4 keep their existing signatures and dispatch behavior.
+
+### Preflight geometry
+
+Each VDN attention forward exposes `vdn_query_position_plan_v1(options, layout)`. It derives an immutable CPU summary from the supplied native MiniMax-H3 `PackedLayout` and the captured VDN configuration; it does not read a previous runtime `state.layout`. The summary contains the owner generation, plan digest and ordered v4 maps used by grouped native execution.
+
+Unsupported/opaque layouts, external or reduced sequence ownership, Flex routing, or invalid native layout geometry return no mapped preflight. This allows forecast/history consumers to treat unknown mapped routing as actual-only instead of predicting from stale state.
 
 ## Full-domain QKV preprocessing
 
@@ -63,22 +96,16 @@ For grouped execution it runs once on the complete post-RoPE packed tensors insi
 
 Generic model-level dense attention overrides still do not automatically leak into VDN's trained local operator. The explicit provider/preprocess contracts define composition instead.
 
-## Optional stacking with PR #8
+## Compatibility
 
-The unreleased PR #8 audio-fidelity experiment owns separate hybrid/audio/training behavior. This provider work does not edit `vdn_h3/hybrid.py` and can be stacked with #8 for experimentation, but v1.5.3 does not depend on #8 and does not include its unvalidated semantic experiment.
+v1/v2/v3 remain callable without additional keyword arguments. A v4-capable provider is a paired capability: VDN transports exact positions, while the provider decides whether that mapping is representable by its backend. Missing or unsupported mapped capability must use the same restricted-domain native callback; equal Q/K tensor lengths alone are not proof that rows are aligned.
 
-## Validation and production evidence
+The provider contracts do not transfer ownership of VDN's learned gate, output projection, linear complement, global/anchor topology, external/reduced sequence handling, or other VDN runtime ownership.
 
-The provider suite checks v1/v2/v3 dispatch, restricted-domain equivalence, lazy v2 square mapping, direct rectangular v3 routing, and full-domain preprocessing before grouped row gathering. The normal VDN CI lanes cover the pinned Comfy/OpenVDN oracle, current-Comfy smoke and legacy workflow migration.
+The separate PR #8 audio-fidelity experiment is not part of this provider-v4 release and remains unreleased.
 
-The released Sol-H3 v0.1.0 production stack on RTX PRO 6000 Blackwell confirms direct v3 routing with no VDN square-Q expansion:
+## Validation and evidence boundary
 
-| Stage | Rectangular SOL calls | Requested Q rows | Kernel Q rows | Square expansion |
-|---|---:|---:|---:|---:|
-| Native low | 1,584 | 3,744,000 | 3,744,000 | 0 |
-| Native high | 1,056 | 4,972,800 | 4,972,800 | 0 |
-| Later native high | 1,248 | 5,967,360 | 5,967,360 | 0 |
+The v4 implementation has CPU tests for exact restricted-domain mapping, owner-bound preflight, provider precedence, malformed-v4 native fallback, and suppression of the v2 square-Q payload. Paired Sol-H3 v0.1.5 production validation additionally passed real SM120 same-input validation, controlled first-high replay, the historical-M timing gate, and the representative 2x7-second Target Input trajectory.
 
-The historical v2 compatibility bridge expanded Q kernel work by roughly 4.4–5.4x in affected stages. v3 removes that expansion without changing VDN's K/V membership, learned gate, linear complement, output projection or global/anchor ownership.
-
-Flow's separate external mixed-grid API-2 route also remained direct at 144 SOL calls / 6,270,480 requested and kernel Q rows 1:1. Spectrum retained 18 logical calls / 14 actual transformer NFEs / 4 forecasts in the final stack. These results validate provider composition; they are not a claim that VDN itself owns Flow's external route or Spectrum's forecast policy.
+The released v3 stack remains historical evidence for direct rectangular routing. v4 changes the numerical routing policy only when a paired provider validates and consumes the explicit map; it does not retroactively change the behavior of older providers.

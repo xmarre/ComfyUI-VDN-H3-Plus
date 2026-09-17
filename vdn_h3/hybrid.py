@@ -5,6 +5,7 @@ import collections
 import contextvars
 import copy
 import logging
+import uuid
 
 import torch
 import torch.nn.functional as F
@@ -16,6 +17,7 @@ import comfy.quant_ops
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
+from vdn_h3.query_positions import native_plan_summary
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
@@ -74,6 +76,7 @@ class VDNState:
         self.head_dim = head_dim
         self.managed_weights = managed_weights
         self.softmax_backend = "grouped"
+        self.query_position_owner_generation = "vdn-" + uuid.uuid4().hex
         self.runtime = RuntimeBufferOwner(retain_buffers)
         self._layout = contextvars.ContextVar(f"vdn_layout_{id(self)}", default=None)
 
@@ -348,7 +351,8 @@ def make_vdn_forward(attn, state, block_index):
                     q, k, v, layout.video_start, layout.video_end,
                     layout.num_frames, layout.tokens_per_frame, layout.bounds,
                     head_dim ** -0.5, anchor_frames=cfg["anchor_frames"],
-                    transformer_options=transformer_options)
+                    transformer_options=transformer_options,
+                    query_position_owner=state.query_position_owner_generation)
         else:
             qc = AttentionTensorContainer(q.transpose(0, 1).unsqueeze(0))
             kc = AttentionTensorContainer(k.transpose(0, 1).unsqueeze(0))
@@ -387,8 +391,22 @@ def make_vdn_forward(attn, state, block_index):
                 readout.type_as(x), weights["to_out_linear.weight"])
         return out
 
+    def query_position_plan(options, layout):
+        # Preflight is valid only for the native grouped path. External/reduced and
+        # Flex paths remain actual-only; do not read state.layout here.
+        if base_branch is None or state.softmax_backend != "grouped":
+            return None
+        options = options or {}
+        if options.get(VDN_EXTERNAL_SEQUENCE_KEY) is not None:
+            return None
+        try:
+            return native_plan_summary(layout, cfg, state.query_position_owner_generation)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+
     vdn_forward._vdn_forward = True
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
+    vdn_forward.vdn_query_position_plan_v1 = query_position_plan
     return vdn_forward
 
 
