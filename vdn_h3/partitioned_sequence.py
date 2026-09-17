@@ -1,7 +1,7 @@
 """Fail-closed parser for Flow's partitioned exact-prefix sequence contract.
 
 This is deliberately separate from the deprecated Mixed-Grid external-sequence
-API.  VDN remains owner of its learned gate/out projection; the contract only
+API. VDN remains owner of its learned gate/out projection; the contract only
 describes the heterogeneous packed rows presented to numerical attention during
 the low/probe phase of exact-prefix progressive continuation.
 """
@@ -15,7 +15,7 @@ import math
 PARTITIONED_PREFIX_KEY = "h3_flow_partitioned_exact_prefix_v1"
 PARTITIONED_PREFIX_API = 1
 PARTITIONED_PREFIX_TOPOLOGY = "target_prefix_source_suffix"
-VDN_PARTITIONED_SEQUENCE_API = 1
+VDN_PARTITIONED_SEQUENCE_API = 3
 VDN_PARTITIONED_SEQUENCE_MODE = "partitioned_attention_no_linear"
 
 
@@ -120,7 +120,10 @@ class PartitionedSequence:
 def validate_flow_partition_contract(contract, *, sequence_rows):
     if not isinstance(contract, dict):
         raise ValueError("partitioned exact-prefix metadata must be a dictionary")
-    if contract.get("api") != PARTITIONED_PREFIX_API or contract.get("topology") != PARTITIONED_PREFIX_TOPOLOGY:
+    if (
+        contract.get("api") != PARTITIONED_PREFIX_API
+        or contract.get("topology") != PARTITIONED_PREFIX_TOPOLOGY
+    ):
         raise ValueError("unsupported partitioned exact-prefix metadata")
     geometry_names = (
         "video_start",
