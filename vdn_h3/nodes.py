@@ -9,6 +9,7 @@ import comfy.model_management
 from vdn_h3.adapters import convert_adapter
 from vdn_h3.apply import apply_adapters
 from vdn_h3.hybrid import VDNState, apply_vdn
+from vdn_h3.keyless_compat import require_released_qkv_base
 from vdn_h3.managed import make_managed_branch_patcher
 from vdn_h3.retained import RuntimeLinearBranch
 import vdn_h3.policy as policy
@@ -109,6 +110,12 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         raise ValueError(
             f"retain_buffers must be auto, on or off, got {retain_buffers!r}")
 
+    # Architecture is a prerequisite, not a checkpoint-discovery side effect. In
+    # particular, reject an advertised Keyless core before touching checkpoint files,
+    # VRAM placement heuristics or ModelPatcher state: released VDN stages are QKV-trained.
+    dm = model.get_model_object("diffusion_model")
+    blocks = require_released_qkv_base(dm)
+
     path = spec.resolve_vdn_checkpoint(vdn_checkpoint)
     free = (
         _effective_free_vram(model)
@@ -141,12 +148,6 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                 "ModelSpec: %s", changed)
         cfg.update(cfg_overrides)
 
-    dm = model.get_model_object("diffusion_model")
-    blocks = getattr(dm, "blocks", None)
-    if blocks is None or not blocks or not hasattr(getattr(blocks[0], "attn", None), "qkv_proj"):
-        raise RuntimeError(
-            "ApplyVDNH3 needs a current ComfyUI MiniMax-H3 MODEL "
-            "(diffusion_model.blocks[].attn.qkv_proj).")
     if len(blocks) != len(branch_weights_by_block):
         raise RuntimeError(
             f"VDN checkpoint has {len(branch_weights_by_block)} blocks but the loaded "
