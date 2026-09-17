@@ -26,7 +26,7 @@ def test_flow_partition_contract_roundtrips_and_binds_vdn_external_mode():
 
     external = make_vdn_partitioned_external_contract(parsed)
     assert external == {
-        "api": 1,
+        "api": 3,
         "mode": "partitioned_attention_no_linear",
         "topology": "target_prefix_source_suffix",
         "sequence_rows": 103,
