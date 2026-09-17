@@ -62,6 +62,22 @@ def _closure_values(function):
     return values
 
 
+def _mixed_layout_matches_plan(layout, plan) -> bool:
+    if layout is None:
+        return False
+    signature = getattr(layout, "signature", None)
+    segments = getattr(layout, "segments", None)
+    return bool(
+        int(getattr(layout, "seq_len", -1)) == plan.sequence_rows
+        and isinstance(signature, tuple)
+        and signature
+        and signature[0] == PARTITIONED_PREFIX_KEY
+        and isinstance(segments, (tuple, list))
+        and segments
+        and tuple(segments[-1]) == (plan.video_start, plan.sequence_rows, "video")
+    )
+
+
 def validate_partitioned_external_execution(
     transformer_options: dict[str, Any],
     layout: Any,
@@ -129,10 +145,18 @@ def _partitioned_query_summary(current, values, options, layout):
         released = getattr(current, "vdn_query_position_plan_v1", None)
         return released(options, layout) if callable(released) else None
     try:
+        state = values["state"]
+        if getattr(state, "softmax_backend", None) != "grouped":
+            return None
         plan = validate_flow_partition_contract(
             flow_contract,
             sequence_rows=int(flow_contract.get("sequence_rows", -1)),
         )
+        if not _mixed_layout_matches_plan(layout, plan):
+            return None
+        external = (options or {}).get(VDN_EXTERNAL_SEQUENCE_KEY)
+        if external != make_vdn_partitioned_external_contract(plan):
+            return None
         cfg = values["cfg"]
         from .window import window_bounds
 
@@ -143,7 +167,7 @@ def _partitioned_query_summary(current, values, options, layout):
             anchor_frames=cfg["anchor_frames"],
             semantic_digest=str(flow_contract["semantic_digest"]),
         )
-        owner = values["state"].query_position_owner_generation
+        owner = state.query_position_owner_generation
         return PartitionedQueryPositionSummary(
             tag="vdn_query_position_plan_v1",
             schema=1,
@@ -171,6 +195,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     options = transformer_options or {}
     state = values["state"]
+    if getattr(state, "softmax_backend", None) != "grouped":
+        raise RuntimeError("partitioned exact-prefix VDN requires the grouped softmax backend")
     base_branch = values["base_branch"]
     if base_branch is None:
         raise RuntimeError("partitioned exact-prefix VDN requires an active VDN branch")
