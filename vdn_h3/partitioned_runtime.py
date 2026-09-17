@@ -1,16 +1,16 @@
 """Runtime bridge for Flow partitioned exact-prefix sequences.
 
 The first API-3 prototype reused VDN's historical external-sequence predicate.
-That predicate intentionally disables both the grouped temporal softmax windows
+That predicate intentionally disabled both the grouped temporal softmax windows
 and the geometry-dependent linear complement. It was appropriate for the retired
 Mixed-Grid experiment, but it is too weak for the replacement production path.
 
-This bridge instead wraps the already-installed VDN object patches on the cloned
-MODEL. Ordinary calls delegate byte-for-byte to the released forward. Only an
-explicit Flow partition contract selects the heterogeneous grouped softmax path.
-The learned linear complement remains disabled for this experimental topology
-until it has its own variable-grid oracle; that omission is explicit and remains
-a decoded-media promotion gate.
+API 4 wraps the already-installed VDN object patches on the cloned MODEL. Ordinary
+calls delegate byte-for-byte to the released forward. Only an explicit Flow
+partition contract selects heterogeneous grouped softmax plus the oracle-backed
+variable-grid learned linear complement. Prefix frames retain the target grid,
+suffix frames retain the source grid, and the linear state uses the same physical
+per-frame measure correction as partitioned softmax.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from .partitioned_sequence import (
 )
 
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
-_BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v2"
+_BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +224,51 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     v = v.view(s, heads, head_dim)
     q_raw = q.view(s, heads, head_dim)
     k_raw = k.view(s, heads, head_dim)
+
+    # The released VDN linear branch consumes raw pre-QK-norm/pre-RoPE video
+    # features. Preserve exactly those rows before the in-place H3 RoPE helper.
+    linear_active = bool(not layout.full_cover and cfg.get("linear_enabled", True))
+    q_raw_video = k_raw_video = v_raw_video = None
+    text_x = text_k_raw = text_v_raw = None
+    if linear_active:
+        video_start = grouped.video_start
+        video_end = grouped.sequence_rows
+        text_len = int(layout.text_len) if base_branch.enable_text_state else 0
+        scratch = resources.activation_scratch(
+            video_end - video_start,
+            text_len,
+            heads,
+            head_dim,
+            device,
+            dtype,
+        )
+        if scratch is None:
+            q_raw_video = q_raw[video_start:video_end].clone()
+            k_raw_video = k_raw[video_start:video_end].clone()
+            v_raw_video = v[video_start:video_end].clone()
+        else:
+            q_raw_video = scratch["q"]
+            k_raw_video = scratch["k"]
+            v_raw_video = scratch["v"]
+            q_raw_video.copy_(q_raw[video_start:video_end])
+            k_raw_video.copy_(k_raw[video_start:video_end])
+            v_raw_video.copy_(v[video_start:video_end])
+
+        if base_branch.enable_text_state and int(layout.text_len):
+            text_start = int(layout.text_start)
+            text_end = text_start + int(layout.text_len)
+            if not 0 <= text_start < text_end <= grouped.video_start:
+                raise RuntimeError("partitioned VDN text rows are outside the non-video prefix")
+            text_x = x[text_start:text_end]
+            if scratch is None:
+                text_k_raw = k_raw[text_start:text_end].clone()
+                text_v_raw = v[text_start:text_end].clone()
+            else:
+                text_k_raw = scratch["tk"]
+                text_v_raw = scratch["tv"]
+                text_k_raw.copy_(k_raw[text_start:text_end])
+                text_v_raw.copy_(v[text_start:text_end])
+
     if rope_freqs is not None:
         q4 = q.view(1, s, heads, head_dim)
         k4 = k.view(1, s, heads, head_dim)
@@ -364,20 +409,46 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         flat = softmax_out.reshape(s, -1)
     out = out_proj(flat.type_as(x))
 
-    # Variable-grid linear state is intentionally not approximated. The released
-    # branch's spatial short-conv and recurrent statistics assume one fixed
-    # tokens-per-frame value. Resizing the exact prefix merely for that branch
-    # would reintroduce the context distortion this path exists to remove.
+    linear_added = False
+    if linear_active:
+        from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
+
+        frame_sizes, measure_scales = partitioned_frame_contract(plan)
+        readout = partitioned_linear_readout(
+            base_branch,
+            weights,
+            x[grouped.video_start : grouped.sequence_rows],
+            q_raw_video,
+            k_raw_video,
+            v_raw_video,
+            frame_sizes=frame_sizes,
+            bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
+            measure_scales=measure_scales,
+            text_x=text_x,
+            text_k_raw=text_k_raw,
+            text_v_raw=text_v_raw,
+            skip_ends=(cfg["anchor_frames"] == "both"),
+        )
+        expected_shape = (grouped.sequence_rows - grouped.video_start, heads * head_dim)
+        if tuple(readout.shape) != expected_shape:
+            raise RuntimeError("partitioned VDN linear complement returned incompatible rows")
+        out[grouped.video_start : grouped.sequence_rows] += F.linear(
+            readout.type_as(x),
+            weights["to_out_linear.weight"],
+        )
+        linear_added = True
+
     from .hybrid import _once
 
     _once(
         (
-            "partitioned-grouped",
+            "partitioned-grouped-v4",
             grouped.plan_digest,
             block_index,
-            bool(cfg.get("linear_enabled", True)),
+            linear_added,
         ),
-        "partitioned exact-prefix: grouped VDN softmax restored; variable-grid linear complement disabled pending oracle",
+        "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+        + ("active" if linear_added else "inactive by released full-coverage/config semantics"),
     )
     return out
 
