@@ -1,9 +1,9 @@
 """Fail-closed parser for Flow's partitioned exact-prefix sequence contract.
 
 This is deliberately separate from the deprecated Mixed-Grid external-sequence
-API. VDN remains owner of its learned gate/out projection; the contract only
-describes the heterogeneous packed rows presented to numerical attention during
-the low/probe phase of exact-prefix progressive continuation.
+API. VDN remains owner of its learned gate/out projection and variable-grid linear
+complement; the contract only describes the heterogeneous packed rows presented to
+VDN during the low/probe phase of exact-prefix progressive continuation.
 """
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ import math
 PARTITIONED_PREFIX_KEY = "h3_flow_partitioned_exact_prefix_v1"
 PARTITIONED_PREFIX_API = 1
 PARTITIONED_PREFIX_TOPOLOGY = "target_prefix_source_suffix"
-VDN_PARTITIONED_SEQUENCE_API = 3
-VDN_PARTITIONED_SEQUENCE_MODE = "partitioned_attention_no_linear"
+VDN_PARTITIONED_SEQUENCE_API = 4
+VDN_PARTITIONED_SEQUENCE_MODE = "partitioned_attention_variable_grid_linear"
 
 
 def _positive_int(value, name):
