@@ -8,13 +8,13 @@ builds the real gathers and the Sol mapped-neighbor wire maps.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any
 
-from .query_positions import WIRE_SCHEMA, WIRE_TAG
 from .partitioned_sequence import PartitionedSequence
+from .query_positions import WIRE_SCHEMA, WIRE_TAG
 
 PARTITIONED_GROUPED_SCHEMA = "vdn-partitioned-grouped-geometry-v1"
 
@@ -135,10 +135,21 @@ def build_partitioned_grouped_plan(
         grouped.setdefault(key, []).append(frame)
 
     groups = []
-    column_anchors = tuple(sorted({0, plan.temporal - 1})) if anchor_frames in {"columns", "both"} else ()
-    for group_index, ((lo, hi), query_prefix_domain) in enumerate(grouped.items()):
-        query_frames = tuple(grouped[((lo, hi), query_prefix_domain)])
-        key_frames = tuple(sorted(set(range(lo, hi + 1)) | {f for f in column_anchors if not lo <= f <= hi}))
+    column_anchors = (
+        tuple(sorted({0, plan.temporal - 1}))
+        if anchor_frames in {"columns", "both"}
+        else ()
+    )
+    for group_index, (((lo, hi), query_prefix_domain), query_frames_raw) in enumerate(
+        grouped.items()
+    ):
+        query_frames = tuple(query_frames_raw)
+        key_frames = tuple(
+            sorted(
+                set(range(lo, hi + 1))
+                | {frame for frame in column_anchors if not lo <= frame <= hi}
+            )
+        )
         if any(frame not in key_frames for frame in query_frames):
             raise RuntimeError("partitioned VDN query frame is absent from its K/V domain")
 
@@ -151,9 +162,8 @@ def build_partitioned_grouped_plan(
         prefix_k_start = None
         prefix_k_end = None
         for frame, (start, end) in zip(key_frames, key_ranges, strict=True):
-            del start
             frame_k_offsets[frame] = cursor
-            rows = end - ranges[frame][0]
+            rows = end - start
             if frame < plan.prefix_t:
                 if prefix_k_start is None:
                     prefix_k_start = cursor
@@ -168,8 +178,7 @@ def build_partitioned_grouped_plan(
         q_cursor = 0
         previous_k = -1
         for frame, (start, end) in zip(query_frames, q_ranges, strict=True):
-            del start
-            rows = end - ranges[frame][0]
+            rows = end - start
             k_begin = frame_k_offsets[frame]
             if k_begin <= previous_k:
                 raise RuntimeError("partitioned VDN query-position map is not monotonic")
