@@ -1,3 +1,96 @@
+# ComfyUI-VDN-H3-Plus v1.5.5
+
+Coordinated production release with [ComfyUI-Sol-H3 v0.1.5](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.5) and [MiniMax H3 Flow-Aligned Regenerate v0.3.5](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.5).
+
+Implementation PRs: [VDN-H3-Plus #18](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/18), [Sol-H3 #14](https://github.com/xmarre/ComfyUI-Sol-H3/pull/14), and Flow [#33](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/33) + [#48](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/48).
+
+## Motivation: the first-high artifact
+
+The production MiniMax-H3 stack exposed a reproducible first-high visual artifact after the progressive low-to-high handoff when VDN retained grouped local attention was executed through Sol-H3 sparse attention.
+
+Controlled same-input investigation isolated the boundary:
+
+- replay R reproduced the broken first-high output;
+- native W-window was clean while preserving VDN's restricted local K/V support and learned linear complement;
+- W-full-support was also clean;
+- global and anchor operations remained native.
+
+The problem was therefore not that VDN's local K/V window was too small and not that its learned complement had to be removed. It was the coordinate contract between VDN's grouped local domain and Sol's exact-neighbor protection.
+
+VDN gathers requested local Q rows separately from its restricted K/V domain, whose order is `[global_rows, permitted_window_rows]`. A requested query's **physical row position inside that gathered K/V domain is not its local Q ordinal**. The old provider contract supplied rectangular Q/K/V but did not transport that physical mapping, so Sol's normal ordinal rule `abs(q_block - kv_block) <= 1` could preserve the wrong neighboring K blocks exactly. In the captured failing group-10 geometry, Q physically corresponded to K positions `9245..10268` while the local Q block ordinals were only `0..15`.
+
+Diagnostic M established the required correction on the preserved input: keep VDN's exact restricted K/V support and Sol's sparse approximation, but protect exact neighbors around each query's mapped physical K/V position.
+
+## Resolution: provider v4 owns the mapping
+
+v1.5.5 adds `vdn_softmax_provider_v4`. VDN now transports the missing information from the component that actually owns it.
+
+For each grouped local call, VDN derives the query-position map from the **same pure CPU geometry that drives the real gather**, binds it to one Apply-VDN owner generation, and sends an immutable tagged affine-run description alongside the existing direct rectangular Q/K/V tensors:
+
+```text
+("vdn_query_positions", 1,
+ owner_generation, plan_digest, group_index,
+ q_rows, kv_rows, sink_rows,
+ query_position_runs)
+```
+
+The map describes positions only. It does not broaden or reorder the restricted K/V domain, change Q/K/V values, or transfer ownership of VDN's learned softmax gate, output projection, linear complement, global/anchor operations or window topology.
+
+Provider-v4 dispatch is fail-closed: a present malformed v4 entry runs the supplied native restricted-domain callback rather than silently downgrading to an older sparse provider. v1/v2/v3 remain compatible. When v4 is present, the old v2 square-Q compatibility payload is not constructed.
+
+VDN also exposes `vdn_query_position_plan_v1(options, layout)` for preflight/history consumers. It derives the upcoming owner-bound native/grouped map directly from the supplied MiniMax-H3 `PackedLayout`, not from stale execution state. External/reduced and Flex-owned paths remain actual-only when the mapping cannot be proven.
+
+The paired Sol-H3 v0.1.5 validates this map, compiles bounded K64 mapped-neighbor intervals and adds them to its real SM120 route as:
+
+```text
+new_exact = old_exact OR mapped_neighbor
+```
+
+That paired change is the production fix for the captured artifact.
+
+## Flow / Continuum production path
+
+The coordinated Flow v0.3.5 release standardizes **Progressive Handoff (Target Input)** and retires Mixed-Grid from the production acceptance path. Exact protected continuation stays on the target grid and uses the validated four-audio-tick guided overlap while restoring caller-owned exact video/audio values at output.
+
+The final production stack validated for this release is:
+
+```text
+MiniMax H3 Flow-Aligned Regenerate v0.3.5
+ComfyUI-Sol-H3                    v0.1.5
+ComfyUI-VDN-H3-Plus              v1.5.5
+```
+
+The separate VDN PR #8 audio-fidelity/training experiment is **not included** in v1.5.5 and remains unreleased.
+
+## Production validation
+
+Real RTX PRO 6000 / SM120 validation of the coordinated stack included the same-input mapped route, controlled first-high replay, historical-M performance comparison, and the representative two-chunk production trajectory.
+
+Run `00494` completed:
+
+```text
+17 logical calls
+13 actual H3 NFE
+4 Spectrum forecasts
+
+low:    4 actual / 1 forecast
+probe:  1 actual / 0 forecast
+high:   2 actual / 1 forecast
+later:  6 actual / 2 forecast
+```
+
+Mapped local routing remained direct with requested Q rows equal to kernel Q rows and zero square expansion. There was no mapped-local native fallback or kernel-unavailable failure. The decoded 14-second output showed no first-high corruption, frame shift, zoom-out, top-edge reveal, flash, grid artifact or physical AV seam; the chunk boundary was perceptually seamless.
+
+The matched Sol production mapped-kernel timing gate measured `1.109472036 ms` versus `1.105535984 ms` for historical diagnostic M, a `+0.356031%` median delta inside the `+5%` acceptance budget.
+
+00494 evidence hashes:
+
+- runtime log: `699c17b6d85d186039b9179c4b99edb596e88fdda37d3f8814917c50b6905ca8`;
+- metrics JSON: `c25a90af61d83c1430c3f29b9e99de7b0adb22f60d714e2d1392a269e6f0802e`;
+- final MP4: `1ffb5ebff47417f2f9354d3ae7cdfa32b6b6e292cd661efb9ddc2fd818d66ab2`.
+
+---
+
 # ComfyUI-VDN-H3-Plus v1.5.4
 
 v1.5.4 is a packaging/release follow-up to v1.5.3. Runtime VDN math and provider behavior are unchanged.
