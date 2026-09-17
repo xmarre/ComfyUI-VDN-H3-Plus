@@ -48,6 +48,28 @@ def _frame_ranges(plan: PartitionedSequence) -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
+def _normalize_bounds(bounds, temporal: int) -> tuple[tuple[int, int], ...]:
+    """Clamp released VDN's intentionally-unclamped temporal window bounds.
+
+    ``window_bounds`` returns negative starts and ends beyond the final frame at
+    sequence edges; released grouped attention clamps those values immediately
+    before choosing K/V frames.  The partitioned geometry plan must canonicalize
+    the same effective domain before grouping and hashing it.
+    """
+    raw = tuple((int(lo), int(hi)) for lo, hi in bounds)
+    if len(raw) != temporal:
+        raise ValueError("partitioned VDN temporal bounds do not cover every frame")
+    normalized = []
+    for frame, (lo, hi) in enumerate(raw):
+        if lo > frame or hi < frame:
+            raise ValueError("partitioned VDN temporal bound does not contain its query frame")
+        clamped = (max(0, lo), min(temporal - 1, hi))
+        if not 0 <= clamped[0] <= frame <= clamped[1] < temporal:
+            raise ValueError("partitioned VDN temporal bound is invalid")
+        normalized.append(clamped)
+    return tuple(normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class PartitionedGroup:
     group_index: int
@@ -117,12 +139,7 @@ def build_partitioned_grouped_plan(
         raise TypeError("partitioned VDN grouped geometry requires a validated Flow plan")
     if not isinstance(semantic_digest, str) or len(semantic_digest) != 64:
         raise ValueError("partitioned VDN semantic digest is invalid")
-    normalized_bounds = tuple((int(lo), int(hi)) for lo, hi in bounds)
-    if len(normalized_bounds) != plan.temporal:
-        raise ValueError("partitioned VDN temporal bounds do not cover every frame")
-    for frame, (lo, hi) in enumerate(normalized_bounds):
-        if not 0 <= lo <= frame <= hi < plan.temporal:
-            raise ValueError("partitioned VDN temporal bound is invalid")
+    normalized_bounds = _normalize_bounds(bounds, plan.temporal)
 
     ranges = _frame_ranges(plan)
     row_anchors = _anchor_rows(anchor_frames, plan.temporal)
