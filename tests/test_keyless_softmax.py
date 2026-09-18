@@ -13,7 +13,7 @@ from vdn_h3.keyless_softmax import (
     KeylessVDNSoftmaxState,
     apply_keyless_softmax_reference,
 )
-from vdn_h3.softmax_provider import KEY_V4
+from vdn_h3.softmax_provider import KEY, KEY_V4
 from vdn_h3 import window
 
 
@@ -249,6 +249,25 @@ def test_unreviewed_keyless_compositions_fail_closed(field, value, match):
         _run(provider, q, v, _Routing(recorder), **{field: value})
 
     assert recorder == {"select": [], "materialize": []}
+
+
+def test_legacy_vdn_softmax_provider_is_not_silently_reused_for_keyless():
+    q = torch.randn(8, 2, 4)
+    v = torch.randn(8, 2, 4)
+    provider, _state = _provider(_layout())
+    recorder = {"select": [], "materialize": []}
+
+    with pytest.raises(
+        KeylessVDNSoftmaxCompatibilityError,
+        match="provider-v4",
+    ):
+        _run(
+            provider,
+            q,
+            v,
+            _Routing(recorder),
+            transformer_options={KEY: lambda native, *args, **kwargs: native()},
+        )
 
 
 def test_native_vdn_preprocess_is_not_reapplied_to_keyless_qv():
