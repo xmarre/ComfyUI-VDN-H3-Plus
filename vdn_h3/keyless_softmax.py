@@ -221,6 +221,17 @@ class KeylessVDNSoftmaxProviderV1:
             raise KeylessVDNSoftmaxCompatibilityError(
                 "Keyless routing spec must expose select_value_rows() and materialize()"
             )
+        legacy_preprocessors = [
+            getattr(preprocessor, "identity", "<unknown>")
+            for preprocessor in tuple(getattr(routing, "preprocessors", ()) or ())
+            if not callable(getattr(preprocessor, "domain_fn", None))
+        ]
+        if legacy_preprocessors:
+            raise KeylessVDNSoftmaxCompatibilityError(
+                "Keyless VDN selected-domain routing requires domain-aware preprocessors; "
+                "legacy full-domain preprocessors are not safe after row selection: "
+                + ", ".join(str(identity) for identity in legacy_preprocessors)
+            )
 
         geometry = describe_window_geometry(
             int(layout.video_start),
