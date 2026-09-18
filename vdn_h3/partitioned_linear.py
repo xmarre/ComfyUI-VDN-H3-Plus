@@ -278,11 +278,18 @@ def _core_readout(
             "vdn_linear_scans_host_wall_s",
             time.perf_counter() - scans_started,
         )
-    gate = torch.sigmoid(
-        F.linear(x_video, weights["output_gate.down.weight"])
-        @ weights["output_gate.up.weight"].T
-        + weights["output_gate.up.bias"]
-    )
+    gate_started = time.perf_counter()
+    with component_span("vdn_linear_gate"):
+        gate = torch.sigmoid(
+            F.linear(x_video, weights["output_gate.down.weight"])
+            @ weights["output_gate.up.weight"].T
+            + weights["output_gate.up.bias"]
+        )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_gate_host_wall_s",
+            time.perf_counter() - gate_started,
+        )
     gather_started = time.perf_counter()
     with component_span("vdn_linear_gather"):
         linear_state = B.gather_linear_state(
@@ -302,7 +309,14 @@ def _core_readout(
         )
 
     outputs = []
-    eps = weights["norm.weight"].new_tensor(1e-6).item()
+    epsilon_started = time.perf_counter()
+    with component_span("vdn_linear_epsilon_scalar"):
+        eps = weights["norm.weight"].new_tensor(1e-6).item()
+    if record_component is not None:
+        record_component(
+            "vdn_linear_epsilon_scalar_host_wall_s",
+            time.perf_counter() - epsilon_started,
+        )
     output_started = time.perf_counter()
     with component_span("vdn_linear_output"):
         for frame, (start, stop) in enumerate(offsets):
