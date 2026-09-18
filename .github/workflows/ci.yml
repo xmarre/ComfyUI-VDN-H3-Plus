@@ -16,6 +16,7 @@ concurrency:
 env:
   COMFY_SHA: 6c53f8c9a06d95f3d847009ceaae55c624169247
   OPENVDN_SHA: b8cb28fbfca0266d1c7742a9f25ab8b58191de97
+  KEYLESS_SHA: c241fc2eb51eb36bbeba0d8adc3c4cc541a76d04
 
 jobs:
   frontend-compat:
@@ -50,6 +51,13 @@ jobs:
           repository: OpenVDN/vdn-minimax-h3
           ref: ${{ env.OPENVDN_SHA }}
           path: _deps/openvdn
+      - name: Checkout pinned MiniMax-H3-Keyless contract
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: xmarre/MiniMax-H3-Keyless
+          ref: ${{ env.KEYLESS_SHA }}
+          path: _deps/Keyless
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -70,6 +78,8 @@ jobs:
           OPENVDN_ROOT: ${{ github.workspace }}/_deps/openvdn
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI:${{ github.workspace }}/_deps/openvdn
         run: pytest -q tests --timeout=120
+      - name: Validate MiniMax-H3-Keyless row-domain contract
+        run: python tools/check_keyless_vdn_contracts.py --keyless _deps/Keyless
 
   comfy-main-smoke:
     name: Current Comfy main smoke
@@ -115,7 +125,11 @@ jobs:
               submodule_search_locations=[str(root)])
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
-          assert {'ApplyVDNH3', 'ApplyVDNH3Advanced'} <= set(mod.NODE_CLASS_MAPPINGS)
+          assert {
+              'ApplyVDNH3',
+              'ApplyVDNH3Advanced',
+              'ApplyVDNH3KeylessSoftmaxReference',
+          } <= set(mod.NODE_CLASS_MAPPINGS)
           assert mod.WEB_DIRECTORY == './web'
 
           from vdn_h3 import compiler_guard

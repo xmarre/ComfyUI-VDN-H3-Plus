@@ -10,6 +10,7 @@ from vdn_h3.adapters import convert_adapter
 from vdn_h3.apply import apply_adapters
 from vdn_h3.hybrid import VDNState, apply_vdn
 from vdn_h3.keyless_compat import require_released_qkv_base
+from vdn_h3.keyless_softmax import apply_keyless_softmax_reference
 from vdn_h3.managed import make_managed_branch_patcher
 from vdn_h3.retained import RuntimeLinearBranch
 import vdn_h3.policy as policy
@@ -387,11 +388,63 @@ class ApplyVDNH3Advanced:
             retain_buffers=retain_buffers)
 
 
+class ApplyVDNH3KeylessSoftmaxReference:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "window_radius": ("INT", {
+                "default": 1,
+                "min": 0,
+                "max": 8,
+                "tooltip": "Reference grouped-window radius. This node does not load "
+                           "released VDN branch weights or adapters.",
+            }),
+            "window_chunk": ("INT", {
+                "default": 5,
+                "min": 0,
+                "max": 64,
+                "tooltip": "Reference grouped-window chunk size; 0 selects frame mode.",
+            }),
+            "anchor_frames": (["both", "columns", "rows", "none"], {
+                "default": "both",
+            }),
+            "retain_buffers": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Retain only VDN-owned grouped-window scratch for this "
+                           "reference provider. No learned linear-branch state is loaded.",
+            }),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "model_patch/video/experimental"
+    DESCRIPTION = (
+        "Reference-only h3_keyless_core50_v1 VDN softmax/window path. It selects each "
+        "restricted V domain once and derives route(V) from those selected rows. It does "
+        "not load released QKV-trained VDN linear-branch weights/adapters and is not a "
+        "replacement for a trained Keyless-native VDN checkpoint."
+    )
+
+    def apply(self, model, window_radius, window_chunk, anchor_frames, retain_buffers):
+        return (
+            apply_keyless_softmax_reference(
+                model,
+                radius=window_radius,
+                chunk=window_chunk,
+                anchor_frames=anchor_frames,
+                retain_buffers=retain_buffers,
+            ),
+        )
+
+
 NODE_CLASS_MAPPINGS = {
     "ApplyVDNH3": ApplyVDNH3,
     "ApplyVDNH3Advanced": ApplyVDNH3Advanced,
+    "ApplyVDNH3KeylessSoftmaxReference": ApplyVDNH3KeylessSoftmaxReference,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ApplyVDNH3": "Apply VDN-H3 (MiniMax-H3 Hybrid Attention)",
     "ApplyVDNH3Advanced": "Apply VDN-H3 Advanced (Checkpoint / Ablations)",
+    "ApplyVDNH3KeylessSoftmaxReference": "Apply VDN-H3 Keyless Softmax Reference",
 }
