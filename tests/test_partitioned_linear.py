@@ -219,7 +219,9 @@ def test_variable_grid_linear_component_recorder_is_observational():
         "vdn_linear_features_host_wall_s",
         "vdn_linear_statistics_host_wall_s",
         "vdn_linear_scans_host_wall_s",
+        "vdn_linear_gate_host_wall_s",
         "vdn_linear_gather_host_wall_s",
+        "vdn_linear_epsilon_scalar_host_wall_s",
         "vdn_linear_output_host_wall_s",
         "vdn_linear_api_host_wall_s",
     }
@@ -229,6 +231,8 @@ def test_variable_grid_linear_component_recorder_is_observational():
         "vdn_linear_features",
         "vdn_linear_statistics",
         "vdn_linear_scans",
+        "vdn_linear_gate",
         "vdn_linear_gather",
+        "vdn_linear_epsilon_scalar",
         "vdn_linear_output",
     ]
