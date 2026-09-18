@@ -22,7 +22,7 @@ from vdn_h3.hybrid import VDNLayout, make_layout_wrapper
 from vdn_h3.keyless_compat import require_keyless_softmax_base
 from vdn_h3.query_positions import bind_query_map, describe_window_geometry
 from vdn_h3.runtime import RuntimeBufferOwner
-from vdn_h3.softmax_provider import PREPROCESS_KEY, dispatch
+from vdn_h3.softmax_provider import KEY, KEY_V2, KEY_V3, KEY_V4, PREPROCESS_KEY, dispatch
 from vdn_h3.window import _sdpa, full_coverage, window_bounds
 
 KEYLESS_PROVIDER_KEY = "minimax_h3_keyless_provider_v1"
@@ -194,6 +194,13 @@ class KeylessVDNSoftmaxProviderV1:
             raise KeylessVDNSoftmaxCompatibilityError(
                 "vdn_attention_preprocess_v1 must not run on Keyless Q/V; "
                 "routing transforms belong in minimax_h3_keyless_routing_preprocessors_v1"
+            )
+        if KEY_V4 not in transformer_options and any(
+            key in transformer_options for key in (KEY, KEY_V2, KEY_V3)
+        ):
+            raise KeylessVDNSoftmaxCompatibilityError(
+                "Keyless VDN softmax authorizes only provider-v4 subcalls; "
+                "legacy VDN softmax provider APIs do not carry the reviewed query-position map"
             )
 
         block_index = getattr(routing, "block_index", None)
