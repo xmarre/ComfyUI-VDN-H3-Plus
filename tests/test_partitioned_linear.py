@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -176,9 +177,15 @@ def test_variable_grid_linear_component_recorder_is_observational():
     x, q, k, v = _inputs(rows, seed=47)
     originals = tuple(t.clone() for t in (x, q, k, v))
     recorded = {}
+    cuda_components = []
 
     def record(name, elapsed_s):
         recorded[name] = recorded.get(name, 0.0) + float(elapsed_s)
+
+    @contextmanager
+    def cuda_span(name):
+        cuda_components.append(name)
+        yield
 
     reference = partitioned_linear_readout(
         branch,
@@ -202,6 +209,7 @@ def test_variable_grid_linear_component_recorder_is_observational():
         bounds=bounds,
         measure_scales=measures,
         record_component=record,
+        cuda_span=cuda_span,
     )
 
     assert torch.equal(observed, reference)
@@ -217,3 +225,10 @@ def test_variable_grid_linear_component_recorder_is_observational():
     }
     assert expected.issubset(recorded)
     assert all(recorded[name] >= 0.0 for name in expected)
+    assert cuda_components == [
+        "vdn_linear_features",
+        "vdn_linear_statistics",
+        "vdn_linear_scans",
+        "vdn_linear_gather",
+        "vdn_linear_output",
+    ]
