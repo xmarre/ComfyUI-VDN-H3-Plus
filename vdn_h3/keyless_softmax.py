@@ -18,11 +18,11 @@ import torch
 
 from comfy.patcher_extension import WrappersMP
 
-from vdn_h3.hybrid import VDNLayout, layout_from_payload, make_layout_wrapper
+from vdn_h3.hybrid import VDNLayout, make_layout_wrapper
 from vdn_h3.keyless_compat import require_keyless_softmax_base
 from vdn_h3.query_positions import bind_query_map, describe_window_geometry
 from vdn_h3.runtime import RuntimeBufferOwner
-from vdn_h3.softmax_provider import KEY_V4, PREPROCESS_KEY, dispatch
+from vdn_h3.softmax_provider import PREPROCESS_KEY, dispatch
 from vdn_h3.window import _sdpa, full_coverage, window_bounds
 
 KEYLESS_PROVIDER_KEY = "minimax_h3_keyless_provider_v1"
