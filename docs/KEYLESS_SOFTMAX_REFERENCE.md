@@ -31,10 +31,16 @@ ordinary Keyless dense fallback.
 The reference path deliberately fails closed for currently unreviewed compositions:
 external/reduced query or value domains, external routing-position domains,
 Keyless masks/log measures, and the old `vdn_attention_preprocess_v1` hook.
+
 Routing-only transforms such as Keyless Untwist belong in
-`minimax_h3_keyless_routing_preprocessors_v1`; applying the native VDN Q/K/V
-preprocessor again would risk transforming retrieval V or double-applying routing
-semantics.
+`minimax_h3_keyless_routing_preprocessors_v1`. Because VDN materializes a
+selected/reordered route for each local window, every active routing preprocessor
+must expose the domain-aware Keyless ABI; legacy full-domain preprocessors are
+rejected before selection. The domain-aware callback receives the composed value
+and routing-position domains after `select_value_rows`, so absolute routing
+semantics can use original packed coordinates without touching retrieval V.
+Applying the native VDN Q/K/V preprocessor again would risk transforming retrieval
+V or double-applying routing semantics.
 
 This is structural/reference infrastructure, not a released Keyless VDN model.
 Production compatibility still requires a separately identified Keyless-native
