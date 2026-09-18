@@ -53,16 +53,29 @@ class _Contract:
 
 
 class _Routing:
-    def __init__(self, recorder, *, block_index=0, rows=None):
+    def __init__(self, recorder, *, block_index=0, rows=None, preprocessors=()):
         self.recorder = recorder
         self.block_index = block_index
         self.rows = rows
+        self.preprocessors = tuple(preprocessors)
 
     def materialize(self, value):
         self.recorder["materialize"].append(
             None if self.rows is None else tuple(self.rows)
         )
-        return value * 0.5
+        route = value * 0.5
+        for preprocessor in self.preprocessors:
+            if self.rows is None:
+                route = preprocessor.fn(route)
+            else:
+                domain = SimpleNamespace(
+                    indices=tuple(self.rows),
+                    start=None,
+                    stop=None,
+                    identity="selected",
+                )
+                route = preprocessor.domain_fn(route, domain, domain)
+        return route
 
     def select_value_rows(self, value, selector, *, log_measure=None, identity=None):
         assert log_measure is None
@@ -74,6 +87,7 @@ class _Routing:
             self.recorder,
             block_index=self.block_index,
             rows=rows,
+            preprocessors=self.preprocessors,
         ), None
 
 
@@ -249,6 +263,80 @@ def test_unreviewed_keyless_compositions_fail_closed(field, value, match):
         _run(provider, q, v, _Routing(recorder), **{field: value})
 
     assert recorder == {"select": [], "materialize": []}
+
+
+def test_selected_window_rejects_legacy_full_domain_keyless_preprocessor():
+    q = torch.randn(8, 2, 4)
+    v = torch.randn(8, 2, 4)
+    provider, _state = _provider(_layout())
+    recorder = {"select": [], "materialize": []}
+    legacy = SimpleNamespace(
+        identity="legacy-full-domain",
+        fn=lambda route: route,
+        domain_fn=None,
+    )
+
+    with pytest.raises(
+        KeylessVDNSoftmaxCompatibilityError,
+        match="domain-aware preprocessors",
+    ):
+        _run(
+            provider,
+            q,
+            v,
+            _Routing(recorder, preprocessors=(legacy,)),
+        )
+
+    assert recorder == {"select": [], "materialize": []}
+
+
+def test_selected_window_passes_composed_domain_to_domain_aware_preprocessor():
+    torch.manual_seed(104)
+    q = torch.randn(8, 2, 4)
+    v = torch.randn(8, 2, 4)
+    layout = _layout()
+    provider, _state = _provider(layout)
+    recorder = {"select": [], "materialize": []}
+    calls = []
+
+    def domain_fn(route, value_domain, routing_position_domain):
+        calls.append(
+            (
+                tuple(value_domain.indices),
+                tuple(routing_position_domain.indices),
+            )
+        )
+        return route * 2.0
+
+    domain_aware = SimpleNamespace(
+        identity="domain-aware",
+        fn=lambda route: route,
+        domain_fn=domain_fn,
+    )
+    got = _run(
+        provider,
+        q,
+        v,
+        _Routing(recorder, preprocessors=(domain_aware,)),
+    )
+    want = window.window_softmax_grouped(
+        q,
+        v,
+        v,
+        layout.video_start,
+        layout.video_end,
+        layout.num_frames,
+        layout.tokens_per_frame,
+        layout.bounds,
+        q.shape[-1] ** -0.5,
+        anchor_frames="none",
+    )
+
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert calls == [
+        ((0, 1, 2, 3), (0, 1, 2, 3)),
+        ((4, 5, 6, 7), (4, 5, 6, 7)),
+    ]
 
 
 def test_legacy_vdn_softmax_provider_is_not_silently_reused_for_keyless():
