@@ -89,6 +89,55 @@ def advertised_keyless_identity(model: Any) -> tuple[Any, ...] | None:
     return (KEYLESS_CONTRACT_KEY, *identity)
 
 
+def require_keyless_softmax_base(model: Any):
+    """Return the canonical Keyless semantic identity and core blocks.
+
+    This authorizes only the Keyless *softmax/window* reference path.  It does not
+    authorize released VDN linear-branch weights or adapters.
+    """
+    identity = advertised_keyless_identity(model)
+    if identity is None:
+        raise VDNBaseCompatibilityError(
+            "VDN Keyless softmax requires h3_keyless_core50_v1; the supplied MODEL "
+            "does not advertise the public Keyless contract."
+        )
+
+    blocks = getattr(model, "blocks", None)
+    try:
+        block_count = len(blocks)
+    except TypeError as exc:
+        raise VDNBaseCompatibilityError("Keyless H3 blocks are not sized") from exc
+    if block_count != 50:
+        raise VDNBaseCompatibilityError(
+            f"Keyless H3 softmax requires exactly 50 core blocks, got {block_count}"
+        )
+
+    for index, block in enumerate(blocks):
+        attention = getattr(block, "attn", None)
+        if attention is None:
+            raise VDNBaseCompatibilityError(f"Keyless block {index} has no attention module")
+        if hasattr(attention, "qkv_proj") or hasattr(attention, "k_norm"):
+            raise VDNBaseCompatibilityError(
+                f"Keyless block {index} exposes native QKV/K compatibility state; "
+                "VDN will not accept a fake or retained K path"
+            )
+        if not hasattr(attention, "qv_proj"):
+            raise VDNBaseCompatibilityError(
+                f"Keyless block {index} is missing attn.qv_proj"
+            )
+        if not hasattr(attention, "q_norm") or not hasattr(attention, "route_norm"):
+            raise VDNBaseCompatibilityError(
+                f"Keyless block {index} is missing q_norm/route_norm"
+            )
+        if int(getattr(attention, "heads", -1)) != 56 or int(
+            getattr(attention, "head_dim", -1)
+        ) != 128:
+            raise VDNBaseCompatibilityError(
+                f"Keyless block {index} has non-canonical head geometry"
+            )
+    return identity, blocks
+
+
 def require_released_qkv_base(model: Any):
     """Return native-QKV blocks or reject before checkpoint loading/patching.
 
@@ -142,5 +191,6 @@ __all__ = [
     "KEYLESS_CONTRACT_KEY",
     "VDNBaseCompatibilityError",
     "advertised_keyless_identity",
+    "require_keyless_softmax_base",
     "require_released_qkv_base",
 ]
