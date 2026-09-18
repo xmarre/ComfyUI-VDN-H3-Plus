@@ -16,6 +16,7 @@ per-frame measure correction as partitioned softmax.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any
 
 from .partitioned_grouped import PartitionedGroupedPlan, build_partitioned_grouped_plan
@@ -29,7 +30,19 @@ from .partitioned_sequence import (
 )
 
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
+FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
+
+
+def _component_recorder(options):
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY) if isinstance(options, dict) else None
+    recorder = getattr(runtime, "record_host_component", None)
+    return recorder if callable(recorder) else None
+
+
+def _record_component(recorder, name, started):
+    if recorder is not None:
+        recorder(name, time.perf_counter() - started)
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +202,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     import comfy.quant_ops
 
     options = transformer_options or {}
+    record_component = _component_recorder(options)
     state = values["state"]
     if getattr(state, "softmax_backend", None) != "grouped":
         raise RuntimeError("partitioned exact-prefix VDN requires the grouped softmax backend")
@@ -295,7 +309,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     # semantics depend on original packed-row coordinates.
     from .softmax_provider import preprocess
 
+    preprocess_started = time.perf_counter()
     q, k, v = preprocess(options, q, k, v, heads)
+    _record_component(record_component, "vdn_preprocess_host_wall_s", preprocess_started)
 
     try:
         from sol_h3.partitioned_request import partitioned_request_attention
@@ -309,14 +325,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     covered_rows = grouped.video_start
 
     if grouped.video_start:
+        gather_started = time.perf_counter()
         global_index = _indices_from_ranges(
             ((0, grouped.video_start),),
             device=device,
             resources=resources,
             identity=(*index_identity, "global"),
         )
+        q_global = q[global_index]
+        _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        softmax_started = time.perf_counter()
         softmax_out[global_index] = partitioned_request_attention(
-            q[global_index],
+            q_global,
             k,
             v,
             transformer_options=options,
@@ -329,9 +349,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             semantic_digest=semantic_digest,
             force_dense=True,
         )
+        _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
+        del q_global
 
     owner = state.query_position_owner_generation
     for group in grouped.groups:
+        gather_started = time.perf_counter()
         q_index = _indices_from_ranges(
             group.q_ranges,
             device=device,
@@ -349,10 +372,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             raise RuntimeError("partitioned VDN runtime gather does not match the CPU geometry plan")
         wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
         measure = plan.prefix_log_key_measure if group.prefix_k_range is not None else 0.0
+        q_group = q[q_index]
+        k_group = k[k_index]
+        v_group = v[k_index]
+        _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        softmax_started = time.perf_counter()
         softmax_out[q_index] = partitioned_request_attention(
-            q[q_index],
-            k[k_index],
-            v[k_index],
+            q_group,
+            k_group,
+            v_group,
             transformer_options=options,
             block_index=block_index,
             kind="local",
@@ -367,17 +395,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             # mapped sparse Sol route.
             force_dense=group.query_prefix_domain,
         )
+        _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
+        del q_group, k_group, v_group
         covered_rows += group.q_rows
 
     if grouped.anchor_slices:
+        gather_started = time.perf_counter()
         anchor_index = _indices_from_ranges(
             grouped.anchor_slices,
             device=device,
             resources=resources,
             identity=(*index_identity, "anchor"),
         )
+        q_anchor = q[anchor_index]
+        _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        softmax_started = time.perf_counter()
         softmax_out[anchor_index] = partitioned_request_attention(
-            q[anchor_index],
+            q_anchor,
             k,
             v,
             transformer_options=options,
@@ -390,12 +424,17 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             semantic_digest=semantic_digest,
             force_dense=True,
         )
+        _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
+        del q_anchor
         covered_rows += int(anchor_index.numel())
 
     if covered_rows != grouped.sequence_rows:
         raise RuntimeError("partitioned VDN grouped queries do not cover the complete hidden sequence")
 
+    weights_started = time.perf_counter()
     weights = state.weights_on(block_index, device, dtype)
+    _record_component(record_component, "vdn_weights_host_wall_s", weights_started)
+    softmax_epilogue_started = time.perf_counter()
     if cfg["enable_softmax_gate"]:
         gate = torch.sigmoid(
             F.linear(
@@ -408,12 +447,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     else:
         flat = softmax_out.reshape(s, -1)
     out = out_proj(flat.type_as(x))
+    _record_component(
+        record_component,
+        "vdn_softmax_epilogue_host_wall_s",
+        softmax_epilogue_started,
+    )
 
     linear_added = False
     if linear_active:
         from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
 
         frame_sizes, measure_scales = partitioned_frame_contract(plan)
+        linear_started = time.perf_counter()
         readout = partitioned_linear_readout(
             base_branch,
             weights,
@@ -428,13 +473,25 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
             skip_ends=(cfg["anchor_frames"] == "both"),
+            record_component=record_component,
+        )
+        _record_component(
+            record_component,
+            "vdn_linear_readout_total_host_wall_s",
+            linear_started,
         )
         expected_shape = (grouped.sequence_rows - grouped.video_start, heads * head_dim)
         if tuple(readout.shape) != expected_shape:
             raise RuntimeError("partitioned VDN linear complement returned incompatible rows")
+        linear_projection_started = time.perf_counter()
         out[grouped.video_start : grouped.sequence_rows] += F.linear(
             readout.type_as(x),
             weights["to_out_linear.weight"],
+        )
+        _record_component(
+            record_component,
+            "vdn_linear_projection_host_wall_s",
+            linear_projection_started,
         )
         linear_added = True
 

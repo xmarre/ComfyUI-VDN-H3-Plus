@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -183,6 +184,7 @@ def _core_readout(
     text_x=None,
     text_k_raw=None,
     text_v_raw=None,
+    record_component=None,
 ):
     offsets = _validate_inputs(
         branch,
@@ -196,6 +198,7 @@ def _core_readout(
     )
     heads = int(branch.num_heads)
     head_dim = int(branch.head_dim)
+    features_started = time.perf_counter()
     query, key, value = _variable_features(
         branch,
         weights,
@@ -205,6 +208,12 @@ def _core_readout(
         frame_sizes,
         offsets,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_features_host_wall_s",
+            time.perf_counter() - features_started,
+        )
+    statistics_started = time.perf_counter()
     beta_rows = torch.sigmoid(F.linear(x_video, weights["beta_proj.weight"]))
     if tuple(beta_rows.shape) != (x_video.shape[0], heads):
         raise RuntimeError("partitioned VDN beta projection has unexpected geometry")
@@ -238,7 +247,13 @@ def _core_readout(
         heads,
         head_dim,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_statistics_host_wall_s",
+            time.perf_counter() - statistics_started,
+        )
 
+    scans_started = time.perf_counter()
     text_state = branch._text_state(weights, text_x, text_k_raw, text_v_raw)
     # vdn_solve does not depend on tokens_per_frame. Use the smallest physical
     # frame size as a stable cache identity while preserving released arithmetic.
@@ -250,11 +265,17 @@ def _core_readout(
         b_raw,
         text_state=text_state,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_scans_host_wall_s",
+            time.perf_counter() - scans_started,
+        )
     gate = torch.sigmoid(
         F.linear(x_video, weights["output_gate.down.weight"])
         @ weights["output_gate.up.weight"].T
         + weights["output_gate.up.bias"]
     )
+    gather_started = time.perf_counter()
     linear_state = B.gather_linear_state(
         prefix_states,
         suffix_states,
@@ -265,9 +286,15 @@ def _core_readout(
         out_dtype=gate.dtype,
         fuse=False,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_gather_host_wall_s",
+            time.perf_counter() - gather_started,
+        )
 
     outputs = []
     eps = weights["norm.weight"].new_tensor(1e-6).item()
+    output_started = time.perf_counter()
     for frame, (start, stop) in enumerate(offsets):
         query_frame = query[start:stop].permute(1, 0, 2)
         readout = torch.matmul(query_frame, linear_state[frame].transpose(-1, -2)).unsqueeze(0)
@@ -280,7 +307,13 @@ def _core_readout(
                 fuse=False,
             )
         )
-    return torch.cat(outputs, dim=0)
+    result = torch.cat(outputs, dim=0)
+    if record_component is not None:
+        record_component(
+            "vdn_linear_output_host_wall_s",
+            time.perf_counter() - output_started,
+        )
+    return result
 
 
 def partitioned_linear_readout(
@@ -298,8 +331,10 @@ def partitioned_linear_readout(
     text_k_raw: torch.Tensor | None = None,
     text_v_raw: torch.Tensor | None = None,
     skip_ends: bool = False,
+    record_component=None,
 ) -> torch.Tensor:
     """Evaluate VDN's learned linear complement over heterogeneous frame grids."""
+    total_started = time.perf_counter()
     local = copy.copy(branch)
     local._backend = None
     local._backend_key = None
@@ -318,7 +353,13 @@ def partitioned_linear_readout(
 
     if skip_ends:
         if len(frame_sizes) <= 2:
-            return x_video.new_zeros((x_video.shape[0], heads * head_dim))
+            result = x_video.new_zeros((x_video.shape[0], heads * head_dim))
+            if record_component is not None:
+                record_component(
+                    "vdn_linear_api_host_wall_s",
+                    time.perf_counter() - total_started,
+                )
+            return result
         first_stop = offsets[0][1]
         last_start = offsets[-1][0]
         inner_bounds = tuple((lo - 1, hi - 1) for lo, hi in bounds[1:-1])
@@ -335,12 +376,18 @@ def partitioned_linear_readout(
             text_x=text_x,
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
+            record_component=record_component,
         )
         out = inner.new_zeros((x_video.shape[0], inner.shape[-1]))
         out[first_stop:last_start] = inner
+        if record_component is not None:
+            record_component(
+                "vdn_linear_api_host_wall_s",
+                time.perf_counter() - total_started,
+            )
         return out
 
-    return _core_readout(
+    result = _core_readout(
         local,
         weights,
         x_video,
@@ -353,7 +400,14 @@ def partitioned_linear_readout(
         text_x=text_x,
         text_k_raw=text_k_raw,
         text_v_raw=text_v_raw,
+        record_component=record_component,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_api_host_wall_s",
+            time.perf_counter() - total_started,
+        )
+    return result
 
 
 def partitioned_frame_contract(plan) -> tuple[tuple[tuple[int, int], ...], tuple[float, ...]]:
