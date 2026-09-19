@@ -95,16 +95,112 @@ def _spatial_conv_frame(tokens: torch.Tensor, weight: torch.Tensor, grid: tuple[
     return F.conv2d(volume, weight, padding=2, groups=channels)
 
 
-def _map_temporal_neighbor(source: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
+def _h3_axis_geometry(grid_h: int, grid_w: int, axis: int) -> tuple[int, float, float]:
+    """Return (length, start, step) for ComfyUI MiniMax-H3 spatial RoPE."""
+    if grid_h <= 0 or grid_w <= 0 or axis not in (0, 1):
+        raise RuntimeError("partitioned VDN physical grid requires positive H/W and axis 0/1")
+    dim = grid_h if axis == 0 else grid_w
+    sqrt_area = math.sqrt(float(grid_h * grid_w))
+    ratio = float(dim) / sqrt_area
+    return dim, (1.0 - ratio) * 16.0, 32.0 / sqrt_area
+
+
+def _h3_axis_coordinates(
+    grid_h: int,
+    grid_w: int,
+    axis: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return ComfyUI MiniMax-H3 spatial RoPE coordinates for one patch-grid axis."""
+    length, start, step = _h3_axis_geometry(grid_h, grid_w, axis)
+    return torch.arange(length, device=device, dtype=torch.float32) * step + start
+
+
+def _physical_resample_grid(
+    source_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build grid_sample coordinates that preserve H3's physical RoPE lattice."""
+    source_h, source_w = map(int, source_hw)
+    target_h, target_w = map(int, target_hw)
+    source_y_len, source_y_start, source_step = _h3_axis_geometry(source_h, source_w, 0)
+    source_x_len, source_x_start, source_step_x = _h3_axis_geometry(source_h, source_w, 1)
+    target_y_len, target_y_start, target_step = _h3_axis_geometry(target_h, target_w, 0)
+    target_x_len, target_x_start, target_step_x = _h3_axis_geometry(target_h, target_w, 1)
+
+    def normalized(
+        target_len: int,
+        target_start: float,
+        target_stride: float,
+        source_len: int,
+        source_start: float,
+        source_stride: float,
+    ) -> torch.Tensor:
+        if source_len == 1:
+            return torch.zeros(target_len, device=device, dtype=torch.float32)
+        target_index = torch.arange(target_len, device=device, dtype=torch.float32)
+        source_index = (target_start + target_index * target_stride - source_start) / source_stride
+        return 2.0 * source_index / float(source_len - 1) - 1.0
+
+    grid_y = normalized(
+        target_y_len,
+        target_y_start,
+        target_step,
+        source_y_len,
+        source_y_start,
+        source_step,
+    )
+    grid_x = normalized(
+        target_x_len,
+        target_x_start,
+        target_step_x,
+        source_x_len,
+        source_x_start,
+        source_step_x,
+    )
+    yy, xx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    return torch.stack((xx, yy), dim=-1).unsqueeze(0)
+
+
+def _map_temporal_neighbor(
+    source: torch.Tensor,
+    target_hw: tuple[int, int],
+    *,
+    grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
+) -> torch.Tensor:
     if tuple(source.shape[-2:]) == tuple(target_hw):
         return source
-    # Interpolate only cross-grid temporal taps. FP32 keeps the coordinate mapping
-    # deterministic across BF16 model execution before returning to branch dtype.
-    return F.interpolate(
+    if source.ndim != 4 or int(source.shape[0]) != 1:
+        raise RuntimeError("partitioned VDN temporal map expects 1xCxHxW features")
+    source_hw = tuple(map(int, source.shape[-2:]))
+    target_hw = tuple(map(int, target_hw))
+    if min(*source_hw, *target_hw) <= 0:
+        raise RuntimeError("partitioned VDN temporal grids must be positive")
+
+    # H3 RoPE does not place different resolutions on PyTorch interpolate's
+    # implicit half-pixel lattice. _frame_grid/_axis_from_sqrt_area use a
+    # distinct area-normalized, endpoint-excluded physical lattice. Mapping
+    # cross-grid temporal taps with F.interpolate(..., align_corners=False)
+    # therefore introduces a systematic spatial phase offset at the boundary.
+    cache_key = (source_hw, target_hw, str(source.device))
+    grid = grid_cache.get(cache_key) if grid_cache is not None else None
+    if grid is None:
+        grid = _physical_resample_grid(source_hw, target_hw, source.device)
+        if grid_cache is not None:
+            grid_cache[cache_key] = grid
+
+    # Only cross-grid taps use this path. FP32 interpolation preserves the
+    # existing precision contract; border padding handles the small endpoint
+    # extent mismatch caused by endpoint-excluded H3 lattices without injecting
+    # zero-valued feature bands.
+    return F.grid_sample(
         source.float(),
-        size=target_hw,
+        grid,
         mode="bilinear",
-        align_corners=False,
+        padding_mode="border",
+        align_corners=True,
     ).to(source.dtype)
 
 
@@ -116,6 +212,7 @@ def _heterogeneous_conv_features(
     offsets: Sequence[tuple[int, int]],
     *,
     l2norm: bool,
+    grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     maps = [
         _spatial_conv_frame(tokens[start:stop], spatial_weight, grid)
@@ -134,7 +231,11 @@ def _heterogeneous_conv_features(
             source_frame = frame + tap - pad
             if source_frame < 0 or source_frame >= len(maps):
                 continue
-            source = _map_temporal_neighbor(maps[source_frame], (target_h, target_w))
+            source = _map_temporal_neighbor(
+                maps[source_frame],
+                (target_h, target_w),
+                grid_cache=grid_cache,
+            )
             part = source * temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
             mixed = part if mixed is None else mixed + part
         if mixed is None:  # pragma: no cover - an odd kernel always includes the current frame
@@ -149,6 +250,7 @@ def _heterogeneous_conv_features(
 
 def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offsets):
     conv = tuple(getattr(branch, "short_conv", ()) or ())
+    grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] = {}
 
     def feature(name: str, raw: torch.Tensor, *, l2norm: bool):
         if name not in conv:
@@ -160,6 +262,7 @@ def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offset
             frame_sizes,
             offsets,
             l2norm=l2norm,
+            grid_cache=grid_cache,
         )
 
     return (
