@@ -3,7 +3,12 @@ from types import SimpleNamespace
 import torch
 
 from vdn_h3.branch import LinearBranch
-from vdn_h3.partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
+from vdn_h3.partitioned_linear import (
+    _h3_axis_coordinates,
+    _map_temporal_neighbor,
+    partitioned_frame_contract,
+    partitioned_linear_readout,
+)
 
 
 def _weights(*, hidden=5, heads=2, head_dim=3, rank=4, seed=91):
@@ -164,3 +169,35 @@ def test_variable_grid_linear_skip_ends_matches_released_anchor_contract_shape()
     assert torch.count_nonzero(result[:first_rows]) == 0
     assert torch.count_nonzero(result[-last_rows:]) == 0
     assert torch.isfinite(result[first_rows:-last_rows]).all()
+
+
+def test_cross_grid_temporal_map_follows_h3_physical_rope_lattice():
+    source_hw = (28, 38)
+    target_hw = (20, 27)
+    y = _h3_axis_coordinates(*source_hw, 0, device=torch.device("cpu"))
+    x = _h3_axis_coordinates(*source_hw, 1, device=torch.device("cpu"))
+    source = (y[:, None] + 0.25 * x[None, :]).unsqueeze(0).unsqueeze(0)
+
+    mapped = _map_temporal_neighbor(source, target_hw)
+
+    target_y = _h3_axis_coordinates(*target_hw, 0, device=torch.device("cpu"))
+    target_x = _h3_axis_coordinates(*target_hw, 1, device=torch.device("cpu"))
+    expected = (target_y[:, None] + 0.25 * target_x[None, :]).unsqueeze(0).unsqueeze(0)
+
+    # The first target row extends slightly beyond the denser source lattice for
+    # this aligned H3 geometry and is deliberately border-clamped. All interior
+    # samples must represent the exact H3 physical coordinates.
+    assert torch.allclose(mapped[..., 1:-1, 1:-1], expected[..., 1:-1, 1:-1], rtol=1e-5, atol=2e-5)
+
+    half_pixel = torch.nn.functional.interpolate(
+        source,
+        size=target_hw,
+        mode="bilinear",
+        align_corners=False,
+    )
+    assert torch.max(torch.abs(half_pixel[..., 1:-1, 1:-1] - expected[..., 1:-1, 1:-1])) > 0.1
+
+
+def test_cross_grid_temporal_map_identity_returns_original_tensor():
+    source = torch.randn(1, 3, 4, 5)
+    assert _map_temporal_neighbor(source, (4, 5)) is source
