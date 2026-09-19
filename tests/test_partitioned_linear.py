@@ -201,3 +201,28 @@ def test_cross_grid_temporal_map_follows_h3_physical_rope_lattice():
 def test_cross_grid_temporal_map_identity_returns_original_tensor():
     source = torch.randn(1, 3, 4, 5)
     assert _map_temporal_neighbor(source, (4, 5)) is source
+
+
+def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
+    from comfy.ldm.minimax.model import _axis_from_sqrt_area
+
+    for grid_h, grid_w in ((20, 27), (28, 38), (2, 3)):
+        latent_h = grid_h * 2
+        latent_w = grid_w * 2
+        sqrt_area = float(latent_h * latent_w) ** 0.5
+        expected_y = _axis_from_sqrt_area(latent_h, 2, sqrt_area).to(torch.float32)
+        expected_x = _axis_from_sqrt_area(latent_w, 2, sqrt_area).to(torch.float32)
+        actual_y = _h3_axis_coordinates(
+            grid_h,
+            grid_w,
+            0,
+            device=torch.device("cpu"),
+        )
+        actual_x = _h3_axis_coordinates(
+            grid_h,
+            grid_w,
+            1,
+            device=torch.device("cpu"),
+        )
+        assert torch.equal(actual_y, expected_y)
+        assert torch.equal(actual_x, expected_x)
