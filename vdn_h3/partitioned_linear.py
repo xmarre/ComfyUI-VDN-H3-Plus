@@ -9,8 +9,8 @@ This module extends only the released ``vdn_solve`` inference path. Per-frame
 statistics and recurrence remain the released VDN arithmetic. Spatial short-conv
 runs on each frame's native grid. The temporal depthwise short-conv uses the same
 kernel and zero-padding as released VDN; only taps crossing a grid boundary are
-mapped to the destination frame's physical grid with center-aligned bilinear
-interpolation in FP32. When all frame grids are identical, no interpolation occurs
+mapped to the destination frame on MiniMax-H3's area-normalized spatial
+coordinate lattice with FP32 bilinear sampling. When all frame grids are identical, no interpolation occurs
 and the helper reduces to the released fixed-grid computation.
 
 Target-prefix frame statistics are weighted by source_rows / target_rows so the
