@@ -275,6 +275,16 @@ def make_vdn_forward(attn, state, block_index):
         branch._backend = None
         branch._backend_key = None
 
+        # The partitioned low/probe path must preserve raw heterogeneous Q/K/V rows
+        # through its in-place RoPE step and may retain that scratch across calls.
+        # This ordinary native path no longer consumes activation_scratch at all:
+        # its learned complement is computed before RoPE below. Drop any retained
+        # partitioned entry before allocating this call's target-grid QKV so stale
+        # low-grid raw copies cannot survive into the high-stage memory peak.
+        resources = state.runtime.current()
+        if resources is not None:
+            resources.release_activation_scratch()
+
         s = x.shape[0]
         external_reduced = _external_reduced_sequence_active(
             transformer_options, layout, s, rope_freqs)
