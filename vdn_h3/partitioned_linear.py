@@ -87,14 +87,86 @@ def _validate_inputs(
     return offsets
 
 
-def _spatial_conv_frame(tokens: torch.Tensor, weight: torch.Tensor, grid: tuple[int, int]) -> torch.Tensor:
+def _physical_short_conv_weight(
+    weight: torch.Tensor,
+    frame_hw: tuple[int, int],
+    canonical_hw: tuple[int, int],
+) -> torch.Tensor:
+    """Resample one depthwise spatial kernel onto a frame's H3 physical lattice.
+
+    The released VDN short-conv is learned on integer grid taps. During a
+    partitioned exact-prefix call the protected prefix and generated suffix use
+    different H3 spatial grid steps. Applying the same 5x5 index-space kernel to
+    both therefore changes its physical receptive field exactly at the temporal
+    boundary. The generated suffix is the canonical low-grid carrier. For a
+    denser prefix frame, scatter each learned tap onto the fractional destination
+    index implied by H3's area-normalized step and bilinearly distribute it to
+    neighboring integer taps. This is exactly equivalent to bilinear sampling of
+    the frame at the learned physical tap locations, but runs as one grouped
+    conv2d.
+
+    Uniform-grid calls return the original tensor object byte-for-byte.
+    """
+    if not torch.is_tensor(weight) or weight.ndim != 4 or int(weight.shape[1]) != 1:
+        raise RuntimeError("partitioned VDN spatial short-conv expects [C,1,K,K] weights")
+    kernel_h, kernel_w = map(int, weight.shape[-2:])
+    if kernel_h != kernel_w or kernel_h <= 0 or kernel_h % 2 == 0:
+        raise RuntimeError("partitioned VDN spatial short-conv requires an odd square kernel")
+    frame_h, frame_w = map(int, frame_hw)
+    canonical_h, canonical_w = map(int, canonical_hw)
+    if min(frame_h, frame_w, canonical_h, canonical_w) <= 0:
+        raise RuntimeError("partitioned VDN spatial short-conv grids must be positive")
+
+    frame_step = 32.0 / math.sqrt(float(frame_h * frame_w))
+    canonical_step = 32.0 / math.sqrt(float(canonical_h * canonical_w))
+    scale = canonical_step / frame_step
+    if abs(scale - 1.0) <= 1.0e-12:
+        return weight
+
+    in_radius = kernel_h // 2
+    out_radius = max(1, int(math.ceil(in_radius * scale - 1.0e-12)))
+    out_size = out_radius * 2 + 1
+    transfer = torch.zeros(
+        (out_size, kernel_h),
+        device=weight.device,
+        dtype=weight.dtype,
+    )
+    for source_index in range(kernel_h):
+        position = (source_index - in_radius) * scale + out_radius
+        lo = int(math.floor(position))
+        hi = min(out_size - 1, lo + 1)
+        fraction = position - lo
+        if 0 <= lo < out_size:
+            transfer[lo, source_index] += 1.0 - fraction
+        if hi != lo and 0 <= hi < out_size:
+            transfer[hi, source_index] += fraction
+
+    raw = weight[:, 0]
+    transformed = torch.matmul(transfer, raw)
+    transformed = torch.matmul(transformed, transfer.transpose(0, 1))
+    return transformed.unsqueeze(1)
+
+
+def _spatial_conv_frame(
+    tokens: torch.Tensor,
+    weight: torch.Tensor,
+    grid: tuple[int, int],
+    *,
+    canonical_hw: tuple[int, int] | None = None,
+) -> torch.Tensor:
     grid_h, grid_w = grid
     rows, heads, head_dim = tokens.shape
     if rows != grid_h * grid_w:
         raise RuntimeError("partitioned VDN spatial short-conv frame rows do not match its grid")
     channels = heads * head_dim
     volume = tokens.reshape(grid_h, grid_w, channels).permute(2, 0, 1).unsqueeze(0)
-    return F.conv2d(volume, weight, padding=2, groups=channels)
+    kernel = (
+        weight
+        if canonical_hw is None
+        else _physical_short_conv_weight(weight, grid, canonical_hw)
+    )
+    padding = int(kernel.shape[-1]) // 2
+    return F.conv2d(volume, kernel, padding=padding, groups=channels)
 
 
 def _h3_axis_geometry(grid_h: int, grid_w: int, axis: int) -> tuple[int, float, float]:
@@ -214,10 +286,16 @@ def _heterogeneous_conv_features(
     offsets: Sequence[tuple[int, int]],
     *,
     l2norm: bool,
+    canonical_hw: tuple[int, int],
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
 ) -> torch.Tensor:
     maps = [
-        _spatial_conv_frame(tokens[start:stop], spatial_weight, grid)
+        _spatial_conv_frame(
+            tokens[start:stop],
+            spatial_weight,
+            grid,
+            canonical_hw=canonical_hw,
+        )
         for (start, stop), grid in zip(offsets, frame_sizes, strict=True)
     ]
     temporal = temporal_weight.squeeze(1)
@@ -250,7 +328,17 @@ def _heterogeneous_conv_features(
     return torch.cat(outputs, dim=0)
 
 
-def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offsets):
+def _variable_features(
+    branch,
+    weights,
+    q_raw,
+    k_raw,
+    v_raw,
+    frame_sizes,
+    offsets,
+    *,
+    canonical_hw,
+):
     conv = tuple(getattr(branch, "short_conv", ()) or ())
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] = {}
 
@@ -264,6 +352,7 @@ def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offset
             frame_sizes,
             offsets,
             l2norm=l2norm,
+            canonical_hw=canonical_hw,
             grid_cache=grid_cache,
         )
 
@@ -285,6 +374,7 @@ def _core_readout(
     bounds,
     measure_scales,
     *,
+    canonical_hw,
     text_x=None,
     text_k_raw=None,
     text_v_raw=None,
@@ -316,6 +406,7 @@ def _core_readout(
             v_raw,
             frame_sizes,
             offsets,
+            canonical_hw=canonical_hw,
         )
     if record_component is not None:
         record_component(
@@ -478,6 +569,9 @@ def partitioned_linear_readout(
     )
     heads = int(local.num_heads)
     head_dim = int(local.head_dim)
+    # By contract the final frames are generated suffix frames on the source
+    # grid. Their physical spacing is the canonical learned short-conv carrier.
+    canonical_hw = tuple(map(int, frame_sizes[-1]))
 
     if skip_ends:
         if len(frame_sizes) <= 2:
@@ -501,6 +595,7 @@ def partitioned_linear_readout(
             tuple(frame_sizes[1:-1]),
             inner_bounds,
             tuple(measure_scales[1:-1]),
+            canonical_hw=canonical_hw,
             text_x=text_x,
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
@@ -526,6 +621,7 @@ def partitioned_linear_readout(
         tuple(frame_sizes),
         tuple(bounds),
         tuple(measure_scales),
+        canonical_hw=canonical_hw,
         text_x=text_x,
         text_k_raw=text_k_raw,
         text_v_raw=text_v_raw,

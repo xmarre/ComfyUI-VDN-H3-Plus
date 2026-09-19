@@ -7,6 +7,8 @@ from vdn_h3.branch import LinearBranch
 from vdn_h3.partitioned_linear import (
     _h3_axis_coordinates,
     _map_temporal_neighbor,
+    _physical_short_conv_weight,
+    _spatial_conv_frame,
     partitioned_frame_contract,
     partitioned_linear_readout,
 )
@@ -297,3 +299,53 @@ def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
         )
         assert torch.allclose(actual_y, expected_y, rtol=0.0, atol=2e-6)
         assert torch.allclose(actual_x, expected_x, rtol=0.0, atol=2e-6)
+
+
+
+def test_physical_short_conv_uniform_grid_is_exact_identity():
+    weight = torch.randn(6, 1, 5, 5)
+    transformed = _physical_short_conv_weight(weight, (20, 27), (20, 27))
+    assert transformed is weight
+
+
+def test_physical_short_conv_prefix_uses_source_grid_receptive_field():
+    frame_hw = (28, 38)
+    canonical_hw = (20, 27)
+    weight = torch.zeros(1, 1, 5, 5, dtype=torch.float32)
+    # One learned tap at physical offset (+1 row, -2 columns) on the source grid.
+    weight[0, 0, 3, 0] = 1.0
+    transformed = _physical_short_conv_weight(weight, frame_hw, canonical_hw)
+    assert transformed.shape[-2:] == (7, 7)
+
+    height, width = frame_hw
+    yy = torch.arange(height, dtype=torch.float32)[:, None]
+    xx = torch.arange(width, dtype=torch.float32)[None, :]
+    field = yy + 0.25 * xx
+    tokens = field.reshape(-1, 1, 1)
+    output = _spatial_conv_frame(
+        tokens,
+        weight,
+        frame_hw,
+        canonical_hw=canonical_hw,
+    )
+
+    scale = (float(frame_hw[0] * frame_hw[1]) / float(canonical_hw[0] * canonical_hw[1])) ** 0.5
+    y, x = 12, 18
+    expected = (y + scale) + 0.25 * (x - 2.0 * scale)
+    assert torch.allclose(output[0, 0, y, x], torch.tensor(expected), rtol=0.0, atol=2e-5)
+
+
+def test_physical_short_conv_source_frame_matches_released_conv2d():
+    grid = (20, 27)
+    channels = 3
+    weight = torch.randn(channels, 1, 5, 5)
+    tokens = torch.randn(grid[0] * grid[1], channels, 1)
+    expected_volume = tokens.reshape(grid[0], grid[1], channels).permute(2, 0, 1).unsqueeze(0)
+    expected = torch.nn.functional.conv2d(
+        expected_volume,
+        weight,
+        padding=2,
+        groups=channels,
+    )
+    actual = _spatial_conv_frame(tokens, weight, grid, canonical_hw=grid)
+    assert torch.equal(actual, expected)
