@@ -92,11 +92,30 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
         expected_q = attn.qkv_proj(x).split(2, dim=-1)[0].clone()
 
     with state.runtime.execution() as resources:
+        # Simulate the retained raw-QKV payload left by the preceding partitioned
+        # low/probe stage. Native high-grid entry must release it before qkv_proj
+        # allocates the new target-grid projection.
+        resources.activation_scratch(
+            video_rows=3,
+            text_rows=1,
+            heads=1,
+            head_dim=2,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        assert resources.retained_counts()["activations"] == 1
+
         def forbidden_activation_scratch(*_args, **_kwargs):
             raise AssertionError(
                 "native VDN forward must not preserve raw Q/K/V in activation scratch"
             )
 
+        qkv_entry_activation_counts = []
+        hook = attn.qkv_proj.register_forward_pre_hook(
+            lambda *_args: qkv_entry_activation_counts.append(
+                resources.retained_counts()["activations"]
+            )
+        )
         monkeypatch.setattr(resources, "activation_scratch", forbidden_activation_scratch)
         token = state._layout.set(layout)
         try:
@@ -104,7 +123,9 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
                 got = make_vdn_forward(attn, state, 0)(x, transformer_options={})
         finally:
             state._layout.reset(token)
+            hook.remove()
 
+        assert qkv_entry_activation_counts == [0]
         assert resources.retained_counts()["activations"] == 0
 
     assert torch.equal(got, expected_q)
