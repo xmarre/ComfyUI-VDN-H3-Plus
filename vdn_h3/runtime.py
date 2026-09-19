@@ -237,6 +237,17 @@ class RuntimeBuffers:
             self._activations.move_to_end(key)
         return hit
 
+    def release_activation_scratch(self):
+        """Drop retained raw-QKV preservation scratch when the caller no longer uses it.
+
+        Partitioned exact-prefix execution still needs activation scratch because its
+        in-place RoPE path must preserve heterogeneous raw video/text rows until the
+        variable-grid linear complement runs. The ordinary native forward computes
+        that complement before RoPE instead, so carrying partitioned scratch into the
+        subsequent target-grid high stage is pure retained VRAM.
+        """
+        self._activations.clear()
+
     def window_plan(self, key, builder):
         if not self.retain:
             return builder()
