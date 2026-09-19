@@ -180,7 +180,7 @@ def _map_temporal_neighbor(
         raise RuntimeError("partitioned VDN temporal grids must be positive")
 
     # H3 RoPE does not place different resolutions on PyTorch interpolate's
-    # implicit half-pixel lattice. _frame_grid/_axis_from_sqrt_area use an
+    # implicit half-pixel lattice. _frame_grid/_axis_from_sqrt_area use a
     # distinct area-normalized, endpoint-excluded physical lattice. Mapping
     # cross-grid temporal taps with F.interpolate(..., align_corners=False)
     # therefore introduces a systematic spatial phase offset at the boundary.
