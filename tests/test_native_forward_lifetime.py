@@ -69,12 +69,22 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
         chunk=1,
         anchor_frames="none",
     )
-    state.weights_on = lambda *_args, **_kwargs: {
-        "to_out_linear.weight": torch.eye(2),
-    }
+    events = []
+
+    def weights_on(*_args, **kwargs):
+        assert kwargs.get("prefetch_next") is False
+        events.append("weights")
+        return {"to_out_linear.weight": torch.eye(2)}
+
+    def softmax(query, *_args, **_kwargs):
+        events.append("softmax")
+        return torch.zeros_like(query)
+
+    state.weights_on = weights_on
+    state.prefetch_next_weights = lambda *_args, **_kwargs: events.append("prefetch")
     monkeypatch.setattr(
         "vdn_h3.retained.window_softmax_grouped_runtime",
-        lambda query, *_args, **_kwargs: torch.zeros_like(query),
+        softmax,
     )
 
     x = torch.randn(4, 2)
@@ -98,3 +108,4 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
         assert resources.retained_counts()["activations"] == 0
 
     assert torch.equal(got, expected_q)
+    assert events == ["weights", "softmax", "prefetch"]
