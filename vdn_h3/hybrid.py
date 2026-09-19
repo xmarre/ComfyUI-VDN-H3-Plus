@@ -91,7 +91,25 @@ class VDNState:
     def _stream_weights(self, index, device, dtype):
         return resolve_branch_weights(self.branches[index].w, device, dtype)
 
-    def weights_on(self, index, device, dtype):
+    def prefetch_next_weights(self, index, device, dtype):
+        if self.managed_weights is not None:
+            return
+
+        resources = self.runtime.current()
+        if (resources is None or not resources.retain
+                or torch.device(device).type != "cuda"):
+            return
+
+        placement = (str(torch.device(device)), dtype)
+        next_index = (index + 1) % len(self.branches)
+        if self.branches[next_index] is not None:
+            next_key = (next_index, *placement)
+            resources.prefetch_request(
+                next_key,
+                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
+            )
+
+    def weights_on(self, index, device, dtype, *, prefetch_next=True):
         if self.managed_weights is not None:
             return self.managed_weights.weights_on(index, device, dtype)
 
@@ -106,13 +124,8 @@ class VDNState:
         if hit is None:
             hit = self._stream_weights(index, device, dtype)
 
-        next_index = (index + 1) % len(self.branches)
-        if self.branches[next_index] is not None:
-            next_key = (next_index, *placement)
-            resources.prefetch_request(
-                next_key,
-                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
-            )
+        if prefetch_next:
+            self.prefetch_next_weights(index, device, dtype)
         return hit
 
 
@@ -300,7 +313,12 @@ def make_vdn_forward(attn, state, block_index):
                 text_k_raw = k_raw[ta:tb]
                 text_v_raw = v[ta:tb]
 
-            weights = state.weights_on(block_index, device, dtype)
+            # Preserve the original branch-weight lookahead timing. Starting the
+            # next-block prefetch here would make streamed checkpoint weights overlap
+            # the current block's high-memory softmax lifetime, undoing part of the
+            # raw-QKV lifetime reduction below.
+            weights = state.weights_on(
+                block_index, device, dtype, prefetch_next=False)
             readout = branch.readout(
                 weights,
                 x[a:b],
@@ -371,6 +389,12 @@ def make_vdn_forward(attn, state, block_index):
                 transformer_options=transformer_options).squeeze(0).reshape(s, heads, head_dim)
 
         del q, k, v, q_raw, k_raw
+
+        if linear_active:
+            # Before this lifetime change weights_on() ran after softmax and launched
+            # one-block lookahead from here. Keep that ordering so asynchronous
+            # streamed weights do not become an additional attention-peak resident.
+            state.prefetch_next_weights(block_index, device, dtype)
 
         if cfg["enable_softmax_gate"]:
             if precomputed_softmax_gate is None:
