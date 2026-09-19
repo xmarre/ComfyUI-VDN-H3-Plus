@@ -163,14 +163,23 @@ class _StreamPrefetcher:
             self._record_stream(tensor, current)
         return weights
 
-    def reset(self):
+    def reset(self, *, wait=False):
         with self._lock:
             self._generation += 1
             future = self._future
             self._future = None
             self._index = None
-        if future is not None:
+        if future is None:
+            return
+        if not wait:
             future.cancel()
+            return
+        try:
+            # A terminal lifecycle release must not leave an orphaned producer-stream
+            # allocation racing the allocator trim that follows it.
+            future.result()
+        except Exception as exc:
+            _log.warning("[vdn] branch prefetch drain failed during runtime release: %s", exc)
 
 
 class RuntimeBuffers:
@@ -383,7 +392,12 @@ class RuntimeBuffers:
             self._prefetcher = _StreamPrefetcher()
         self._prefetcher.request(index, fetch)
 
-    def clear(self):
+    def clear(self, *, wait_prefetch=False):
+        # In a terminal lifecycle release, invalidate and drain the producer before
+        # dropping tensor caches so no late prefetch allocation can repopulate CUDA
+        # pressure after the clear. Ordinary cancellation remains non-blocking.
+        if self._prefetcher is not None:
+            self._prefetcher.reset(wait=wait_prefetch)
         self._scan.clear()
         self._delta.clear()
         self._plans.clear()
@@ -391,8 +405,6 @@ class RuntimeBuffers:
         self._activations.clear()
         self._partition_indices.clear()
         self._partition_index_bytes = 0
-        if self._prefetcher is not None:
-            self._prefetcher.reset()
 
     def retained_counts(self):
         return {
@@ -437,3 +449,12 @@ class RuntimeBufferOwner:
 
     def clear(self):
         self._primary.clear()
+
+    def release_retained(self):
+        """Drain prefetch and drop all retained scratch at a quiescent sample boundary."""
+        if not self.retain:
+            return {}
+        with self._lease:
+            before = self._primary.retained_counts()
+            self._primary.clear(wait_prefetch=True)
+        return before

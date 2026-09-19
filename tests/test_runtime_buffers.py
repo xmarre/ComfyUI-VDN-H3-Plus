@@ -278,3 +278,17 @@ def test_completed_prefetch_is_retained_for_its_target(monkeypatch):
     assert prefetcher._index == "original"
     prefetcher.reset()
     assert prefetcher._future is None
+
+
+def test_release_retained_clears_primary_pool_after_execution():
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        resources.activation_scratch(8, 3, 2, 4, "cpu", torch.float32)
+        resources.kv_scratch(8, 2, 4, "cpu", torch.float32)
+    before = owner.release_retained()
+    assert before["activations"] == 1
+    assert before["kv"] == 1
+    with owner.execution() as resources:
+        counts = resources.retained_counts()
+        assert counts["activations"] == 0
+        assert counts["kv"] == 0

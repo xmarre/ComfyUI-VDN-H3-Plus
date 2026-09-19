@@ -30,6 +30,9 @@ VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 VDN_EXTERNAL_SEQUENCE_API_VERSION = 2
 VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
 
+FLOW_STAGE_KEY = "h3_flow_stage"
+FLOW_PARTITIONED_PROGRESSIVE_KEY = "h3_flow_partitioned_progressive_v1"
+
 
 def _once(key, message):
     if key in _seen:
@@ -446,6 +449,76 @@ def make_vdn_forward(attn, state, block_index):
     return vdn_forward
 
 
+def _cuda_allocator_snapshot():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = torch.device(comfy.model_management.get_torch_device())
+        if device.type != "cuda":
+            return None
+        return {
+            "allocated_mib": torch.cuda.memory_allocated(device) / (1 << 20),
+            "reserved_mib": torch.cuda.memory_reserved(device) / (1 << 20),
+        }
+    except Exception:
+        return None
+
+
+def make_outer_release_wrapper(state):
+    """Release retained VDN scratch once a Flow progressive sample is quiescent.
+
+    Wrapper ordering is deliberately not assumed. If VDN wraps Flow, the persistent
+    progressive contract is visible with no active sub-stage and release happens
+    after the complete Flow OUTER_SAMPLE. If Flow wraps VDN, low/probe sub-samples
+    retain their scratch and only the high sub-sample releases it. A failing
+    progressive sub-sample releases immediately.
+    """
+
+    def wrap(executor, *args, **kwargs):
+        guider = getattr(executor, "class_obj", None)
+        model_options = getattr(guider, "model_options", None)
+        progressive = (
+            isinstance(model_options, dict)
+            and FLOW_PARTITIONED_PROGRESSIVE_KEY in model_options
+        )
+        transformer = (
+            model_options.get("transformer_options")
+            if isinstance(model_options, dict)
+            else None
+        )
+        stage = transformer.get(FLOW_STAGE_KEY) if isinstance(transformer, dict) else None
+        error = None
+        try:
+            return executor(*args, **kwargs)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            release = bool(
+                state.retain_buffers
+                and progressive
+                and (error is not None or stage is None or stage == "high")
+            )
+            if release:
+                before_allocator = _cuda_allocator_snapshot()
+                retained = state.runtime.release_retained()
+                # Dropping references alone leaves cudaMallocAsync's reserved pool high.
+                # At this quiescent OUTER_SAMPLE boundary Comfy's own cache trim is safe
+                # and returns unused blocks before VAE decode.
+                comfy.model_management.soft_empty_cache()
+                after_allocator = _cuda_allocator_snapshot()
+                _log.info(
+                    "[vdn] progressive runtime release stage=%s error=%s retained=%s "
+                    "allocator_before=%s allocator_after=%s",
+                    stage,
+                    type(error).__name__ if error is not None else None,
+                    retained,
+                    before_allocator,
+                    after_allocator,
+                )
+
+    return wrap
+
 def apply_vdn(new_model, state):
     dm = new_model.get_model_object("diffusion_model")
     blocks = getattr(dm, "blocks", None)
@@ -466,3 +539,5 @@ def apply_vdn(new_model, state):
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))
+    new_model.add_wrapper_with_key(
+        WrappersMP.OUTER_SAMPLE, "vdn_h3_runtime_release", make_outer_release_wrapper(state))
