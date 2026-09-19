@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -170,6 +171,76 @@ def test_variable_grid_linear_skip_ends_matches_released_anchor_contract_shape()
     assert torch.count_nonzero(result[-last_rows:]) == 0
     assert torch.isfinite(result[first_rows:-last_rows]).all()
 
+
+def test_variable_grid_linear_component_recorder_is_observational():
+    weights = _weights(seed=211)
+    branch = _branch(weights)
+    frame_sizes = ((2, 2), (2, 2), (1, 2), (1, 2))
+    measures = (0.5, 0.5, 1.0, 1.0)
+    bounds = ((0, 1), (0, 2), (1, 3), (2, 3))
+    rows = sum(height * width for height, width in frame_sizes)
+    x, q, k, v = _inputs(rows, seed=47)
+    originals = tuple(t.clone() for t in (x, q, k, v))
+    recorded = {}
+    cuda_components = []
+
+    def record(name, elapsed_s):
+        recorded[name] = recorded.get(name, 0.0) + float(elapsed_s)
+
+    @contextmanager
+    def cuda_span(name):
+        cuda_components.append(name)
+        yield
+
+    reference = partitioned_linear_readout(
+        branch,
+        weights,
+        x,
+        q,
+        k,
+        v,
+        frame_sizes=frame_sizes,
+        bounds=bounds,
+        measure_scales=measures,
+    )
+    observed = partitioned_linear_readout(
+        branch,
+        weights,
+        x,
+        q,
+        k,
+        v,
+        frame_sizes=frame_sizes,
+        bounds=bounds,
+        measure_scales=measures,
+        record_component=record,
+        cuda_span=cuda_span,
+    )
+
+    assert torch.equal(observed, reference)
+    for before, after in zip(originals, (x, q, k, v), strict=True):
+        assert torch.equal(before, after)
+    expected = {
+        "vdn_linear_features_host_wall_s",
+        "vdn_linear_statistics_host_wall_s",
+        "vdn_linear_scans_host_wall_s",
+        "vdn_linear_gate_host_wall_s",
+        "vdn_linear_gather_host_wall_s",
+        "vdn_linear_epsilon_scalar_host_wall_s",
+        "vdn_linear_output_host_wall_s",
+        "vdn_linear_api_host_wall_s",
+    }
+    assert expected.issubset(recorded)
+    assert all(recorded[name] >= 0.0 for name in expected)
+    assert cuda_components == [
+        "vdn_linear_features",
+        "vdn_linear_statistics",
+        "vdn_linear_scans",
+        "vdn_linear_gate",
+        "vdn_linear_gather",
+        "vdn_linear_epsilon_scalar",
+        "vdn_linear_output",
+    ]
 
 def test_cross_grid_temporal_map_follows_h3_physical_rope_lattice():
     source_hw = (28, 38)
