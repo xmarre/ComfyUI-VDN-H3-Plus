@@ -40,6 +40,8 @@ _MAX_DELTA_SCRATCH = 1
 _MAX_WINDOW_PLANS = 8
 _MAX_KV_SCRATCH = 1
 _MAX_ACTIVATION_SCRATCH = 1
+_MAX_PARTITION_INDEX_ENTRIES = 64
+_MAX_PARTITION_INDEX_BYTES = 4 * 1024 * 1024
 _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=None)
 # One worker is enough for one-block lookahead. It never stores branch weights itself;
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
@@ -167,6 +169,8 @@ class RuntimeBuffers:
         self._plans = collections.OrderedDict()
         self._kv = collections.OrderedDict()
         self._activations = collections.OrderedDict()
+        self._partition_indices = collections.OrderedDict()
+        self._partition_index_bytes = 0
         self._prefetcher = None
 
     def delta_scratch(self, shape, device):
@@ -227,6 +231,88 @@ class RuntimeBuffers:
             self._plans.move_to_end(key)
         return hit
 
+    def partition_indices(self, identity, ranges, device):
+        """Return one bounded execution-owned gather index with stream-safe reuse.
+
+        Partitioned exact-prefix VDN uses the same temporal gather geometry in
+        every transformer block. Rebuilding ``arange``/``cat`` tensors for each
+        block creates avoidable warm allocations. Unlike a process-global cache,
+        this cache lives in the leased RuntimeBuffers instance and therefore has
+        the same ownership/cancellation semantics as the other retained scratch.
+        Transient pools cache only for their current execution and are cleared on
+        scope exit.
+        """
+        device = torch.device(device)
+        normalized = []
+        previous_end = -1
+        for item in tuple(ranges):
+            if (
+                not isinstance(item, (tuple, list))
+                or len(item) != 2
+                or type(item[0]) is not int
+                or type(item[1]) is not int
+            ):
+                raise RuntimeError("partitioned VDN gather ranges must be integer pairs")
+            start, end = item
+            if start < 0 or end <= start or start < previous_end:
+                raise RuntimeError("partitioned VDN gather ranges must be positive, ordered, and disjoint")
+            normalized.append((start, end))
+            previous_end = end
+        normalized = tuple(normalized)
+        if not normalized:
+            raise RuntimeError("partitioned VDN gather index cannot be empty")
+
+        key = (identity, normalized, str(device))
+        hit = self._partition_indices.get(key)
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                current = torch.cuda.current_stream(device)
+                if hit is not None:
+                    self._partition_indices.move_to_end(key)
+                    tensor, event, _size = hit
+                    if event is None:
+                        raise RuntimeError("partitioned VDN CUDA gather cache entry is missing its stream event")
+                    current.wait_event(event)
+                    tensor.record_stream(current)
+                    return tensor
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("partitioned VDN cannot allocate gather indices during CUDA graph capture")
+                total = sum(end - start for start, end in normalized)
+                tensor = torch.empty(total, dtype=torch.long, device=device)
+                cursor = 0
+                for start, end in normalized:
+                    span = end - start
+                    tensor[cursor : cursor + span].copy_(
+                        torch.arange(start, end, dtype=torch.long, device=device)
+                    )
+                    cursor += span
+                event = torch.cuda.Event()
+                event.record(current)
+                tensor.record_stream(current)
+        else:
+            if hit is not None:
+                self._partition_indices.move_to_end(key)
+                tensor, event, _size = hit
+                if event is not None:
+                    raise RuntimeError("partitioned VDN CPU gather cache entry has a CUDA event")
+                return tensor
+            tensor = torch.cat(
+                [torch.arange(start, end, dtype=torch.long, device=device) for start, end in normalized]
+            )
+            event = None
+
+        size = tensor.numel() * tensor.element_size()
+        self._partition_indices[key] = (tensor, event, size)
+        self._partition_indices.move_to_end(key)
+        self._partition_index_bytes += size
+        while (
+            len(self._partition_indices) > _MAX_PARTITION_INDEX_ENTRIES
+            or self._partition_index_bytes > _MAX_PARTITION_INDEX_BYTES
+        ):
+            _, (_tensor, _event, evicted_size) = self._partition_indices.popitem(last=False)
+            self._partition_index_bytes -= evicted_size
+        return tensor
+
     def kv_scratch(self, rows, heads, head_dim, device, dtype):
         shape = (rows, heads, head_dim)
         if not self.retain:
@@ -267,6 +353,8 @@ class RuntimeBuffers:
         self._plans.clear()
         self._kv.clear()
         self._activations.clear()
+        self._partition_indices.clear()
+        self._partition_index_bytes = 0
         if self._prefetcher is not None:
             self._prefetcher.reset()
 
@@ -277,6 +365,8 @@ class RuntimeBuffers:
             "plans": len(self._plans),
             "kv": len(self._kv),
             "activations": len(self._activations),
+            "partition_indices": len(self._partition_indices),
+            "partition_index_bytes": self._partition_index_bytes,
         }
 
 
