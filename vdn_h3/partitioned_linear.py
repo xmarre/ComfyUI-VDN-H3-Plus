@@ -95,16 +95,75 @@ def _spatial_conv_frame(tokens: torch.Tensor, weight: torch.Tensor, grid: tuple[
     return F.conv2d(volume, weight, padding=2, groups=channels)
 
 
+def _h3_axis_coordinates(
+    grid_h: int,
+    grid_w: int,
+    axis: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return ComfyUI MiniMax-H3 spatial RoPE coordinates for one patch-grid axis."""
+    if grid_h <= 0 or grid_w <= 0 or axis not in (0, 1):
+        raise RuntimeError("partitioned VDN physical grid requires positive H/W and axis 0/1")
+    dim = grid_h if axis == 0 else grid_w
+    sqrt_area = math.sqrt(float(grid_h * grid_w))
+    ratio = float(dim) / sqrt_area
+    return (
+        torch.arange(dim, device=device, dtype=torch.float32) * (ratio / float(dim))
+        + (1.0 - ratio) / 2.0
+    ) * 32.0
+
+
+def _axis_to_grid_sample(
+    destination: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Map physical destination coordinates to align_corners=True source indices."""
+    source_len = int(source.numel())
+    if source_len == 1:
+        return torch.zeros_like(destination)
+    step = source[1] - source[0]
+    if not bool(torch.isfinite(step).item()) or float(step.item()) <= 0.0:
+        raise RuntimeError("partitioned VDN physical source grid is not strictly increasing")
+    index = (destination - source[0]) / step
+    return 2.0 * index / float(source_len - 1) - 1.0
+
+
 def _map_temporal_neighbor(source: torch.Tensor, target_hw: tuple[int, int]) -> torch.Tensor:
     if tuple(source.shape[-2:]) == tuple(target_hw):
         return source
-    # Interpolate only cross-grid temporal taps. FP32 keeps the coordinate mapping
-    # deterministic across BF16 model execution before returning to branch dtype.
-    return F.interpolate(
+    if source.ndim != 4 or int(source.shape[0]) != 1:
+        raise RuntimeError("partitioned VDN temporal map expects 1xCxHxW features")
+    source_h, source_w = map(int, source.shape[-2:])
+    target_h, target_w = map(int, target_hw)
+    if target_h <= 0 or target_w <= 0:
+        raise RuntimeError("partitioned VDN temporal target grid must be positive")
+
+    # H3 RoPE does not place different resolutions on PyTorch interpolate's
+    # implicit half-pixel lattice. _frame_grid/_axis_from_sqrt_area use an
+    # explicit area-normalized, endpoint-excluded physical lattice. Mapping a
+    # target-prefix temporal tap with F.interpolate(..., align_corners=False)
+    # therefore introduces a systematic half-cell phase offset at a grid
+    # boundary. Resample at the exact H3 physical coordinates instead.
+    source_y = _h3_axis_coordinates(source_h, source_w, 0, device=source.device)
+    source_x = _h3_axis_coordinates(source_h, source_w, 1, device=source.device)
+    target_y = _h3_axis_coordinates(target_h, target_w, 0, device=source.device)
+    target_x = _h3_axis_coordinates(target_h, target_w, 1, device=source.device)
+    grid_y = _axis_to_grid_sample(target_y, source_y)
+    grid_x = _axis_to_grid_sample(target_x, source_x)
+    yy, xx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+    grid = torch.stack((xx, yy), dim=-1).unsqueeze(0)
+
+    # Only cross-grid taps use this path. FP32 interpolation preserves the
+    # existing precision contract; border padding handles the small endpoint
+    # extent mismatch caused by endpoint-excluded H3 lattices without injecting
+    # zero-valued feature bands.
+    return F.grid_sample(
         source.float(),
-        size=target_hw,
+        grid,
         mode="bilinear",
-        align_corners=False,
+        padding_mode="border",
+        align_corners=True,
     ).to(source.dtype)
 
 
