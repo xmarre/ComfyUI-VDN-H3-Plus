@@ -469,9 +469,11 @@ def make_outer_release_wrapper(state):
 
     Wrapper ordering is deliberately not assumed. If VDN wraps Flow, the persistent
     progressive contract is visible with no active sub-stage and release happens
-    after the complete Flow OUTER_SAMPLE. If Flow wraps VDN, low/probe sub-samples
-    retain their scratch and only the high sub-sample releases it. A failing
-    progressive sub-sample releases immediately.
+    after the complete Flow OUTER_SAMPLE. If Flow wraps VDN, low-stage scratch is
+    retained through the exact probe, then released after probe before the native
+    target-grid high stage allocates its QKV/live attention state. High releases
+    again at the terminal boundary. A failing progressive sub-sample releases
+    immediately.
     """
 
     def wrap(executor, *args, **kwargs):
@@ -497,9 +499,21 @@ def make_outer_release_wrapper(state):
             release = bool(
                 state.retain_buffers
                 and progressive
-                and (error is not None or stage is None or stage == "high")
+                and (
+                    error is not None
+                    or stage is None
+                    or stage in ("probe", "high")
+                )
             )
             if release:
+                if error is not None:
+                    reason = "error"
+                elif stage == "probe":
+                    reason = "probe_to_high"
+                elif stage == "high":
+                    reason = "terminal_high"
+                else:
+                    reason = "outer_complete"
                 before_allocator = _cuda_allocator_snapshot()
                 retained = state.runtime.release_retained()
                 # Dropping references alone leaves cudaMallocAsync's reserved pool high.
@@ -508,9 +522,10 @@ def make_outer_release_wrapper(state):
                 comfy.model_management.soft_empty_cache()
                 after_allocator = _cuda_allocator_snapshot()
                 _log.info(
-                    "[vdn] progressive runtime release stage=%s error=%s retained=%s "
-                    "allocator_before=%s allocator_after=%s",
+                    "[vdn] progressive runtime release stage=%s reason=%s error=%s "
+                    "retained=%s allocator_before=%s allocator_after=%s",
                     stage,
+                    reason,
                     type(error).__name__ if error is not None else None,
                     retained,
                     before_allocator,
