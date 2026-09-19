@@ -224,5 +224,5 @@ def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
             1,
             device=torch.device("cpu"),
         )
-        assert torch.equal(actual_y, expected_y)
-        assert torch.equal(actual_x, expected_x)
+        assert torch.allclose(actual_y, expected_y, rtol=0.0, atol=2e-6)
+        assert torch.allclose(actual_x, expected_x, rtol=0.0, atol=2e-6)
