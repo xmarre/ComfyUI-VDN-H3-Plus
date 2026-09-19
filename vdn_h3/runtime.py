@@ -63,6 +63,20 @@ def _bounded_put(mapping, key, value, limit):
     return value
 
 
+def _pre_evict_single_replacement(mapping, key):
+    """Drop an incompatible single-entry cache before allocating its replacement.
+
+    Tensor-heavy retained scratch caches intentionally keep at most one geometry.
+    Evicting through _bounded_put() only after the new tensor exists creates a
+    transient old+new VRAM peak at geometry transitions (for example progressive
+    low-grid -> high-grid handoff). Dropping the cache's reference first allows
+    the allocator to recycle the old storage before the larger allocation while
+    preserving any independent live references held by an active caller.
+    """
+    if key not in mapping and mapping:
+        mapping.clear()
+
+
 class _StreamPrefetcher:
     """One cancellable in-flight block transfer; no per-state worker/thread leak."""
 
@@ -179,6 +193,7 @@ class RuntimeBuffers:
         key = (tuple(shape), str(device))
         hit = self._delta.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._delta, key)
             hit = torch.empty(shape, dtype=torch.float32, device=device)
             _bounded_put(self._delta, key, hit, _MAX_DELTA_SCRATCH)
         else:
@@ -193,6 +208,7 @@ class RuntimeBuffers:
         key = (num_frames, tuple(state_shape), str(device), dtype)
         hit = self._scan.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._scan, key)
             prefix = torch.empty(shape, dtype=dtype, device=device)
             hit = (prefix, torch.empty_like(prefix))
             _bounded_put(self._scan, key, hit, _MAX_SCAN_BANKS)
@@ -206,6 +222,7 @@ class RuntimeBuffers:
         key = (video_rows, text_rows, heads, head_dim, str(device), dtype)
         hit = self._activations.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._activations, key)
             vshape = (video_rows, heads, head_dim)
             tshape = (text_rows, heads, head_dim)
             hit = {
@@ -324,6 +341,14 @@ class RuntimeBuffers:
         pair = self._kv.get(key)
         need = rows * heads * head_dim
         if pair is None or pair[0].numel() < need:
+            if pair is not None:
+                # This key owns the only retained K/V pair. Remove its cache
+                # reference before requesting a larger pair so allocator pressure
+                # does not include both capacities at the replacement boundary.
+                self._kv.pop(key, None)
+                pair = None
+            else:
+                _pre_evict_single_replacement(self._kv, key)
             pair = (
                 torch.empty(need, device=device, dtype=dtype),
                 torch.empty(need, device=device, dtype=dtype),
