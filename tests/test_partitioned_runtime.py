@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
+from vdn_h3.partitioned_grouped import build_partitioned_grouped_plan
 from vdn_h3.partitioned_runtime import (
+    FLOW_PARTITIONED_STAGE_KEY,
     VDN_EXTERNAL_SEQUENCE_KEY,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
@@ -14,8 +16,10 @@ from vdn_h3.partitioned_runtime import (
     _partitioned_query_summary,
     _record_partitioned_cross_grid_temporal_suppression,
     _record_partitioned_linear_bypass,
+    _record_partitioned_prefix_measure_route,
     _record_partitioned_raw_token_measure,
     _resolve_partitioned_linear_runtime,
+    _resolve_partitioned_prefix_measure,
     _wrap_vdn_forward,
 )
 from vdn_h3.partitioned_sequence import (
@@ -260,3 +264,68 @@ def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
     assert tuple(wrapped._vdn_partitioned_linear_diagnostic_modes) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL in wrapped._vdn_partitioned_linear_diagnostic_modes
     assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE in wrapped._vdn_partitioned_linear_diagnostic_modes
+
+
+def test_raw_token_measure_resolves_global_local_and_anchor_routes_consistently():
+    plan, _options, _layout, _values = _fixture()
+    grouped = build_partitioned_grouped_plan(
+        plan,
+        bounds=((0, 1), (0, 2), (1, 3), (2, 4), (3, 4)),
+        anchor_frames="both",
+        semantic_digest=plan.canonical_contract()["semantic_digest"],
+    )
+    assert grouped.anchor_slices
+    resolved = 0.0
+
+    requested, applied = _resolve_partitioned_prefix_measure(
+        plan, resolved, has_prefix=grouped.full_prefix_k_range is not None
+    )
+    assert requested == float(plan.prefix_log_key_measure)
+    assert applied == 0.0
+
+    local_with_prefix = next(group for group in grouped.groups if group.prefix_k_range is not None)
+    requested, applied = _resolve_partitioned_prefix_measure(
+        plan, resolved, has_prefix=local_with_prefix.prefix_k_range is not None
+    )
+    assert requested == float(plan.prefix_log_key_measure)
+    assert applied == 0.0
+
+    requested, applied = _resolve_partitioned_prefix_measure(
+        plan, resolved, has_prefix=grouped.full_prefix_k_range is not None
+    )
+    assert requested == float(plan.prefix_log_key_measure)
+    assert applied == 0.0
+
+
+def test_prefix_measure_route_receipts_report_requested_and_applied_values():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+            self.events = []
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+        def event(self, kind, **fields):
+            self.events.append((kind, fields))
+
+    metrics = Metrics()
+    options = {FLOW_PARTITIONED_STAGE_KEY: SimpleNamespace(metrics=metrics)}
+    for route in ("global", "local", "anchor"):
+        _record_partitioned_prefix_measure_route(
+            options,
+            route=route,
+            requested=-0.678,
+            applied=0.0,
+        )
+    assert metrics.values["partitioned_vdn_prefix_measure_global_calls"] == 1
+    assert metrics.values["partitioned_vdn_prefix_measure_local_calls"] == 1
+    assert metrics.values["partitioned_vdn_prefix_measure_anchor_calls"] == 1
+    assert metrics.values["partitioned_vdn_prefix_measure_global_adjustments"] == 1
+    assert [fields["route"] for kind, fields in metrics.events if kind == "partitioned_vdn_prefix_measure_route"] == [
+        "global",
+        "local",
+        "anchor",
+    ]
+    assert all(fields["requested"] == -0.678 for _, fields in metrics.events)
+    assert all(fields["applied"] == 0.0 for _, fields in metrics.events)
