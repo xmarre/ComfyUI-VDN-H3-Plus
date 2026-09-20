@@ -104,6 +104,41 @@ def _record_partitioned_raw_token_measure(options: dict[str, Any], plan) -> None
             increment("partitioned_vdn_raw_token_measure_prefix_frames", int(plan.prefix_t))
 
 
+def _resolve_partitioned_prefix_measure(plan, resolved_measure: float, *, has_prefix: bool) -> tuple[float, float]:
+    requested = float(plan.prefix_log_key_measure) if has_prefix else 0.0
+    applied = float(resolved_measure) if has_prefix else 0.0
+    return requested, applied
+
+
+def _record_partitioned_prefix_measure_route(
+    options: dict[str, Any],
+    *,
+    route: str,
+    requested: float,
+    applied: float,
+) -> None:
+    if route not in {"global", "local", "anchor"}:
+        raise RuntimeError(f"unsupported partitioned prefix-measure route {route!r}")
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    if metrics is None:
+        return
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment(f"partitioned_vdn_prefix_measure_{route}_calls")
+        if not math.isclose(float(requested), float(applied), rel_tol=0.0, abs_tol=0.0):
+            increment(f"partitioned_vdn_prefix_measure_{route}_adjustments")
+    event = getattr(metrics, "event", None)
+    if callable(event):
+        event(
+            "partitioned_vdn_prefix_measure_route",
+            route=route,
+            requested=float(requested),
+            applied=float(applied),
+            adjusted=not math.isclose(float(requested), float(applied), rel_tol=0.0, abs_tol=0.0),
+        )
+
+
 def _record_partitioned_cross_grid_temporal_suppression(
     options: dict[str, Any],
     stats: dict[str, int],
@@ -447,6 +482,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     covered_rows = grouped.video_start
 
     if grouped.video_start:
+        global_requested_measure, global_applied_measure = _resolve_partitioned_prefix_measure(
+            plan,
+            prefix_log_key_measure,
+            has_prefix=grouped.full_prefix_k_range is not None,
+        )
+        if raw_token_measure:
+            _record_partitioned_prefix_measure_route(
+                options,
+                route="global",
+                requested=global_requested_measure,
+                applied=global_applied_measure,
+            )
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
             global_index = _indices_from_ranges(
@@ -469,7 +516,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 scale=scale,
                 sink_rows=0,
                 prefix_k_range=grouped.full_prefix_k_range,
-                prefix_log_key_measure=prefix_log_key_measure,
+                prefix_log_key_measure=global_applied_measure,
                 semantic_digest=semantic_digest,
                 force_dense=True,
             )
@@ -498,7 +545,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
-            measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
+            requested_measure, measure = _resolve_partitioned_prefix_measure(
+                plan,
+                prefix_log_key_measure,
+                has_prefix=group.prefix_k_range is not None,
+            )
+            if raw_token_measure:
+                _record_partitioned_prefix_measure_route(
+                    options,
+                    route="local",
+                    requested=requested_measure,
+                    applied=measure,
+                )
             q_group = q[q_index]
             k_group = k[k_index]
             v_group = v[k_index]
@@ -528,6 +586,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         covered_rows += group.q_rows
 
     if grouped.anchor_slices:
+        anchor_requested_measure, anchor_applied_measure = _resolve_partitioned_prefix_measure(
+            plan,
+            prefix_log_key_measure,
+            has_prefix=grouped.full_prefix_k_range is not None,
+        )
+        if raw_token_measure:
+            _record_partitioned_prefix_measure_route(
+                options,
+                route="anchor",
+                requested=anchor_requested_measure,
+                applied=anchor_applied_measure,
+            )
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
             anchor_index = _indices_from_ranges(
@@ -550,7 +620,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 scale=scale,
                 sink_rows=0,
                 prefix_k_range=grouped.full_prefix_k_range,
-                prefix_log_key_measure=plan.prefix_log_key_measure,
+                prefix_log_key_measure=anchor_applied_measure,
                 semantic_digest=semantic_digest,
                 force_dense=True,
             )
