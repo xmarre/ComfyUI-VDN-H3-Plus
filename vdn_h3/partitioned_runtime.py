@@ -37,6 +37,12 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY = "h3_flow_partitioned_vdn_linear_diagnost
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS = "bypass_partitioned_linear"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL = "suppress_cross_grid_temporal_taps"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+)
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
 
@@ -56,14 +62,10 @@ def _partitioned_linear_diagnostic_mode(options: dict[str, Any]) -> str:
         VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
         VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
     )
-    if raw not in {
-        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
-        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
-    }:
+    if raw not in VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS:
         raise RuntimeError(
-            "partitioned VDN linear diagnostic mode must be "
-            f"{VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL!r} or "
-            f"{VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS!r}, got {raw!r}"
+            "partitioned VDN linear diagnostic mode must be one of "
+            f"{VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS!r}, got {raw!r}"
         )
     return str(raw)
 
@@ -87,6 +89,27 @@ def _record_partitioned_linear_bypass(options: dict[str, Any], video_rows: int) 
         return
     increment("partitioned_vdn_linear_bypass_calls")
     increment("partitioned_vdn_linear_bypass_video_rows", int(video_rows))
+
+
+def _record_partitioned_cross_grid_temporal_suppression(
+    options: dict[str, Any],
+    stats: dict[str, int],
+) -> None:
+    suppressed_taps = int(stats.get("suppressed_taps", 0))
+    suppressed_rows = int(stats.get("suppressed_rows", 0))
+    if suppressed_taps <= 0 or suppressed_rows <= 0:
+        raise RuntimeError(
+            "partitioned VDN cross-grid temporal diagnostic was requested but no "
+            "cross-grid short-conv taps were suppressed"
+        )
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if not callable(increment):
+        return
+    increment("partitioned_vdn_cross_grid_temporal_suppression_calls")
+    increment("partitioned_vdn_cross_grid_temporal_suppressed_taps", suppressed_taps)
+    increment("partitioned_vdn_cross_grid_temporal_suppressed_rows", suppressed_rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,9 +565,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     )
 
     linear_added = False
+    cross_grid_temporal_suppressed = False
+    cross_grid_temporal_stats: dict[str, int] | None = None
     if linear_active:
         from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
 
+        suppress_cross_grid_temporal = (
+            linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL
+        )
+        cross_grid_temporal_stats = {} if suppress_cross_grid_temporal else None
         frame_sizes, measure_scales = partitioned_frame_contract(plan)
         linear_started = time.perf_counter()
         readout = partitioned_linear_readout(
@@ -561,9 +590,17 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
             skip_ends=(cfg["anchor_frames"] == "both"),
+            suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal,
+            diagnostic_stats=cross_grid_temporal_stats,
             record_component=record_component,
             cuda_span=cuda_span,
         )
+        if cross_grid_temporal_stats is not None:
+            _record_partitioned_cross_grid_temporal_suppression(
+                options,
+                cross_grid_temporal_stats,
+            )
+            cross_grid_temporal_suppressed = True
         _record_component(
             record_component,
             "vdn_linear_readout_total_host_wall_s",
@@ -597,6 +634,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             ),
             "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
             f"diagnostic-bypassed; diagnostic_mode={linear_diagnostic_mode}",
+        )
+    elif cross_grid_temporal_suppressed:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                "diagnostic-cross-grid-temporal-suppressed",
+            ),
+            "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+            "active with cross-grid temporal short-conv taps diagnostic-suppressed; "
+            f"diagnostic_mode={linear_diagnostic_mode}",
         )
     else:
         # Preserve the existing normal-path logging identity and wording exactly.
@@ -647,6 +696,7 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
+    partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
@@ -676,6 +726,8 @@ __all__ = [
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
 ]

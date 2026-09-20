@@ -215,6 +215,8 @@ def _heterogeneous_conv_features(
     *,
     l2norm: bool,
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
+    suppress_cross_grid_temporal_taps: bool = False,
+    diagnostic_stats: dict[str, int] | None = None,
 ) -> torch.Tensor:
     maps = [
         _spatial_conv_frame(tokens[start:stop], spatial_weight, grid)
@@ -233,6 +235,16 @@ def _heterogeneous_conv_features(
             source_frame = frame + tap - pad
             if source_frame < 0 or source_frame >= len(maps):
                 continue
+            if (
+                suppress_cross_grid_temporal_taps
+                and tuple(frame_sizes[source_frame]) != tuple(grid)
+            ):
+                if diagnostic_stats is not None:
+                    diagnostic_stats["suppressed_taps"] = diagnostic_stats.get("suppressed_taps", 0) + 1
+                    diagnostic_stats["suppressed_rows"] = (
+                        diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
+                    )
+                continue
             source = _map_temporal_neighbor(
                 maps[source_frame],
                 (target_h, target_w),
@@ -250,7 +262,18 @@ def _heterogeneous_conv_features(
     return torch.cat(outputs, dim=0)
 
 
-def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offsets):
+def _variable_features(
+    branch,
+    weights,
+    q_raw,
+    k_raw,
+    v_raw,
+    frame_sizes,
+    offsets,
+    *,
+    suppress_cross_grid_temporal_taps: bool = False,
+    diagnostic_stats: dict[str, int] | None = None,
+):
     conv = tuple(getattr(branch, "short_conv", ()) or ())
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] = {}
 
@@ -265,6 +288,8 @@ def _variable_features(branch, weights, q_raw, k_raw, v_raw, frame_sizes, offset
             offsets,
             l2norm=l2norm,
             grid_cache=grid_cache,
+            suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
+            diagnostic_stats=diagnostic_stats,
         )
 
     return (
@@ -288,6 +313,8 @@ def _core_readout(
     text_x=None,
     text_k_raw=None,
     text_v_raw=None,
+    suppress_cross_grid_temporal_taps: bool = False,
+    diagnostic_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
 ):
@@ -316,6 +343,8 @@ def _core_readout(
             v_raw,
             frame_sizes,
             offsets,
+            suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
+            diagnostic_stats=diagnostic_stats,
         )
     if record_component is not None:
         record_component(
@@ -458,6 +487,8 @@ def partitioned_linear_readout(
     text_k_raw: torch.Tensor | None = None,
     text_v_raw: torch.Tensor | None = None,
     skip_ends: bool = False,
+    suppress_cross_grid_temporal_taps: bool = False,
+    diagnostic_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
 ) -> torch.Tensor:
@@ -504,6 +535,8 @@ def partitioned_linear_readout(
             text_x=text_x,
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
+            suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
+            diagnostic_stats=diagnostic_stats,
             record_component=record_component,
             cuda_span=cuda_span,
         )
@@ -529,6 +562,8 @@ def partitioned_linear_readout(
         text_x=text_x,
         text_k_raw=text_k_raw,
         text_v_raw=text_v_raw,
+        suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
+        diagnostic_stats=diagnostic_stats,
         record_component=record_component,
         cuda_span=cuda_span,
     )

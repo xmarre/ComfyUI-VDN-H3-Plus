@@ -6,6 +6,7 @@ import torch
 from vdn_h3.branch import LinearBranch
 from vdn_h3.partitioned_linear import (
     _h3_axis_coordinates,
+    _heterogeneous_conv_features,
     _map_temporal_neighbor,
     partitioned_frame_contract,
     partitioned_linear_readout,
@@ -297,3 +298,86 @@ def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
         )
         assert torch.allclose(actual_y, expected_y, rtol=0.0, atol=2e-6)
         assert torch.allclose(actual_x, expected_x, rtol=0.0, atol=2e-6)
+
+
+
+def test_cross_grid_temporal_diagnostic_suppresses_only_cross_domain_taps():
+    # Three 2x2 target-grid frames followed by three 1x2 source-grid frames.
+    # A five-tap temporal kernel has radius two, so the outermost frames never
+    # see the other grid domain while frames adjacent to the boundary do.
+    frame_sizes = ((2, 2), (2, 2), (2, 2), (1, 2), (1, 2), (1, 2))
+    offsets = ((0, 4), (4, 8), (8, 12), (12, 14), (14, 16), (16, 18))
+    tokens = torch.arange(18, dtype=torch.float32).view(18, 1, 1) + 1.0
+    spatial = torch.zeros((1, 1, 5, 5), dtype=torch.float32)
+    spatial[0, 0, 2, 2] = 1.0
+    temporal = torch.ones((1, 1, 5), dtype=torch.float32)
+
+    normal = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+    )
+    stats = {}
+    suppressed = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        suppress_cross_grid_temporal_taps=True,
+        diagnostic_stats=stats,
+    )
+
+    assert normal.shape == suppressed.shape == tokens.shape
+    assert stats["suppressed_taps"] > 0
+    assert stats["suppressed_rows"] > 0
+
+    # Same-domain temporal neighborhoods stay byte-identical.
+    first = slice(*offsets[0])
+    last = slice(*offsets[-1])
+    assert torch.equal(normal[first], suppressed[first])
+    assert torch.equal(normal[last], suppressed[last])
+
+    # Boundary-adjacent frames change because only cross-grid contributions are
+    # removed; the spatial conv, same-grid temporal taps and the rest of the
+    # learned-linear branch remain active.
+    before = slice(*offsets[2])
+    after = slice(*offsets[3])
+    assert not torch.equal(normal[before], suppressed[before])
+    assert not torch.equal(normal[after], suppressed[after])
+
+
+def test_cross_grid_temporal_diagnostic_is_noop_on_uniform_grid():
+    frame_sizes = ((2, 2),) * 4
+    offsets = ((0, 4), (4, 8), (8, 12), (12, 16))
+    tokens = torch.randn(16, 1, 1, generator=torch.Generator().manual_seed(5))
+    spatial = torch.zeros((1, 1, 5, 5), dtype=torch.float32)
+    spatial[0, 0, 2, 2] = 1.0
+    temporal = torch.randn((1, 1, 5), generator=torch.Generator().manual_seed(6))
+    stats = {}
+
+    normal = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+    )
+    suppressed = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        suppress_cross_grid_temporal_taps=True,
+        diagnostic_stats=stats,
+    )
+
+    assert torch.equal(normal, suppressed)
+    assert stats == {}

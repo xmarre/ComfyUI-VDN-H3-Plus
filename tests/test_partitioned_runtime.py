@@ -6,9 +6,12 @@ from vdn_h3.partitioned_runtime import (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
     _mixed_layout_matches_plan,
     _partitioned_linear_diagnostic_mode,
     _partitioned_query_summary,
+    _record_partitioned_cross_grid_temporal_suppression,
     _record_partitioned_linear_bypass,
     _resolve_partitioned_linear_runtime,
     _wrap_vdn_forward,
@@ -114,6 +117,18 @@ def test_partitioned_linear_diagnostic_defaults_to_normal_and_is_partition_scope
     assert bypassed is True
     assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
 
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        layout,
+        cfg,
+        {
+            VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY:
+                VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+        },
+    )
+    assert active is True
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL
+
 
 def test_partitioned_linear_bypass_does_not_invent_a_branch_when_released_linear_is_inactive():
     options = {
@@ -169,6 +184,27 @@ def test_partitioned_linear_bypass_records_explicit_flow_metrics():
     assert metrics.values["partitioned_vdn_linear_bypass_video_rows"] == 2468
 
 
+def test_partitioned_cross_grid_temporal_suppression_records_explicit_flow_metrics():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+    metrics = Metrics()
+    options = {
+        "h3_flow_partitioned_stage_v1": SimpleNamespace(metrics=metrics),
+    }
+    _record_partitioned_cross_grid_temporal_suppression(
+        options,
+        {"suppressed_taps": 7, "suppressed_rows": 1234},
+    )
+    assert metrics.values["partitioned_vdn_cross_grid_temporal_suppression_calls"] == 1
+    assert metrics.values["partitioned_vdn_cross_grid_temporal_suppressed_taps"] == 7
+    assert metrics.values["partitioned_vdn_cross_grid_temporal_suppressed_rows"] == 1234
+
+
 def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
     base_branch = SimpleNamespace()
     block_index = 0
@@ -189,3 +225,5 @@ def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
     wrapped = _wrap_vdn_forward(current)
     assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API == 1
     assert wrapped._vdn_partitioned_linear_diagnostic_api == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
+    assert tuple(wrapped._vdn_partitioned_linear_diagnostic_modes) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
+    assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL in wrapped._vdn_partitioned_linear_diagnostic_modes
