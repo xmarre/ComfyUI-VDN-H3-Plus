@@ -586,22 +586,29 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     from .hybrid import _once
 
-    linear_status = (
-        "diagnostic-bypassed"
-        if linear_bypassed
-        else ("active" if linear_added else "inactive by released full-coverage/config semantics")
-    )
-    _once(
-        (
-            "partitioned-grouped-v4",
-            grouped.plan_digest,
-            block_index,
-            linear_status,
-        ),
-        "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
-        + linear_status
-        + f"; diagnostic_mode={linear_diagnostic_mode}",
-    )
+    if linear_bypassed:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                "diagnostic-bypassed",
+            ),
+            "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+            f"diagnostic-bypassed; diagnostic_mode={linear_diagnostic_mode}",
+        )
+    else:
+        # Preserve the existing normal-path logging identity and wording exactly.
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                linear_added,
+            ),
+            "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+            + ("active" if linear_added else "inactive by released full-coverage/config semantics"),
+        )
     return out
 
 
