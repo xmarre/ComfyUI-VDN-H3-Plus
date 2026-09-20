@@ -663,6 +663,9 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 __all__ = [
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
 ]
