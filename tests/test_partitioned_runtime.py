@@ -2,8 +2,13 @@ from types import SimpleNamespace
 
 from vdn_h3.partitioned_runtime import (
     VDN_EXTERNAL_SEQUENCE_KEY,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
     _mixed_layout_matches_plan,
+    _partitioned_linear_diagnostic_mode,
     _partitioned_query_summary,
+    _resolve_partitioned_linear_runtime,
 )
 from vdn_h3.partitioned_sequence import (
     PARTITIONED_PREFIX_KEY,
@@ -83,3 +88,58 @@ def test_partitioned_query_summary_fails_closed_on_backend_layout_or_external_dr
         },
     }
     assert _partitioned_query_summary(current, values, bad_options, layout) is None
+
+
+
+def test_partitioned_linear_diagnostic_defaults_to_normal_and_is_partition_scoped():
+    layout = SimpleNamespace(full_cover=False)
+    cfg = {"linear_enabled": True}
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(layout, cfg, {})
+    assert active is True
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        layout,
+        cfg,
+        {
+            VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+        },
+    )
+    assert active is False
+    assert bypassed is True
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+
+def test_partitioned_linear_bypass_does_not_invent_a_branch_when_released_linear_is_inactive():
+    options = {
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    }
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        SimpleNamespace(full_cover=True),
+        {"linear_enabled": True},
+        options,
+    )
+    assert active is False
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        SimpleNamespace(full_cover=False),
+        {"linear_enabled": False},
+        options,
+    )
+    assert active is False
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+
+def test_partitioned_linear_diagnostic_rejects_unknown_mode():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="partitioned VDN linear diagnostic mode"):
+        _partitioned_linear_diagnostic_mode(
+            {VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: "silently_change_vdn"}
+        )
