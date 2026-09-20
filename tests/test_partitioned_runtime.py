@@ -2,8 +2,16 @@ from types import SimpleNamespace
 
 from vdn_h3.partitioned_runtime import (
     VDN_EXTERNAL_SEQUENCE_KEY,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
     _mixed_layout_matches_plan,
+    _partitioned_linear_diagnostic_mode,
     _partitioned_query_summary,
+    _record_partitioned_linear_bypass,
+    _resolve_partitioned_linear_runtime,
+    _wrap_vdn_forward,
 )
 from vdn_h3.partitioned_sequence import (
     PARTITIONED_PREFIX_KEY,
@@ -83,3 +91,101 @@ def test_partitioned_query_summary_fails_closed_on_backend_layout_or_external_dr
         },
     }
     assert _partitioned_query_summary(current, values, bad_options, layout) is None
+
+
+
+def test_partitioned_linear_diagnostic_defaults_to_normal_and_is_partition_scoped():
+    layout = SimpleNamespace(full_cover=False)
+    cfg = {"linear_enabled": True}
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(layout, cfg, {})
+    assert active is True
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        layout,
+        cfg,
+        {
+            VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+        },
+    )
+    assert active is False
+    assert bypassed is True
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+
+def test_partitioned_linear_bypass_does_not_invent_a_branch_when_released_linear_is_inactive():
+    options = {
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    }
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        SimpleNamespace(full_cover=True),
+        {"linear_enabled": True},
+        options,
+    )
+    assert active is False
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+    active, bypassed, mode = _resolve_partitioned_linear_runtime(
+        SimpleNamespace(full_cover=False),
+        {"linear_enabled": False},
+        options,
+    )
+    assert active is False
+    assert bypassed is False
+    assert mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+
+
+def test_partitioned_linear_diagnostic_rejects_unknown_mode():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="partitioned VDN linear diagnostic mode"):
+        _partitioned_linear_diagnostic_mode(
+            {VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: "silently_change_vdn"}
+        )
+
+
+
+def test_partitioned_linear_bypass_records_explicit_flow_metrics():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+    metrics = Metrics()
+    options = {
+        "h3_flow_partitioned_stage_v1": SimpleNamespace(metrics=metrics),
+    }
+
+    _record_partitioned_linear_bypass(options, 1234)
+    _record_partitioned_linear_bypass(options, 1234)
+
+    assert metrics.values["partitioned_vdn_linear_bypass_calls"] == 2
+    assert metrics.values["partitioned_vdn_linear_bypass_video_rows"] == 2468
+
+
+def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
+    base_branch = SimpleNamespace()
+    block_index = 0
+    cfg = {}
+    head_dim = 128
+    heads = 56
+    k_norm = SimpleNamespace()
+    out_proj = SimpleNamespace()
+    q_norm = SimpleNamespace()
+    qkv_proj = SimpleNamespace()
+    state = SimpleNamespace()
+
+    def current(x, rope_freqs=None, transformer_options=None):
+        _ = (base_branch, block_index, cfg, head_dim, heads, k_norm, out_proj, q_norm, qkv_proj, state)
+        return x
+
+    current._vdn_forward = True
+    wrapped = _wrap_vdn_forward(current)
+    assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API == 1
+    assert wrapped._vdn_partitioned_linear_diagnostic_api == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API

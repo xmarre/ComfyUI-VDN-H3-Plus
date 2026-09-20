@@ -33,6 +33,10 @@ from .partitioned_sequence import (
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
 SOL_CUDA_DIAGNOSTICS_KEY = "sol_h3_cuda_diagnostics_v1"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY = "h3_flow_partitioned_vdn_linear_diagnostic_v1"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API = 1
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL = "normal"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS = "bypass_partitioned_linear"
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
 
@@ -45,6 +49,44 @@ def _component_recorder(options):
 def _record_component(recorder, name, started):
     if recorder is not None:
         recorder(name, time.perf_counter() - started)
+
+
+def _partitioned_linear_diagnostic_mode(options: dict[str, Any]) -> str:
+    raw = options.get(
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+    )
+    if raw not in {
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
+    }:
+        raise RuntimeError(
+            "partitioned VDN linear diagnostic mode must be "
+            f"{VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL!r} or "
+            f"{VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS!r}, got {raw!r}"
+        )
+    return str(raw)
+
+
+def _resolve_partitioned_linear_runtime(layout, cfg, options: dict[str, Any]):
+    """Return (active, bypassed, mode) without changing released/native VDN semantics."""
+
+    would_run = bool(not layout.full_cover and cfg.get("linear_enabled", True))
+    mode = _partitioned_linear_diagnostic_mode(options)
+    bypassed = bool(
+        would_run and mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
+    )
+    return bool(would_run and not bypassed), bypassed, mode
+
+
+def _record_partitioned_linear_bypass(options: dict[str, Any], video_rows: int) -> None:
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if not callable(increment):
+        return
+    increment("partitioned_vdn_linear_bypass_calls")
+    increment("partitioned_vdn_linear_bypass_video_rows", int(video_rows))
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,7 +306,19 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     # The released VDN linear branch consumes raw pre-QK-norm/pre-RoPE video
     # features. Preserve exactly those rows before the in-place H3 RoPE helper.
-    linear_active = bool(not layout.full_cover and cfg.get("linear_enabled", True))
+    # The diagnostic bypass is deliberately scoped to the explicit partitioned
+    # runtime only. Ordinary/native VDN never reaches this function, and normal
+    # mode remains byte-for-byte on the existing branch.
+    linear_active, linear_bypassed, linear_diagnostic_mode = _resolve_partitioned_linear_runtime(
+        layout,
+        cfg,
+        options,
+    )
+    if linear_bypassed:
+        _record_partitioned_linear_bypass(
+            options,
+            grouped.sequence_rows - grouped.video_start,
+        )
     q_raw_video = k_raw_video = v_raw_video = None
     text_x = text_k_raw = text_v_raw = None
     if linear_active:
@@ -533,16 +587,29 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     from .hybrid import _once
 
-    _once(
-        (
-            "partitioned-grouped-v4",
-            grouped.plan_digest,
-            block_index,
-            linear_added,
-        ),
-        "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
-        + ("active" if linear_added else "inactive by released full-coverage/config semantics"),
-    )
+    if linear_bypassed:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                "diagnostic-bypassed",
+            ),
+            "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+            f"diagnostic-bypassed; diagnostic_mode={linear_diagnostic_mode}",
+        )
+    else:
+        # Preserve the existing normal-path logging identity and wording exactly.
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                linear_added,
+            ),
+            "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
+            + ("active" if linear_added else "inactive by released full-coverage/config semantics"),
+        )
     return out
 
 
@@ -579,6 +646,7 @@ def _wrap_vdn_forward(current):
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
+    partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
@@ -604,6 +672,10 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 __all__ = [
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
 ]
