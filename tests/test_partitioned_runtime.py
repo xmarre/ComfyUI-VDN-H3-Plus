@@ -8,6 +8,7 @@ from vdn_h3.partitioned_runtime import (
     _mixed_layout_matches_plan,
     _partitioned_linear_diagnostic_mode,
     _partitioned_query_summary,
+    _record_partitioned_linear_bypass,
     _resolve_partitioned_linear_runtime,
 )
 from vdn_h3.partitioned_sequence import (
@@ -143,3 +144,24 @@ def test_partitioned_linear_diagnostic_rejects_unknown_mode():
         _partitioned_linear_diagnostic_mode(
             {VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY: "silently_change_vdn"}
         )
+
+
+
+def test_partitioned_linear_bypass_records_explicit_flow_metrics():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+    metrics = Metrics()
+    options = {
+        "h3_flow_partitioned_stage_v1": SimpleNamespace(metrics=metrics),
+    }
+
+    _record_partitioned_linear_bypass(options, 1234)
+    _record_partitioned_linear_bypass(options, 1234)
+
+    assert metrics.values["partitioned_vdn_linear_bypass_calls"] == 2
+    assert metrics.values["partitioned_vdn_linear_bypass_video_rows"] == 2468
