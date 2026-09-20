@@ -34,6 +34,7 @@ VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 FLOW_PARTITIONED_STAGE_KEY = "h3_flow_partitioned_stage_v1"
 SOL_CUDA_DIAGNOSTICS_KEY = "sol_h3_cuda_diagnostics_v1"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY = "h3_flow_partitioned_vdn_linear_diagnostic_v1"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS = "bypass_partitioned_linear"
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
@@ -645,6 +646,7 @@ def _wrap_vdn_forward(current):
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
+    partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
@@ -670,6 +672,7 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 __all__ = [
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL",

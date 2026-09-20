@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from vdn_h3.partitioned_runtime import (
     VDN_EXTERNAL_SEQUENCE_KEY,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
@@ -10,6 +11,7 @@ from vdn_h3.partitioned_runtime import (
     _partitioned_query_summary,
     _record_partitioned_linear_bypass,
     _resolve_partitioned_linear_runtime,
+    _wrap_vdn_forward,
 )
 from vdn_h3.partitioned_sequence import (
     PARTITIONED_PREFIX_KEY,
@@ -165,3 +167,25 @@ def test_partitioned_linear_bypass_records_explicit_flow_metrics():
 
     assert metrics.values["partitioned_vdn_linear_bypass_calls"] == 2
     assert metrics.values["partitioned_vdn_linear_bypass_video_rows"] == 2468
+
+
+def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
+    base_branch = SimpleNamespace()
+    block_index = 0
+    cfg = {}
+    head_dim = 128
+    heads = 56
+    k_norm = SimpleNamespace()
+    out_proj = SimpleNamespace()
+    q_norm = SimpleNamespace()
+    qkv_proj = SimpleNamespace()
+    state = SimpleNamespace()
+
+    def current(x, rope_freqs=None, transformer_options=None):
+        _ = (base_branch, block_index, cfg, head_dim, heads, k_norm, out_proj, q_norm, qkv_proj, state)
+        return x
+
+    current._vdn_forward = True
+    wrapped = _wrap_vdn_forward(current)
+    assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API == 1
+    assert wrapped._vdn_partitioned_linear_diagnostic_api == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
