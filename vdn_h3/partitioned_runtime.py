@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import math
 import time
 from typing import Any
 
@@ -38,10 +39,12 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS = "bypass_partitioned_linear"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL = "suppress_cross_grid_temporal_taps"
+VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE = "raw_token_measure"
 VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+    VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
 )
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
@@ -89,6 +92,16 @@ def _record_partitioned_linear_bypass(options: dict[str, Any], video_rows: int) 
         return
     increment("partitioned_vdn_linear_bypass_calls")
     increment("partitioned_vdn_linear_bypass_video_rows", int(video_rows))
+
+
+def _record_partitioned_raw_token_measure(options: dict[str, Any], plan) -> None:
+    if not math.isclose(float(plan.prefix_log_key_measure), 0.0, rel_tol=0.0, abs_tol=0.0):
+        runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+        metrics = getattr(runtime, "metrics", None)
+        increment = getattr(metrics, "increment", None)
+        if callable(increment):
+            increment("partitioned_vdn_raw_token_measure_calls")
+            increment("partitioned_vdn_raw_token_measure_prefix_frames", int(plan.prefix_t))
 
 
 def _record_partitioned_cross_grid_temporal_suppression(
@@ -422,6 +435,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         ) from exc
 
     scale = head_dim**-0.5
+    raw_token_measure = (
+        linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE
+    )
+    if raw_token_measure and not linear_active:
+        raise RuntimeError(
+            "partitioned VDN raw-token measure diagnostic requires the learned linear complement"
+        )
+    prefix_log_key_measure = 0.0 if raw_token_measure else plan.prefix_log_key_measure
     softmax_out = torch.empty_like(q)
     covered_rows = grouped.video_start
 
@@ -448,7 +469,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 scale=scale,
                 sink_rows=0,
                 prefix_k_range=grouped.full_prefix_k_range,
-                prefix_log_key_measure=plan.prefix_log_key_measure,
+                prefix_log_key_measure=prefix_log_key_measure,
                 semantic_digest=semantic_digest,
                 force_dense=True,
             )
@@ -477,7 +498,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
-            measure = plan.prefix_log_key_measure if group.prefix_k_range is not None else 0.0
+            measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
             q_group = q[q_index]
             k_group = k[k_index]
             v_group = v[k_index]
@@ -575,6 +596,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         )
         cross_grid_temporal_stats = {} if suppress_cross_grid_temporal else None
         frame_sizes, measure_scales = partitioned_frame_contract(plan)
+        if raw_token_measure:
+            measure_scales = tuple(1.0 for _ in measure_scales)
         linear_started = time.perf_counter()
         readout = partitioned_linear_readout(
             base_branch,
@@ -621,6 +644,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             linear_projection_started,
         )
         linear_added = True
+        if raw_token_measure:
+            _record_partitioned_raw_token_measure(options, plan)
 
     from .hybrid import _once
 
@@ -634,6 +659,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             ),
             "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
             f"diagnostic-bypassed; diagnostic_mode={linear_diagnostic_mode}",
+        )
+    elif raw_token_measure:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                "diagnostic-raw-token-measure",
+            ),
+            "partitioned exact-prefix: grouped VDN softmax and learned-linear complement active; "
+            "target-prefix density correction diagnostic-disabled so both paths use raw token measure; "
+            f"diagnostic_mode={linear_diagnostic_mode}",
         )
     elif cross_grid_temporal_suppressed:
         _once(
@@ -727,6 +764,7 @@ __all__ = [
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS",
+    "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
