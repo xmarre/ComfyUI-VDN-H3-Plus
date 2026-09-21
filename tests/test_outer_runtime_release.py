@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from vdn_h3.hybrid import make_outer_release_wrapper
+from vdn_h3.hybrid import (
+    _allocator_pressure_requires_trim,
+    _high_stage_block_trim_due,
+    _maybe_trim_high_allocator,
+    make_outer_release_wrapper,
+)
 
 
 class _Runtime:
@@ -108,4 +113,87 @@ def test_non_progressive_outer_sample_preserves_existing_retention_policy(monkey
     options = {"transformer_options": {"h3_flow_stage": "high"}}
     assert wrapped(_Executor(options)) == "ok"
     assert state.runtime.releases == 0
+    assert trims == []
+
+
+
+def test_high_allocator_pressure_gate_matches_capacity_and_reclaimable_pool():
+    assert _allocator_pressure_requires_trim(
+        {
+            "allocated_mib": 58483.0,
+            "reserved_mib": 87168.0,
+            "free_mib": 9000.0,
+            "total_mib": 97886.0,
+        }
+    )
+    assert not _allocator_pressure_requires_trim(
+        {
+            "allocated_mib": 53788.0,
+            "reserved_mib": 56288.0,
+            "free_mib": 41000.0,
+            "total_mib": 97886.0,
+        }
+    )
+    assert not _allocator_pressure_requires_trim(
+        {
+            "allocated_mib": 84000.0,
+            "reserved_mib": 88000.0,
+            "free_mib": 9000.0,
+            "total_mib": 97886.0,
+        }
+    )
+
+
+def test_high_stage_block_trim_sampling_is_sparse_and_stage_bounded():
+    assert not _high_stage_block_trim_due({"h3_flow_stage": "low"}, 3)
+    assert not _high_stage_block_trim_due({"h3_flow_stage": "high"}, 0)
+    assert not _high_stage_block_trim_due({"h3_flow_stage": "high"}, 2)
+    assert _high_stage_block_trim_due({"h3_flow_stage": "high"}, 3)
+    assert _high_stage_block_trim_due({"h3_flow_stage": "high"}, 7)
+
+
+def test_high_allocator_pressure_trim_is_stage_and_pressure_bounded(monkeypatch):
+    state = _State()
+    snapshots = iter(
+        [
+            {
+                "allocated_mib": 58483.0,
+                "reserved_mib": 87168.0,
+                "free_mib": 9000.0,
+                "total_mib": 97886.0,
+            },
+            {
+                "allocated_mib": 58483.0,
+                "reserved_mib": 60224.0,
+                "free_mib": 37000.0,
+                "total_mib": 97886.0,
+            },
+        ]
+    )
+    trims = []
+    monkeypatch.setattr("vdn_h3.hybrid._cuda_allocator_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(
+        "vdn_h3.hybrid.comfy.model_management.soft_empty_cache",
+        lambda: trims.append(True),
+    )
+    assert _maybe_trim_high_allocator(state, {"h3_flow_stage": "high"}) is True
+    assert trims == [True]
+
+
+def test_high_allocator_pressure_trim_does_not_touch_low_or_healthy_high(monkeypatch):
+    state = _State()
+    trims = []
+    healthy = {
+        "allocated_mib": 54000.0,
+        "reserved_mib": 65000.0,
+        "free_mib": 32000.0,
+        "total_mib": 97886.0,
+    }
+    monkeypatch.setattr("vdn_h3.hybrid._cuda_allocator_snapshot", lambda: healthy)
+    monkeypatch.setattr(
+        "vdn_h3.hybrid.comfy.model_management.soft_empty_cache",
+        lambda: trims.append(True),
+    )
+    assert _maybe_trim_high_allocator(state, {"h3_flow_stage": "low"}) is False
+    assert _maybe_trim_high_allocator(state, {"h3_flow_stage": "high"}) is False
     assert trims == []
