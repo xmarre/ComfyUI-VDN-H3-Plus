@@ -33,6 +33,12 @@ VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
 FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_PARTITIONED_PROGRESSIVE_KEY = "h3_flow_partitioned_progressive_v1"
 
+# Emptying CUDA's cache synchronizes the device, so do it only when a high-stage
+# model call leaves both a near-capacity reserved pool and substantial reclaimable
+# cache. This protects the following denoiser call without perturbing healthy runs.
+_HIGH_STAGE_RESERVED_FRACTION_LIMIT = 0.85
+_HIGH_STAGE_RECLAIMABLE_FRACTION_MIN = 0.10
+
 
 def _once(key, message):
     if key in _seen:
@@ -172,7 +178,12 @@ def make_layout_wrapper(state):
                 f"buffers={'retained' if state.retain_buffers else 'transient'}",
             )
             try:
-                return executor(*args, **kwargs)
+                result = executor(*args, **kwargs)
+                transformer_options = kwargs.get("transformer_options")
+                if transformer_options is None and len(args) > 3:
+                    transformer_options = args[3]
+                _maybe_trim_high_allocator(state, transformer_options)
+                return result
             except comfy.model_management.InterruptProcessingException:
                 # All persistent scratch belongs to this VDNState, so a cancelled
                 # execution can release it without touching another node/model.
@@ -456,12 +467,53 @@ def _cuda_allocator_snapshot():
         device = torch.device(comfy.model_management.get_torch_device())
         if device.type != "cuda":
             return None
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
         return {
             "allocated_mib": torch.cuda.memory_allocated(device) / (1 << 20),
             "reserved_mib": torch.cuda.memory_reserved(device) / (1 << 20),
+            "free_mib": free_bytes / (1 << 20),
+            "total_mib": total_bytes / (1 << 20),
         }
     except Exception:
         return None
+
+
+def _allocator_pressure_requires_trim(snapshot):
+    if not isinstance(snapshot, dict):
+        return False
+    try:
+        allocated = float(snapshot["allocated_mib"])
+        reserved = float(snapshot["reserved_mib"])
+        total = float(snapshot["total_mib"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if total <= 0.0 or allocated < 0.0 or reserved < allocated:
+        return False
+    reclaimable = reserved - allocated
+    return (
+        reserved / total >= _HIGH_STAGE_RESERVED_FRACTION_LIMIT
+        and reclaimable / total >= _HIGH_STAGE_RECLAIMABLE_FRACTION_MIN
+    )
+
+
+def _maybe_trim_high_allocator(state, transformer_options):
+    if (
+        not state.retain_buffers
+        or not isinstance(transformer_options, dict)
+        or transformer_options.get(FLOW_STAGE_KEY) != "high"
+    ):
+        return False
+    before = _cuda_allocator_snapshot()
+    if not _allocator_pressure_requires_trim(before):
+        return False
+    comfy.model_management.soft_empty_cache()
+    after = _cuda_allocator_snapshot()
+    _log.info(
+        "[vdn] high-stage allocator pressure trim allocator_before=%s allocator_after=%s",
+        before,
+        after,
+    )
+    return True
 
 
 def make_outer_release_wrapper(state):
