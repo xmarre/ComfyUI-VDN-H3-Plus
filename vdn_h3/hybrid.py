@@ -464,6 +464,71 @@ def _cuda_allocator_snapshot():
         return None
 
 
+def make_prepare_sampling_memory_wrapper(state):
+    """Give retained VDN sampling exclusive GPU headroom without changing arithmetic.
+
+    HIGH_VRAM can leave unrelated text encoders and VAEs resident after conditioning.
+    Evict those unrelated models at the sampler-admission boundary while preserving
+    an already-loaded copy of this H3 ModelPatcher when possible. Core
+    prepare_sampling then reloads only models required for the current invocation.
+    """
+
+    def wrap(
+        executor,
+        model,
+        noise_shape,
+        conds,
+        model_options=None,
+        force_full_load=False,
+        force_offload=False,
+    ):
+        if state.retain_buffers:
+            device = torch.device(
+                getattr(
+                    model,
+                    "load_device",
+                    comfy.model_management.get_torch_device(),
+                )
+            )
+            if device.type == "cuda":
+                transformer = (
+                    model_options.get("transformer_options")
+                    if isinstance(model_options, dict)
+                    else None
+                )
+                stage = (
+                    transformer.get(FLOW_STAGE_KEY)
+                    if isinstance(transformer, dict)
+                    else None
+                )
+                before_allocator = _cuda_allocator_snapshot()
+                keep_loaded = [comfy.model_management.LoadedModel(model)]
+                unloaded = comfy.model_management.free_memory(
+                    1e30,
+                    device,
+                    keep_loaded=keep_loaded,
+                )
+                after_allocator = _cuda_allocator_snapshot()
+                _log.info(
+                    "[vdn] sampling admission eviction stage=%s unloaded=%d "
+                    "allocator_before=%s allocator_after=%s",
+                    stage,
+                    len(unloaded),
+                    before_allocator,
+                    after_allocator,
+                )
+        return executor(
+            model,
+            noise_shape,
+            conds,
+            model_options=model_options,
+            force_full_load=force_full_load,
+            force_offload=force_offload,
+        )
+
+    return wrap
+
+
 def make_outer_release_wrapper(state):
     """Release retained VDN scratch once a Flow progressive sample is quiescent.
 
@@ -554,5 +619,10 @@ def apply_vdn(new_model, state):
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))
+    new_model.add_wrapper_with_key(
+        WrappersMP.PREPARE_SAMPLING,
+        "vdn_h3_memory_admission",
+        make_prepare_sampling_memory_wrapper(state),
+    )
     new_model.add_wrapper_with_key(
         WrappersMP.OUTER_SAMPLE, "vdn_h3_runtime_release", make_outer_release_wrapper(state))

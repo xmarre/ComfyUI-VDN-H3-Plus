@@ -5,7 +5,12 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from vdn_h3.hybrid import VDNLayout, VDNState, make_vdn_forward
+from vdn_h3.hybrid import (
+    VDNLayout,
+    VDNState,
+    make_prepare_sampling_memory_wrapper,
+    make_vdn_forward,
+)
 
 
 class _TinyAttention(nn.Module):
@@ -130,3 +135,66 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
 
     assert torch.equal(got, expected_q)
     assert events == ["weights", "softmax", "prefetch"]
+
+
+
+def test_prepare_sampling_memory_admission_evicts_unrelated_models_before_executor(monkeypatch):
+    state = SimpleNamespace(retain_buffers=True)
+    model = SimpleNamespace(load_device=torch.device("cuda"))
+    events = []
+
+    class _Keep:
+        def __init__(self, patcher):
+            self.model = patcher
+
+    monkeypatch.setattr("vdn_h3.hybrid._cuda_allocator_snapshot", lambda: {"ok": True})
+    monkeypatch.setattr("comfy.model_management.LoadedModel", _Keep)
+
+    def free_memory(required, device, keep_loaded):
+        events.append(("free", required, device.type, keep_loaded[0].model is model))
+        return ["text_encoder", "vae"]
+
+    monkeypatch.setattr("comfy.model_management.free_memory", free_memory)
+
+    def executor(*args, **kwargs):
+        events.append((
+            "executor",
+            args[0] is model,
+            kwargs["model_options"]["transformer_options"]["h3_flow_stage"],
+        ))
+        return "prepared"
+
+    wrapped = make_prepare_sampling_memory_wrapper(state)
+    result = wrapped(
+        executor,
+        model,
+        (1, 1, 1),
+        {},
+        model_options={"transformer_options": {"h3_flow_stage": "high"}},
+    )
+
+    assert result == "prepared"
+    assert events == [
+        ("free", 1e30, "cuda", True),
+        ("executor", True, "high"),
+    ]
+
+
+def test_prepare_sampling_memory_admission_is_inert_without_retained_buffers(monkeypatch):
+    state = SimpleNamespace(retain_buffers=False)
+    model = SimpleNamespace(load_device=torch.device("cuda"))
+    monkeypatch.setattr(
+        "comfy.model_management.free_memory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("free_memory must not run when VDN buffers are not retained")
+        ),
+    )
+
+    wrapped = make_prepare_sampling_memory_wrapper(state)
+    assert wrapped(
+        lambda *_args, **_kwargs: "prepared",
+        model,
+        (1, 1, 1),
+        {},
+        model_options={},
+    ) == "prepared"
