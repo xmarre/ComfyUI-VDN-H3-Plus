@@ -72,6 +72,9 @@ class RuntimeLinearBranch(B.LinearBranch):
 
         a, b = B.frame_statistics(
             key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        # The activated token tensors are not used by any later branch phase.
+        del key_by_frame, value_by_frame, key, value, beta
+
         frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
             dim=1, dtype=torch.float32)
         alpha = B.alpha_gate(
@@ -83,16 +86,16 @@ class RuntimeLinearBranch(B.LinearBranch):
             n_heads,
             head_dim,
         )
+        del frame_mean
 
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
+        del a, b
 
-        gate = torch.sigmoid(
-            F.linear(xv, w["output_gate.down.weight"])
-            @ w["output_gate.up.weight"].T
-            + w["output_gate.up.bias"]
-        )
+        # The output gate has the activation dtype: VDN streamed/resident branch
+        # weights are resolved to xv.dtype. Delay its full-row allocation until the
+        # scan state has been gathered and the readout GEMM has released its inputs.
         linear_state = B.gather_linear_state(
             prefix_states,
             suffix_states,
@@ -100,9 +103,10 @@ class RuntimeLinearBranch(B.LinearBranch):
             bounds,
             bridge=self.bridge,
             text_state=text_state,
-            out_dtype=gate.dtype,
+            out_dtype=xv.dtype,
             fuse=self.fuse_epilogue,
         )
+        del prefix_states, suffix_states, alpha, text_state
 
         if query.dim() == 4:
             query_fhsd = query
@@ -110,13 +114,22 @@ class RuntimeLinearBranch(B.LinearBranch):
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(
             query_fhsd, linear_state.transpose(-1, -2))
-        return B.linear_epilogue(
+        del query, query_fhsd, linear_state
+
+        gate = torch.sigmoid(
+            F.linear(xv, w["output_gate.down.weight"])
+            @ w["output_gate.up.weight"].T
+            + w["output_gate.up.bias"]
+        )
+        out = B.linear_epilogue(
             readout,
             w["norm.weight"],
             gate,
             w["norm.weight"].new_tensor(1e-6).item(),
             fuse=self.fuse_epilogue,
         )
+        del readout, gate
+        return out
 
 
 def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
