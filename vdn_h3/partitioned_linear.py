@@ -21,7 +21,9 @@ softmax contract instead of overweighting the denser prefix representation.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import math
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -286,6 +288,8 @@ def _core_readout(
     text_x=None,
     text_k_raw=None,
     text_v_raw=None,
+    record_component=None,
+    cuda_span=None,
 ):
     offsets = _validate_inputs(
         branch,
@@ -299,91 +303,144 @@ def _core_readout(
     )
     heads = int(branch.num_heads)
     head_dim = int(branch.head_dim)
-    query, key, value = _variable_features(
-        branch,
-        weights,
-        q_raw,
-        k_raw,
-        v_raw,
-        frame_sizes,
-        offsets,
-    )
-    beta_rows = torch.sigmoid(F.linear(x_video, weights["beta_proj.weight"]))
-    if tuple(beta_rows.shape) != (x_video.shape[0], heads):
-        raise RuntimeError("partitioned VDN beta projection has unexpected geometry")
+    def component_span(name):
+        return nullcontext() if cuda_span is None else cuda_span(name)
 
-    a_frames = []
-    b_frames = []
-    means = []
-    for (start, stop), measure in zip(offsets, measure_scales, strict=True):
-        key_frame = key[start:stop].permute(1, 0, 2).unsqueeze(0)
-        value_frame = value[start:stop].permute(1, 0, 2).unsqueeze(0)
-        beta_frame = beta_rows[start:stop].transpose(0, 1).unsqueeze(0)
-        beta_frame = beta_frame * float(measure)
-        frame_a, frame_b = B.frame_statistics(
-            key_frame,
-            value_frame,
-            beta_frame,
-            a_fp32=branch.a_fp32,
+    features_started = time.perf_counter()
+    with component_span("vdn_linear_features"):
+        query, key, value = _variable_features(
+            branch,
+            weights,
+            q_raw,
+            k_raw,
+            v_raw,
+            frame_sizes,
+            offsets,
         )
-        a_frames.append(frame_a)
-        b_frames.append(frame_b)
-        means.append(x_video[start:stop].mean(dim=0, dtype=torch.float32))
-    a_raw = torch.cat(a_frames, dim=0)
-    b_raw = torch.cat(b_frames, dim=0)
-    frame_mean = torch.stack(means, dim=0)
-    alpha = B.alpha_gate(
-        frame_mean,
-        weights["alpha.down.weight"],
-        weights["alpha.up.weight"],
-        weights["alpha.dt_bias"],
-        weights["alpha.A_log"],
-        heads,
-        head_dim,
-    )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_features_host_wall_s",
+            time.perf_counter() - features_started,
+        )
+    statistics_started = time.perf_counter()
+    with component_span("vdn_linear_statistics"):
+        beta_rows = torch.sigmoid(F.linear(x_video, weights["beta_proj.weight"]))
+        if tuple(beta_rows.shape) != (x_video.shape[0], heads):
+            raise RuntimeError("partitioned VDN beta projection has unexpected geometry")
 
-    text_state = branch._text_state(weights, text_x, text_k_raw, text_v_raw)
-    # vdn_solve does not depend on tokens_per_frame. Use the smallest physical
-    # frame size as a stable cache identity while preserving released arithmetic.
-    backend = branch._delta_backend(min(stop - start for start, stop in offsets))
-    prefix_states, suffix_states = run_scans_runtime(
-        backend,
-        alpha,
-        a_raw,
-        b_raw,
-        text_state=text_state,
-    )
-    gate = torch.sigmoid(
-        F.linear(x_video, weights["output_gate.down.weight"])
-        @ weights["output_gate.up.weight"].T
-        + weights["output_gate.up.bias"]
-    )
-    linear_state = B.gather_linear_state(
-        prefix_states,
-        suffix_states,
-        alpha,
-        bounds,
-        bridge=branch.bridge,
-        text_state=text_state,
-        out_dtype=gate.dtype,
-        fuse=False,
-    )
+        a_frames = []
+        b_frames = []
+        means = []
+        for (start, stop), measure in zip(offsets, measure_scales, strict=True):
+            key_frame = key[start:stop].permute(1, 0, 2).unsqueeze(0)
+            value_frame = value[start:stop].permute(1, 0, 2).unsqueeze(0)
+            beta_frame = beta_rows[start:stop].transpose(0, 1).unsqueeze(0)
+            beta_frame = beta_frame * float(measure)
+            frame_a, frame_b = B.frame_statistics(
+                key_frame,
+                value_frame,
+                beta_frame,
+                a_fp32=branch.a_fp32,
+            )
+            a_frames.append(frame_a)
+            b_frames.append(frame_b)
+            means.append(x_video[start:stop].mean(dim=0, dtype=torch.float32))
+        a_raw = torch.cat(a_frames, dim=0)
+        b_raw = torch.cat(b_frames, dim=0)
+        frame_mean = torch.stack(means, dim=0)
+        alpha = B.alpha_gate(
+            frame_mean,
+            weights["alpha.down.weight"],
+            weights["alpha.up.weight"],
+            weights["alpha.dt_bias"],
+            weights["alpha.A_log"],
+            heads,
+            head_dim,
+        )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_statistics_host_wall_s",
+            time.perf_counter() - statistics_started,
+        )
+
+    scans_started = time.perf_counter()
+    with component_span("vdn_linear_scans"):
+        text_state = branch._text_state(weights, text_x, text_k_raw, text_v_raw)
+        # vdn_solve does not depend on tokens_per_frame. Use the smallest physical
+        # frame size as a stable cache identity while preserving released arithmetic.
+        backend = branch._delta_backend(min(stop - start for start, stop in offsets))
+        prefix_states, suffix_states = run_scans_runtime(
+            backend,
+            alpha,
+            a_raw,
+            b_raw,
+            text_state=text_state,
+        )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_scans_host_wall_s",
+            time.perf_counter() - scans_started,
+        )
+    gate_started = time.perf_counter()
+    with component_span("vdn_linear_gate"):
+        gate = torch.sigmoid(
+            F.linear(x_video, weights["output_gate.down.weight"])
+            @ weights["output_gate.up.weight"].T
+            + weights["output_gate.up.bias"]
+        )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_gate_host_wall_s",
+            time.perf_counter() - gate_started,
+        )
+    gather_started = time.perf_counter()
+    with component_span("vdn_linear_gather"):
+        linear_state = B.gather_linear_state(
+            prefix_states,
+            suffix_states,
+            alpha,
+            bounds,
+            bridge=branch.bridge,
+            text_state=text_state,
+            out_dtype=gate.dtype,
+            fuse=False,
+        )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_gather_host_wall_s",
+            time.perf_counter() - gather_started,
+        )
 
     outputs = []
-    eps = weights["norm.weight"].new_tensor(1e-6).item()
-    for frame, (start, stop) in enumerate(offsets):
-        query_frame = query[start:stop].permute(1, 0, 2)
-        readout = torch.matmul(query_frame, linear_state[frame].transpose(-1, -2)).unsqueeze(0)
-        outputs.append(
-            B.linear_epilogue(
-                readout,
-                weights["norm.weight"],
-                gate[start:stop],
-                eps,
-                fuse=False,
-            )
+    epsilon_started = time.perf_counter()
+    with component_span("vdn_linear_epsilon_scalar"):
+        eps = weights["norm.weight"].new_tensor(1e-6).item()
+    if record_component is not None:
+        record_component(
+            "vdn_linear_epsilon_scalar_host_wall_s",
+            time.perf_counter() - epsilon_started,
         )
-    return torch.cat(outputs, dim=0)
+    output_started = time.perf_counter()
+    with component_span("vdn_linear_output"):
+        for frame, (start, stop) in enumerate(offsets):
+            query_frame = query[start:stop].permute(1, 0, 2)
+            readout = torch.matmul(query_frame, linear_state[frame].transpose(-1, -2)).unsqueeze(0)
+            outputs.append(
+                B.linear_epilogue(
+                    readout,
+                    weights["norm.weight"],
+                    gate[start:stop],
+                    eps,
+                    fuse=False,
+                )
+            )
+        result = torch.cat(outputs, dim=0)
+    if record_component is not None:
+        record_component(
+            "vdn_linear_output_host_wall_s",
+            time.perf_counter() - output_started,
+        )
+    return result
 
 
 def partitioned_linear_readout(
@@ -401,8 +458,11 @@ def partitioned_linear_readout(
     text_k_raw: torch.Tensor | None = None,
     text_v_raw: torch.Tensor | None = None,
     skip_ends: bool = False,
+    record_component=None,
+    cuda_span=None,
 ) -> torch.Tensor:
     """Evaluate VDN's learned linear complement over heterogeneous frame grids."""
+    total_started = time.perf_counter()
     local = copy.copy(branch)
     local._backend = None
     local._backend_key = None
@@ -421,7 +481,13 @@ def partitioned_linear_readout(
 
     if skip_ends:
         if len(frame_sizes) <= 2:
-            return x_video.new_zeros((x_video.shape[0], heads * head_dim))
+            result = x_video.new_zeros((x_video.shape[0], heads * head_dim))
+            if record_component is not None:
+                record_component(
+                    "vdn_linear_api_host_wall_s",
+                    time.perf_counter() - total_started,
+                )
+            return result
         first_stop = offsets[0][1]
         last_start = offsets[-1][0]
         inner_bounds = tuple((lo - 1, hi - 1) for lo, hi in bounds[1:-1])
@@ -438,12 +504,19 @@ def partitioned_linear_readout(
             text_x=text_x,
             text_k_raw=text_k_raw,
             text_v_raw=text_v_raw,
+            record_component=record_component,
+            cuda_span=cuda_span,
         )
         out = inner.new_zeros((x_video.shape[0], inner.shape[-1]))
         out[first_stop:last_start] = inner
+        if record_component is not None:
+            record_component(
+                "vdn_linear_api_host_wall_s",
+                time.perf_counter() - total_started,
+            )
         return out
 
-    return _core_readout(
+    result = _core_readout(
         local,
         weights,
         x_video,
@@ -456,7 +529,15 @@ def partitioned_linear_readout(
         text_x=text_x,
         text_k_raw=text_k_raw,
         text_v_raw=text_v_raw,
+        record_component=record_component,
+        cuda_span=cuda_span,
     )
+    if record_component is not None:
+        record_component(
+            "vdn_linear_api_host_wall_s",
+            time.perf_counter() - total_started,
+        )
+    return result
 
 
 def partitioned_frame_contract(plan) -> tuple[tuple[tuple[int, int], ...], tuple[float, ...]]:
