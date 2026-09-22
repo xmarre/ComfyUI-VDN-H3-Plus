@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import gc
+import weakref
 
 import torch
 
@@ -29,6 +31,58 @@ def test_runtime_buffer_owner_reuses_primary_but_isolates_nested_execution():
         second = outer.activation_scratch(8, 3, 2, 4, "cpu", torch.float32)
         assert first["q"].data_ptr() == second["q"].data_ptr()
     assert current_runtime_buffers() is None
+
+
+def test_activation_scratch_evicts_old_geometry_before_replacement_allocation(monkeypatch):
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        first = resources.activation_scratch(8, 3, 2, 4, "cpu", torch.float32)
+        first_ref = weakref.ref(first["q"])
+        del first
+        gc.collect()
+        assert first_ref() is not None  # retained by the cache
+
+        original_empty = torch.empty
+        observed = {"checked": False}
+
+        def checked_empty(*args, **kwargs):
+            if not observed["checked"]:
+                gc.collect()
+                assert first_ref() is None
+                observed["checked"] = True
+            return original_empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", checked_empty)
+        second = resources.activation_scratch(16, 3, 2, 4, "cpu", torch.float32)
+        assert observed["checked"]
+        assert second["q"].shape[0] == 16
+        assert resources.retained_counts()["activations"] == 1
+
+
+def test_kv_scratch_evicts_smaller_capacity_before_growth_allocation(monkeypatch):
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        first_k, first_v = resources.kv_scratch(8, 2, 4, "cpu", torch.float32)
+        backing_ref = weakref.ref(resources._kv[("cpu", torch.float32, 2, 4)][0])
+        del first_k, first_v
+        gc.collect()
+        assert backing_ref() is not None  # retained by the cache
+
+        original_empty = torch.empty
+        observed = {"checked": False}
+
+        def checked_empty(*args, **kwargs):
+            if not observed["checked"]:
+                gc.collect()
+                assert backing_ref() is None
+                observed["checked"] = True
+            return original_empty(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "empty", checked_empty)
+        grown_k, grown_v = resources.kv_scratch(16, 2, 4, "cpu", torch.float32)
+        assert observed["checked"]
+        assert grown_k.shape == grown_v.shape == (16, 2, 4)
+        assert resources.retained_counts()["kv"] == 1
 
 
 def test_retained_scan_banks_match_reference_and_reuse_storage():
@@ -224,3 +278,17 @@ def test_completed_prefetch_is_retained_for_its_target(monkeypatch):
     assert prefetcher._index == "original"
     prefetcher.reset()
     assert prefetcher._future is None
+
+
+def test_release_retained_clears_primary_pool_after_execution():
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        resources.activation_scratch(8, 3, 2, 4, "cpu", torch.float32)
+        resources.kv_scratch(8, 2, 4, "cpu", torch.float32)
+    before = owner.release_retained()
+    assert before["activations"] == 1
+    assert before["kv"] == 1
+    with owner.execution() as resources:
+        counts = resources.retained_counts()
+        assert counts["activations"] == 0
+        assert counts["kv"] == 0

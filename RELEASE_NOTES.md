@@ -1,3 +1,40 @@
+# ComfyUI-VDN-H3-Plus v1.5.6
+
+Coordinated production release with [ComfyUI-Sol-H3 v0.1.6](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.6), [MiniMax H3 Flow-Aligned Regenerate v0.3.6](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.6), and [H3 Continuum v3.4.4](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.4). [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28) remains unchanged.
+
+Production consolidation PRs: [VDN-H3-Plus #32](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/32), [Sol-H3 #15](https://github.com/xmarre/ComfyUI-Sol-H3/pull/15), [Flow #73](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/73), and [Continuum #34](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/34). VDN #32 consolidates the validated VDN #30 source line without merging the intermediate diagnostic PRs.
+
+## Exact-prefix VDN transport and lifetime control
+
+v1.5.6 completes the VDN side of the heterogeneous exact-prefix progressive path. The released normal route preserves the grouped VDN softmax domain, provider-v4 mapped query-position ownership, variable-grid learned linear complement, output projection and existing adapter arithmetic while allowing Flow to execute the protected target-grid prefix and generated source-grid suffix under one explicit partitioned contract.
+
+The runtime lifetime work keeps retained VDN scratch under bounded ownership across progressive low/probe/high stages and releases it at the established quiescent boundaries. The final production fix adds sampler-admission eviction of unrelated resident models when retained buffers are active. This frees stale text-encoder/VAE residency before the H3 sampler needs the space while explicitly preserving the current H3 ModelPatcher.
+
+That admission fix changes memory residency, not VDN mathematics: Q/K/V values, grouped support, learned branch arithmetic, adapter weights, scheduler/NFE ownership and Flow's partitioned geometry remain unchanged.
+
+## Why the final VRAM fix is narrow
+
+An earlier bounded-workset experiment improved allocator pressure but changed output behavior and was rejected. The shipped fix therefore does not replace VDN scratch/branch arithmetic. It keeps the accepted normal route and performs only the pre-sampling residency eviction before Core prepares the active sample.
+
+On the production RTX PRO 6000 stack, this restored the later high stage to the healthy allocator/timing class instead of the previous spill/cliff behavior.
+
+## Coordinated stack
+
+- **Sol-H3 v0.1.6** consumes the mapped physical query-position contract through the real packaged SM120 CuTe backend.
+- **Flow v0.3.6** uses the validated fast source-uniform exact-prefix continuation topology with 16 sampler-owned overlap ticks and no duplicate shadow low/probe lifetimes.
+- **H3 Continuum v3.4.4** fixes physical prompt/audio ownership at continuation and terminal boundaries.
+
+The release does not require a new Spectrum build; Spectrum v0.2.28 remains the companion version used in the current stack.
+
+## Validation
+
+The #30 exact head passed the full VDN CI matrix. Hardware validation showed the sampler-admission policy removed the third-high VRAM/performance cliff while preserving the accepted arithmetic path. The final Flow #70 acceptance run retained three continuation sampler lifetimes / two history boundaries and healthy high-stage execution.
+
+## Release scope
+
+Historical VDN linear-bypass, raw-token-measure, cross-grid short-conv and allocator diagnostics remain diagnostic evidence and are **not merged as independent production PRs**. Keyless research PRs are also excluded. This release consolidates the validated normal production tree and the narrow #30 admission fix into one mainline release commit.
+
+
 # ComfyUI-VDN-H3-Plus v1.5.5
 
 Coordinated production release with [ComfyUI-Sol-H3 v0.1.5](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.5) and [MiniMax H3 Flow-Aligned Regenerate v0.3.5](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.5).
