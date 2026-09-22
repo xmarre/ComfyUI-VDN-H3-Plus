@@ -30,6 +30,9 @@ VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
 VDN_EXTERNAL_SEQUENCE_API_VERSION = 2
 VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
 
+FLOW_STAGE_KEY = "h3_flow_stage"
+FLOW_PARTITIONED_PROGRESSIVE_KEY = "h3_flow_partitioned_progressive_v1"
+
 
 def _once(key, message):
     if key in _seen:
@@ -91,7 +94,25 @@ class VDNState:
     def _stream_weights(self, index, device, dtype):
         return resolve_branch_weights(self.branches[index].w, device, dtype)
 
-    def weights_on(self, index, device, dtype):
+    def prefetch_next_weights(self, index, device, dtype):
+        if self.managed_weights is not None:
+            return
+
+        resources = self.runtime.current()
+        if (resources is None or not resources.retain
+                or torch.device(device).type != "cuda"):
+            return
+
+        placement = (str(torch.device(device)), dtype)
+        next_index = (index + 1) % len(self.branches)
+        if self.branches[next_index] is not None:
+            next_key = (next_index, *placement)
+            resources.prefetch_request(
+                next_key,
+                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
+            )
+
+    def weights_on(self, index, device, dtype, *, prefetch_next=True):
         if self.managed_weights is not None:
             return self.managed_weights.weights_on(index, device, dtype)
 
@@ -106,13 +127,8 @@ class VDNState:
         if hit is None:
             hit = self._stream_weights(index, device, dtype)
 
-        next_index = (index + 1) % len(self.branches)
-        if self.branches[next_index] is not None:
-            next_key = (next_index, *placement)
-            resources.prefetch_request(
-                next_key,
-                lambda i=next_index, d=device, t=dtype: self._stream_weights(i, d, t),
-            )
+        if prefetch_next:
+            self.prefetch_next_weights(index, device, dtype)
         return hit
 
 
@@ -262,6 +278,16 @@ def make_vdn_forward(attn, state, block_index):
         branch._backend = None
         branch._backend_key = None
 
+        # The partitioned low/probe path must preserve raw heterogeneous Q/K/V rows
+        # through its in-place RoPE step and may retain that scratch across calls.
+        # This ordinary native path no longer consumes activation_scratch at all:
+        # its learned complement is computed before RoPE below. Drop any retained
+        # partitioned entry before allocating this call's target-grid QKV so stale
+        # low-grid raw copies cannot survive into the high-stage memory peak.
+        resources = state.runtime.current()
+        if resources is not None:
+            resources.release_activation_scratch()
+
         s = x.shape[0]
         external_reduced = _external_reduced_sequence_active(
             transformer_options, layout, s, rope_freqs)
@@ -282,40 +308,54 @@ def make_vdn_forward(attn, state, block_index):
 
         window_active = not layout.full_cover and not external_reduced
         linear_active = window_active and cfg.get("linear_enabled", True)
-        q_raw_video = k_raw_video = v_video = None
-        text_x = text_k_raw = text_v_raw = None
+
+        # The learned linear complement consumes the raw pre-QK-norm/pre-RoPE Q/K/V
+        # rows, but it is independent of the softmax branch. Compute and project it
+        # while those raw views are still valid instead of copying the complete video
+        # and text Q/K/V payload into long-lived activation scratch. At the production
+        # seven-reference high grid this removes the large raw-QKV preservation buffer
+        # from the softmax-attention peak while preserving the exact branch arithmetic.
+        linear_projection = None
+        precomputed_softmax_gate = None
         if linear_active:
             a, b = layout.video_start, layout.video_end
-            resources = state.runtime.current()
-            text_rows = layout.text_len if branch.enable_text_state else 0
-            scratch = (
-                resources.activation_scratch(
-                    b - a, text_rows, heads, head_dim, device, dtype)
-                if resources is not None else None
-            )
-            if scratch is None:
-                q_raw_video = q_raw[a:b].clone()
-                k_raw_video = k_raw[a:b].clone()
-                v_video = v[a:b].clone()
-            else:
-                q_raw_video = scratch["q"]
-                k_raw_video = scratch["k"]
-                v_video = scratch["v"]
-                q_raw_video.copy_(q_raw[a:b])
-                k_raw_video.copy_(k_raw[a:b])
-                v_video.copy_(v[a:b])
-
+            text_x = text_k_raw = text_v_raw = None
             if branch.enable_text_state and layout.text_len:
                 ta, tb = layout.text_start, layout.text_start + layout.text_len
                 text_x = x[ta:tb]
-                if scratch is None:
-                    text_k_raw = k_raw[ta:tb].clone()
-                    text_v_raw = v[ta:tb].clone()
-                else:
-                    text_k_raw = scratch["tk"]
-                    text_v_raw = scratch["tv"]
-                    text_k_raw.copy_(k_raw[ta:tb])
-                    text_v_raw.copy_(v[ta:tb])
+                text_k_raw = k_raw[ta:tb]
+                text_v_raw = v[ta:tb]
+
+            # Preserve the original branch-weight lookahead timing. Starting the
+            # next-block prefetch here would make streamed checkpoint weights overlap
+            # the current block's high-memory softmax lifetime, undoing part of the
+            # raw-QKV lifetime reduction below.
+            weights = state.weights_on(
+                block_index, device, dtype, prefetch_next=False)
+            readout = branch.readout(
+                weights,
+                x[a:b],
+                q_raw[a:b],
+                k_raw[a:b],
+                v[a:b],
+                layout.num_frames,
+                layout.tokens_per_frame,
+                layout.bounds,
+                frame_size=layout.frame_size,
+                text_x=text_x,
+                text_k_raw=text_k_raw,
+                text_v_raw=text_v_raw,
+                skip_ends=(cfg["anchor_frames"] == "both"),
+            )
+            linear_projection = F.linear(
+                readout.type_as(x), weights["to_out_linear.weight"])
+            if cfg["enable_softmax_gate"]:
+                precomputed_softmax_gate = torch.sigmoid(F.linear(
+                    x,
+                    weights["softmax_gate.up.weight"],
+                    weights["softmax_gate.up.bias"],
+                ))
+            del readout, weights, text_x, text_k_raw, text_v_raw
 
         if rope_freqs is not None:
             q4 = q.view(1, s, heads, head_dim)
@@ -362,12 +402,21 @@ def make_vdn_forward(attn, state, block_index):
                 transformer_options=transformer_options).squeeze(0).reshape(s, heads, head_dim)
 
         del q, k, v, q_raw, k_raw
-        weights = state.weights_on(block_index, device, dtype)
+
+        if linear_active:
+            # Before this lifetime change weights_on() ran after softmax and launched
+            # one-block lookahead from here. Keep that ordering so asynchronous
+            # streamed weights do not become an additional attention-peak resident.
+            state.prefetch_next_weights(block_index, device, dtype)
 
         if cfg["enable_softmax_gate"]:
-            gate = torch.sigmoid(F.linear(
-                x, weights["softmax_gate.up.weight"],
-                weights["softmax_gate.up.bias"]))
+            if precomputed_softmax_gate is None:
+                weights = state.weights_on(block_index, device, dtype)
+                gate = torch.sigmoid(F.linear(
+                    x, weights["softmax_gate.up.weight"],
+                    weights["softmax_gate.up.bias"]))
+            else:
+                gate = precomputed_softmax_gate
             flat = (
                 softmax_out
                 * gate.view(s, heads, 1).to(softmax_out.dtype)
@@ -377,18 +426,8 @@ def make_vdn_forward(attn, state, block_index):
         out = out_proj(flat.type_as(x))
         del softmax_out
 
-        if linear_active:
-            readout = branch.readout(
-                weights,
-                x[layout.video_start:layout.video_end],
-                q_raw_video, k_raw_video, v_video,
-                layout.num_frames, layout.tokens_per_frame, layout.bounds,
-                frame_size=layout.frame_size,
-                text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
-                skip_ends=(cfg["anchor_frames"] == "both"),
-            )
-            out[layout.video_start:layout.video_end] += F.linear(
-                readout.type_as(x), weights["to_out_linear.weight"])
+        if linear_projection is not None:
+            out[layout.video_start:layout.video_end] += linear_projection
         return out
 
     def query_position_plan(options, layout):
@@ -410,6 +449,156 @@ def make_vdn_forward(attn, state, block_index):
     return vdn_forward
 
 
+def _cuda_allocator_snapshot():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        device = torch.device(comfy.model_management.get_torch_device())
+        if device.type != "cuda":
+            return None
+        return {
+            "allocated_mib": torch.cuda.memory_allocated(device) / (1 << 20),
+            "reserved_mib": torch.cuda.memory_reserved(device) / (1 << 20),
+        }
+    except Exception:
+        return None
+
+
+def make_prepare_sampling_memory_wrapper(state):
+    """Give retained VDN sampling exclusive GPU headroom without changing arithmetic.
+
+    HIGH_VRAM can leave unrelated text encoders and VAEs resident after conditioning.
+    Evict those unrelated models at the sampler-admission boundary while preserving
+    an already-loaded copy of this H3 ModelPatcher when possible. Core
+    prepare_sampling then reloads only models required for the current invocation.
+    """
+
+    def wrap(
+        executor,
+        model,
+        noise_shape,
+        conds,
+        model_options=None,
+        force_full_load=False,
+        force_offload=False,
+    ):
+        if state.retain_buffers:
+            device = torch.device(
+                getattr(
+                    model,
+                    "load_device",
+                    comfy.model_management.get_torch_device(),
+                )
+            )
+            if device.type == "cuda":
+                transformer = (
+                    model_options.get("transformer_options")
+                    if isinstance(model_options, dict)
+                    else None
+                )
+                stage = (
+                    transformer.get(FLOW_STAGE_KEY)
+                    if isinstance(transformer, dict)
+                    else None
+                )
+                before_allocator = _cuda_allocator_snapshot()
+                keep_loaded = [comfy.model_management.LoadedModel(model)]
+                unloaded = comfy.model_management.free_memory(
+                    1e30,
+                    device,
+                    keep_loaded=keep_loaded,
+                )
+                after_allocator = _cuda_allocator_snapshot()
+                _log.info(
+                    "[vdn] sampling admission eviction stage=%s unloaded=%d "
+                    "allocator_before=%s allocator_after=%s",
+                    stage,
+                    len(unloaded),
+                    before_allocator,
+                    after_allocator,
+                )
+        return executor(
+            model,
+            noise_shape,
+            conds,
+            model_options=model_options,
+            force_full_load=force_full_load,
+            force_offload=force_offload,
+        )
+
+    return wrap
+
+
+def make_outer_release_wrapper(state):
+    """Release retained VDN scratch once a Flow progressive sample is quiescent.
+
+    Wrapper ordering is deliberately not assumed. If VDN wraps Flow, the persistent
+    progressive contract is visible with no active sub-stage and release happens
+    after the complete Flow OUTER_SAMPLE. If Flow wraps VDN, low-stage scratch is
+    retained through the exact probe, then released after probe before the native
+    target-grid high stage allocates its QKV/live attention state. High releases
+    again at the terminal boundary. A failing progressive sub-sample releases
+    immediately.
+    """
+
+    def wrap(executor, *args, **kwargs):
+        guider = getattr(executor, "class_obj", None)
+        model_options = getattr(guider, "model_options", None)
+        progressive = (
+            isinstance(model_options, dict)
+            and FLOW_PARTITIONED_PROGRESSIVE_KEY in model_options
+        )
+        transformer = (
+            model_options.get("transformer_options")
+            if isinstance(model_options, dict)
+            else None
+        )
+        stage = transformer.get(FLOW_STAGE_KEY) if isinstance(transformer, dict) else None
+        error = None
+        try:
+            return executor(*args, **kwargs)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            release = bool(
+                state.retain_buffers
+                and progressive
+                and (
+                    error is not None
+                    or stage is None
+                    or stage in ("probe", "high")
+                )
+            )
+            if release:
+                if error is not None:
+                    reason = "error"
+                elif stage == "probe":
+                    reason = "probe_to_high"
+                elif stage == "high":
+                    reason = "terminal_high"
+                else:
+                    reason = "outer_complete"
+                before_allocator = _cuda_allocator_snapshot()
+                retained = state.runtime.release_retained()
+                # Dropping references alone leaves cudaMallocAsync's reserved pool high.
+                # At this quiescent OUTER_SAMPLE boundary Comfy's own cache trim is safe
+                # and returns unused blocks before VAE decode.
+                comfy.model_management.soft_empty_cache()
+                after_allocator = _cuda_allocator_snapshot()
+                _log.info(
+                    "[vdn] progressive runtime release stage=%s reason=%s error=%s "
+                    "retained=%s allocator_before=%s allocator_after=%s",
+                    stage,
+                    reason,
+                    type(error).__name__ if error is not None else None,
+                    retained,
+                    before_allocator,
+                    after_allocator,
+                )
+
+    return wrap
+
 def apply_vdn(new_model, state):
     dm = new_model.get_model_object("diffusion_model")
     blocks = getattr(dm, "blocks", None)
@@ -430,3 +619,10 @@ def apply_vdn(new_model, state):
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))
+    new_model.add_wrapper_with_key(
+        WrappersMP.PREPARE_SAMPLING,
+        "vdn_h3_memory_admission",
+        make_prepare_sampling_memory_wrapper(state),
+    )
+    new_model.add_wrapper_with_key(
+        WrappersMP.OUTER_SAMPLE, "vdn_h3_runtime_release", make_outer_release_wrapper(state))

@@ -40,6 +40,8 @@ _MAX_DELTA_SCRATCH = 1
 _MAX_WINDOW_PLANS = 8
 _MAX_KV_SCRATCH = 1
 _MAX_ACTIVATION_SCRATCH = 1
+_MAX_PARTITION_INDEX_ENTRIES = 64
+_MAX_PARTITION_INDEX_BYTES = 4 * 1024 * 1024
 _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=None)
 # One worker is enough for one-block lookahead. It never stores branch weights itself;
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
@@ -59,6 +61,20 @@ def _bounded_put(mapping, key, value, limit):
     while len(mapping) > limit:
         mapping.popitem(last=False)
     return value
+
+
+def _pre_evict_single_replacement(mapping, key):
+    """Drop an incompatible single-entry cache before allocating its replacement.
+
+    Tensor-heavy retained scratch caches intentionally keep at most one geometry.
+    Evicting through _bounded_put() only after the new tensor exists creates a
+    transient old+new VRAM peak at geometry transitions (for example progressive
+    low-grid -> high-grid handoff). Dropping the cache's reference first allows
+    the allocator to recycle the old storage before the larger allocation while
+    preserving any independent live references held by an active caller.
+    """
+    if key not in mapping and mapping:
+        mapping.clear()
 
 
 class _StreamPrefetcher:
@@ -147,14 +163,23 @@ class _StreamPrefetcher:
             self._record_stream(tensor, current)
         return weights
 
-    def reset(self):
+    def reset(self, *, wait=False):
         with self._lock:
             self._generation += 1
             future = self._future
             self._future = None
             self._index = None
-        if future is not None:
+        if future is None:
+            return
+        if not wait:
             future.cancel()
+            return
+        try:
+            # A terminal lifecycle release must not leave an orphaned producer-stream
+            # allocation racing the allocator trim that follows it.
+            future.result()
+        except Exception as exc:
+            _log.warning("[vdn] branch prefetch drain failed during runtime release: %s", exc)
 
 
 class RuntimeBuffers:
@@ -167,6 +192,8 @@ class RuntimeBuffers:
         self._plans = collections.OrderedDict()
         self._kv = collections.OrderedDict()
         self._activations = collections.OrderedDict()
+        self._partition_indices = collections.OrderedDict()
+        self._partition_index_bytes = 0
         self._prefetcher = None
 
     def delta_scratch(self, shape, device):
@@ -175,6 +202,7 @@ class RuntimeBuffers:
         key = (tuple(shape), str(device))
         hit = self._delta.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._delta, key)
             hit = torch.empty(shape, dtype=torch.float32, device=device)
             _bounded_put(self._delta, key, hit, _MAX_DELTA_SCRATCH)
         else:
@@ -189,6 +217,7 @@ class RuntimeBuffers:
         key = (num_frames, tuple(state_shape), str(device), dtype)
         hit = self._scan.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._scan, key)
             prefix = torch.empty(shape, dtype=dtype, device=device)
             hit = (prefix, torch.empty_like(prefix))
             _bounded_put(self._scan, key, hit, _MAX_SCAN_BANKS)
@@ -202,6 +231,7 @@ class RuntimeBuffers:
         key = (video_rows, text_rows, heads, head_dim, str(device), dtype)
         hit = self._activations.get(key)
         if hit is None:
+            _pre_evict_single_replacement(self._activations, key)
             vshape = (video_rows, heads, head_dim)
             tshape = (text_rows, heads, head_dim)
             hit = {
@@ -216,6 +246,17 @@ class RuntimeBuffers:
             self._activations.move_to_end(key)
         return hit
 
+    def release_activation_scratch(self):
+        """Drop retained raw-QKV preservation scratch when the caller no longer uses it.
+
+        Partitioned exact-prefix execution still needs activation scratch because its
+        in-place RoPE path must preserve heterogeneous raw video/text rows until the
+        variable-grid linear complement runs. The ordinary native forward computes
+        that complement before RoPE instead, so carrying partitioned scratch into the
+        subsequent target-grid high stage is pure retained VRAM.
+        """
+        self._activations.clear()
+
     def window_plan(self, key, builder):
         if not self.retain:
             return builder()
@@ -226,6 +267,88 @@ class RuntimeBuffers:
         else:
             self._plans.move_to_end(key)
         return hit
+
+    def partition_indices(self, identity, ranges, device):
+        """Return one bounded execution-owned gather index with stream-safe reuse.
+
+        Partitioned exact-prefix VDN uses the same temporal gather geometry in
+        every transformer block. Rebuilding ``arange``/``cat`` tensors for each
+        block creates avoidable warm allocations. Unlike a process-global cache,
+        this cache lives in the leased RuntimeBuffers instance and therefore has
+        the same ownership/cancellation semantics as the other retained scratch.
+        Transient pools cache only for their current execution and are cleared on
+        scope exit.
+        """
+        device = torch.device(device)
+        normalized = []
+        previous_end = -1
+        for item in tuple(ranges):
+            if (
+                not isinstance(item, (tuple, list))
+                or len(item) != 2
+                or type(item[0]) is not int
+                or type(item[1]) is not int
+            ):
+                raise RuntimeError("partitioned VDN gather ranges must be integer pairs")
+            start, end = item
+            if start < 0 or end <= start or start < previous_end:
+                raise RuntimeError("partitioned VDN gather ranges must be positive, ordered, and disjoint")
+            normalized.append((start, end))
+            previous_end = end
+        normalized = tuple(normalized)
+        if not normalized:
+            raise RuntimeError("partitioned VDN gather index cannot be empty")
+
+        key = (identity, normalized, str(device))
+        hit = self._partition_indices.get(key)
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                current = torch.cuda.current_stream(device)
+                if hit is not None:
+                    self._partition_indices.move_to_end(key)
+                    tensor, event, _size = hit
+                    if event is None:
+                        raise RuntimeError("partitioned VDN CUDA gather cache entry is missing its stream event")
+                    current.wait_event(event)
+                    tensor.record_stream(current)
+                    return tensor
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError("partitioned VDN cannot allocate gather indices during CUDA graph capture")
+                total = sum(end - start for start, end in normalized)
+                tensor = torch.empty(total, dtype=torch.long, device=device)
+                cursor = 0
+                for start, end in normalized:
+                    span = end - start
+                    tensor[cursor : cursor + span].copy_(
+                        torch.arange(start, end, dtype=torch.long, device=device)
+                    )
+                    cursor += span
+                event = torch.cuda.Event()
+                event.record(current)
+                tensor.record_stream(current)
+        else:
+            if hit is not None:
+                self._partition_indices.move_to_end(key)
+                tensor, event, _size = hit
+                if event is not None:
+                    raise RuntimeError("partitioned VDN CPU gather cache entry has a CUDA event")
+                return tensor
+            tensor = torch.cat(
+                [torch.arange(start, end, dtype=torch.long, device=device) for start, end in normalized]
+            )
+            event = None
+
+        size = tensor.numel() * tensor.element_size()
+        self._partition_indices[key] = (tensor, event, size)
+        self._partition_indices.move_to_end(key)
+        self._partition_index_bytes += size
+        while (
+            len(self._partition_indices) > _MAX_PARTITION_INDEX_ENTRIES
+            or self._partition_index_bytes > _MAX_PARTITION_INDEX_BYTES
+        ):
+            _, (_tensor, _event, evicted_size) = self._partition_indices.popitem(last=False)
+            self._partition_index_bytes -= evicted_size
+        return tensor
 
     def kv_scratch(self, rows, heads, head_dim, device, dtype):
         shape = (rows, heads, head_dim)
@@ -238,6 +361,14 @@ class RuntimeBuffers:
         pair = self._kv.get(key)
         need = rows * heads * head_dim
         if pair is None or pair[0].numel() < need:
+            if pair is not None:
+                # This key owns the only retained K/V pair. Remove its cache
+                # reference before requesting a larger pair so allocator pressure
+                # does not include both capacities at the replacement boundary.
+                self._kv.pop(key, None)
+                pair = None
+            else:
+                _pre_evict_single_replacement(self._kv, key)
             pair = (
                 torch.empty(need, device=device, dtype=dtype),
                 torch.empty(need, device=device, dtype=dtype),
@@ -261,14 +392,19 @@ class RuntimeBuffers:
             self._prefetcher = _StreamPrefetcher()
         self._prefetcher.request(index, fetch)
 
-    def clear(self):
+    def clear(self, *, wait_prefetch=False):
+        # In a terminal lifecycle release, invalidate and drain the producer before
+        # dropping tensor caches so no late prefetch allocation can repopulate CUDA
+        # pressure after the clear. Ordinary cancellation remains non-blocking.
+        if self._prefetcher is not None:
+            self._prefetcher.reset(wait=wait_prefetch)
         self._scan.clear()
         self._delta.clear()
         self._plans.clear()
         self._kv.clear()
         self._activations.clear()
-        if self._prefetcher is not None:
-            self._prefetcher.reset()
+        self._partition_indices.clear()
+        self._partition_index_bytes = 0
 
     def retained_counts(self):
         return {
@@ -277,6 +413,8 @@ class RuntimeBuffers:
             "plans": len(self._plans),
             "kv": len(self._kv),
             "activations": len(self._activations),
+            "partition_indices": len(self._partition_indices),
+            "partition_index_bytes": self._partition_index_bytes,
         }
 
 
@@ -311,3 +449,12 @@ class RuntimeBufferOwner:
 
     def clear(self):
         self._primary.clear()
+
+    def release_retained(self):
+        """Drain prefetch and drop all retained scratch at a quiescent sample boundary."""
+        if not self.retain:
+            return {}
+        with self._lease:
+            before = self._primary.retained_counts()
+            self._primary.clear(wait_prefetch=True)
+        return before
