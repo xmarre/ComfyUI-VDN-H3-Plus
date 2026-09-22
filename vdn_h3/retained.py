@@ -55,23 +55,51 @@ def run_scans_runtime(backend, alpha, a_raw, b_raw, text_state=None):
 class RuntimeLinearBranch(B.LinearBranch):
     """LinearBranch whose reusable state banks belong to the current VDN execution."""
 
+    def _feature_one(self, w, raw, proj, num_frames, frame_size):
+        """Materialize one branch feature at a time instead of Q/K/V together."""
+        conv = self.short_conv
+        l2norm = proj != "v"
+        if proj == "q" and self.fuse_epilogue and not (conv and "q" in conv):
+            return B._run_compiled(
+                ("act_fhsd", True),
+                B._activate_fhsd_body,
+                raw,
+                True,
+                num_frames,
+                raw.shape[0] // num_frames,
+            )
+        if conv and proj in conv:
+            return B.conv_features(
+                raw,
+                w[f"short_conv.{proj}_sp.weight"],
+                w[f"short_conv.{proj}_tm.weight"],
+                num_frames,
+                frame_size,
+                l2norm=l2norm,
+            )
+        return B._activate(raw, l2norm=l2norm)
+
     def _readout(self, w, xv, qkv_raw, num_frames, tokens_per_frame, bounds,
                  frame_size, text_x, text_k_raw, text_v_raw):
         n_heads, head_dim = self.num_heads, self.head_dim
         backend = self._delta_backend(tokens_per_frame)
         shape = (num_frames, tokens_per_frame, n_heads, head_dim)
+        q_raw, k_raw, v_raw = qkv_raw
 
-        query, key, value = self._features(
-            w, *qkv_raw, num_frames, frame_size,
-            q_fhsd=self.fuse_epilogue)
+        # K is the only activated full-row feature needed by both statistics. Build A
+        # before V exists, then build B, so Q/K/V feature tensors never coexist.
+        key = self._feature_one(w, k_raw, "k", num_frames, frame_size)
         key_by_frame = key.view(shape).permute(0, 2, 1, 3)
-        value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta = torch.sigmoid(F.linear(xv, w["beta_proj.weight"]))
         beta = beta.view(
             num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)
+        a = B.frame_statistic_a(key_by_frame, beta, a_fp32=self.a_fp32)
 
-        a, b = B.frame_statistics(
-            key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        value = self._feature_one(w, v_raw, "v", num_frames, frame_size)
+        value_by_frame = value.view(shape).permute(0, 2, 1, 3)
+        b = B.frame_statistic_b(key_by_frame, value_by_frame, beta)
+        del key_by_frame, value_by_frame, key, value, beta
+
         frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
             dim=1, dtype=torch.float32)
         alpha = B.alpha_gate(
@@ -83,16 +111,13 @@ class RuntimeLinearBranch(B.LinearBranch):
             n_heads,
             head_dim,
         )
+        del frame_mean
 
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
+        del a, b
 
-        gate = torch.sigmoid(
-            F.linear(xv, w["output_gate.down.weight"])
-            @ w["output_gate.up.weight"].T
-            + w["output_gate.up.bias"]
-        )
         linear_state = B.gather_linear_state(
             prefix_states,
             suffix_states,
@@ -100,23 +125,36 @@ class RuntimeLinearBranch(B.LinearBranch):
             bounds,
             bridge=self.bridge,
             text_state=text_state,
-            out_dtype=gate.dtype,
+            out_dtype=xv.dtype,
             fuse=self.fuse_epilogue,
         )
+        del prefix_states, suffix_states, alpha, text_state
 
+        # Q is needed only for the final readout. Delaying its activation until here
+        # keeps it out of the K/A and K/V/B peaks above.
+        query = self._feature_one(w, q_raw, "q", num_frames, frame_size)
         if query.dim() == 4:
             query_fhsd = query
         else:
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(
             query_fhsd, linear_state.transpose(-1, -2))
-        return B.linear_epilogue(
+        del query, query_fhsd, linear_state
+
+        gate = torch.sigmoid(
+            F.linear(xv, w["output_gate.down.weight"])
+            @ w["output_gate.up.weight"].T
+            + w["output_gate.up.bias"]
+        )
+        out = B.linear_epilogue(
             readout,
             w["norm.weight"],
             gate,
             w["norm.weight"].new_tensor(1e-6).item(),
             fuse=self.fuse_epilogue,
         )
+        del readout, gate
+        return out
 
 
 def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,

@@ -49,6 +49,7 @@ from vdn_h3.curve_affine import find_curve_affine, project_curve_terms
 
 _log = logging.getLogger("comfy.vdn")
 _FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+_RUNTIME_ADAPTER_MAX_DELTA_BYTES = 512 * 1024 * 1024
 
 
 def _is_adaln(module: str) -> bool:
@@ -300,12 +301,48 @@ class _PostForwardLoRA:
             )
         x = inputs[0]
         down, up, bias = self._weights_for(x)
+        inference_inplace = not torch.is_grad_enabled() and not output.requires_grad
+
+        if inference_inplace and down is not None and x.ndim == 2 and output.ndim == 2:
+            if x.shape[0] != output.shape[0]:
+                raise RuntimeError(
+                    "VDN post-forward bypass row count changed across a linear module"
+                )
+            # H3's long-sequence projections are row independent. Bound the full-width
+            # LoRA residual by row chunks rather than materializing a second qkv/fc1
+            # sized tensor for the entire packed sequence.
+            bytes_per_row = max(
+                1, int(output.shape[-1]) * int(output.element_size())
+            )
+            rows_per_chunk = max(
+                1, _RUNTIME_ADAPTER_MAX_DELTA_BYTES // bytes_per_row
+            )
+            for start in range(0, int(output.shape[0]), rows_per_chunk):
+                stop = min(int(output.shape[0]), start + rows_per_chunk)
+                delta = F.linear(F.linear(x[start:stop], down), up)
+                if bias is not None:
+                    delta.add_(bias)
+                output[start:stop].add_(delta)
+                del delta
+            return output
+
         delta = None
         if down is not None:
             delta = F.linear(F.linear(x, down), up)
         if bias is not None:
-            delta = bias if delta is None else delta + bias
+            if delta is None:
+                if inference_inplace:
+                    output.add_(bias)
+                    return output
+                return output + bias
+            if inference_inplace:
+                delta.add_(bias)
+            else:
+                delta = delta + bias
         if delta is None:
+            return output
+        if inference_inplace:
+            output.add_(delta)
             return output
         return output + delta
 
@@ -560,6 +597,8 @@ def apply_adapters(
             "runtime_terms": runtime_term_count,
             "runtime_bias_terms": runtime_bias_count,
             "runtime_preloaded_on_inject": True,
+            "output_residual_mode": "bounded_chunked_inplace_inference_out_of_place_grad",
+            "max_runtime_delta_bytes": _RUNTIME_ADAPTER_MAX_DELTA_BYTES,
             "mutable_forward_wrappers": 0,
             "module_forward_untouched": True,
             "weight_wrappers": 0,
