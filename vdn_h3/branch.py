@@ -101,28 +101,100 @@ def _tf32_matmul():
     return _Ctx()
 
 
-def frame_statistics(kf, vf, beta, a_fp32=True):
-    """A[f,h,k,l] = sum_s k beta k,  B[f,h,v,k] = sum_s v beta k, over one chunk's
-    rows. A in fp32 (bf16's 8 mantissa bits break the conditioning I+A needs), B left
-    in bf16 for the tensor-core GEMM and promoted on the store. Operates with autocast
-    off implicitly -- callers run under inference no_grad, no ambient autocast."""
+FRAME_STATS_MAX_FP32_OPERAND_BYTES = 512 * 1024 * 1024
+
+
+def _frame_stat_chunk_frames(kf, operand_bytes=4):
+    """Bound one frame-statistics token operand without splitting a frame's GEMM.
+
+    The contraction is independent across the leading frame dimension. Chunking only
+    that batch dimension keeps every per-frame S reduction intact while preventing
+    full-clip fp32 K/scaled-K copies from coexisting at large H3 grids.
+    """
+    if kf.ndim != 4 or kf.shape[0] <= 0:
+        raise ValueError(f"expected frame-major [F,H,S,D] keys, got {tuple(kf.shape)}")
+    per_frame = int(kf.shape[1]) * int(kf.shape[2]) * int(kf.shape[3]) * int(operand_bytes)
+    return max(1, min(int(kf.shape[0]), FRAME_STATS_MAX_FP32_OPERAND_BYTES // max(1, per_frame)))
+
+
+def frame_statistic_a(kf, beta, a_fp32=True):
+    """Build A with a bounded frame-batch workset.
+
+    A frame is never split across launches, so the S-axis reduction that defines the
+    released VDN statistic remains one GEMM. Only independent frame batches are
+    scheduled separately.
+    """
     with torch.autocast(device_type=kf.device.type, enabled=False):
-        kf16 = kf.contiguous()
-        kf32 = kf16.float()
-        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
-        vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+        frames, heads, _tokens, dim = kf.shape
+        out = torch.empty(
+            (frames, heads, dim, dim), dtype=torch.float32, device=kf.device)
+        chunk_frames = _frame_stat_chunk_frames(
+            kf, 4 if a_fp32 else kf.element_size())
+
+        prev = torch.backends.cuda.matmul.allow_tf32
         if a_fp32:
-            prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
-            try:
-                a = torch.matmul(scaled32.transpose(-1, -2), kf32)
-            finally:
+        try:
+            for start in range(0, frames, chunk_frames):
+                stop = min(frames, start + chunk_frames)
+                kf16 = kf[start:stop].contiguous()
+                beta_chunk = beta[start:stop]
+                if a_fp32:
+                    kf32 = kf16.float()
+                    scaled = (
+                        kf32 * beta_chunk.unsqueeze(-1).float()
+                    ).contiguous()
+                    chunk = torch.matmul(
+                        scaled.transpose(-1, -2), kf32)
+                    del scaled, kf32
+                else:
+                    scaled = (
+                        kf16 * beta_chunk.unsqueeze(-1).to(kf16.dtype)
+                    ).contiguous()
+                    chunk = torch.matmul(
+                        scaled.transpose(-1, -2), kf16).float()
+                    del scaled
+                chunk = 0.5 * (chunk + chunk.transpose(-1, -2))
+                out[start:stop].copy_(chunk)
+                del chunk, kf16
+        finally:
+            if a_fp32:
                 torch.backends.cuda.matmul.allow_tf32 = prev
-        else:
-            a = torch.matmul((kf * beta.unsqueeze(-1).to(kf.dtype)).contiguous()
-                             .transpose(-1, -2), kf).float()
-        a = 0.5 * (a + a.transpose(-1, -2))
-        b = torch.matmul(vb.transpose(-1, -2), kf).float()
+        return out
+
+
+def frame_statistic_b(kf, vf, beta):
+    """Build B with the same bounded frame-batch ownership as A."""
+    with torch.autocast(device_type=kf.device.type, enabled=False):
+        frames, heads, _tokens, dim = kf.shape
+        out = torch.empty(
+            (frames, heads, dim, dim), dtype=torch.float32, device=kf.device)
+        chunk_frames = _frame_stat_chunk_frames(kf, 4)
+
+        for start in range(0, frames, chunk_frames):
+            stop = min(frames, start + chunk_frames)
+            beta_chunk = beta[start:stop]
+            vb = (
+                vf[start:stop] * beta_chunk.unsqueeze(-1).to(vf.dtype)
+            ).contiguous()
+            chunk = torch.matmul(
+                vb.transpose(-1, -2), kf[start:stop]
+            ).float()
+            out[start:stop].copy_(chunk)
+            del chunk, vb
+        return out
+
+
+def frame_statistics(kf, vf, beta, a_fp32=True):
+    """A[f,h,k,l] = sum_s k beta k, B[f,h,v,k] = sum_s v beta k.
+
+    The large token workset is bounded by frame batches. A and B are also built in
+    separate lifetime phases, so B's weighted value tensor cannot overlap A's fp32
+    K/scaled-K pair.
+    """
+    with torch.autocast(device_type=kf.device.type, enabled=False):
+        a = frame_statistic_a(kf, beta, a_fp32=a_fp32)
+        b = frame_statistic_b(kf, vf, beta)
         return a, b
 
 
