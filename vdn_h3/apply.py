@@ -303,9 +303,24 @@ class _PostForwardLoRA:
         delta = None
         if down is not None:
             delta = F.linear(F.linear(x, down), up)
+        inference_inplace = not torch.is_grad_enabled() and not output.requires_grad
         if bias is not None:
-            delta = bias if delta is None else delta + bias
+            if delta is None:
+                if inference_inplace:
+                    output.add_(bias)
+                    return output
+                return output + bias
+            if inference_inplace:
+                delta.add_(bias)
+            else:
+                delta = delta + bias
         if delta is None:
+            return output
+        if inference_inplace:
+            # Linear/module outputs are fresh tensors in the H3 inference path.
+            # Reuse that storage for the adapter residual instead of allocating a
+            # second full-width result (critical for qkv_proj/fc1 at long sequences).
+            output.add_(delta)
             return output
         return output + delta
 
@@ -560,6 +575,7 @@ def apply_adapters(
             "runtime_terms": runtime_term_count,
             "runtime_bias_terms": runtime_bias_count,
             "runtime_preloaded_on_inject": True,
+            "output_residual_mode": "inplace_inference_out_of_place_grad",
             "mutable_forward_wrappers": 0,
             "module_forward_untouched": True,
             "weight_wrappers": 0,

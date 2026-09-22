@@ -15,6 +15,7 @@ import torch
 from vdn_h3.window import (window_bounds, full_coverage,
                         window_softmax_grouped)
 from vdn_h3 import branch as B
+from vdn_h3 import retained as R
 
 
 def window_softmax_reference(query, key, value, video_start, video_end, num_frames,
@@ -81,6 +82,71 @@ def test_window_softmax():
     bounds = window_bounds(23, 1, 5)
     assert not full_coverage(bounds, 23)
     print("  full_coverage: ok")
+
+
+
+def test_frame_statistics_frame_chunking_matches_full_frame_gemms():
+    torch.manual_seed(91)
+    frames, heads, tokens, dim = 5, 3, 7, 8
+    kf = torch.randn(frames, heads, tokens, dim)
+    vf = torch.randn_like(kf)
+    beta = torch.sigmoid(torch.randn(frames, heads, tokens))
+
+    # Force one frame per work chunk so the test exercises the bounded path.
+    old_cap = B.FRAME_STATS_MAX_FP32_OPERAND_BYTES
+    B.FRAME_STATS_MAX_FP32_OPERAND_BYTES = heads * tokens * dim * 4
+    try:
+        got_a, got_b = B.frame_statistics(kf, vf, beta, a_fp32=True)
+    finally:
+        B.FRAME_STATS_MAX_FP32_OPERAND_BYTES = old_cap
+
+    with torch.autocast(device_type=kf.device.type, enabled=False):
+        kf16 = kf.contiguous()
+        kf32 = kf16.float()
+        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
+        want_a = torch.matmul(scaled32.transpose(-1, -2), kf32)
+        want_a = 0.5 * (want_a + want_a.transpose(-1, -2))
+        vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+        want_b = torch.matmul(vb.transpose(-1, -2), kf).float()
+
+    assert torch.allclose(got_a, want_a, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(got_b, want_b, atol=1e-5, rtol=1e-5)
+
+
+def test_runtime_linear_branch_staging_matches_reference():
+    torch.manual_seed(92)
+    frames, tokens, heads, dim, hidden = 4, 3, 2, 4, 7
+    rows = frames * tokens
+    bounds = B.window_bounds(frames, 0, 1) if hasattr(B, "window_bounds") else [
+        (i, i) for i in range(frames)
+    ]
+    weights = {
+        "beta_proj.weight": torch.randn(heads, hidden),
+        "alpha.down.weight": torch.randn(dim, hidden),
+        "alpha.up.weight": torch.randn(heads * dim, dim),
+        "alpha.dt_bias": torch.randn(heads * dim),
+        "alpha.A_log": torch.randn(heads),
+        "output_gate.down.weight": torch.randn(dim, hidden),
+        "output_gate.up.weight": torch.randn(heads * dim, dim),
+        "output_gate.up.bias": torch.randn(heads * dim),
+        "norm.weight": torch.randn(dim),
+    }
+    qkv = tuple(torch.randn(rows, heads, dim) for _ in range(3))
+    xv = torch.randn(rows, hidden)
+    ref = B.LinearBranch(
+        weights, heads, dim, delta_rule="sana_scaled",
+        bridge="alpha", a_fp32=True, short_conv=(), enable_text_state=False)
+    got_branch = R.RuntimeLinearBranch(
+        weights, heads, dim, delta_rule="sana_scaled",
+        bridge="alpha", a_fp32=True, short_conv=(), enable_text_state=False)
+
+    with torch.no_grad():
+        want = ref._readout(
+            weights, xv, qkv, frames, tokens, bounds, None, None, None, None)
+        got = got_branch._readout(
+            weights, xv, qkv, frames, tokens, bounds, None, None, None, None)
+
+    assert torch.allclose(got, want, atol=1e-5, rtol=1e-5)
 
 
 def test_delta_scan():
