@@ -108,21 +108,25 @@ def frame_statistics(kf, vf, beta, a_fp32=True):
     off implicitly -- callers run under inference no_grad, no ambient autocast."""
     with torch.autocast(device_type=kf.device.type, enabled=False):
         kf16 = kf.contiguous()
-        kf32 = kf16.float()
-        scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
-        vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
         if a_fp32:
+            kf32 = kf16.float()
+            scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
             prev = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = True
             try:
                 a = torch.matmul(scaled32.transpose(-1, -2), kf32)
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = prev
+            # A no longer needs its two full fp32 token buffers. Release them before
+            # materializing the independent B-side weighted value tensor.
+            del scaled32, kf32
         else:
-            a = torch.matmul((kf * beta.unsqueeze(-1).to(kf.dtype)).contiguous()
-                             .transpose(-1, -2), kf).float()
+            scaled = (kf16 * beta.unsqueeze(-1).to(kf16.dtype)).contiguous()
+            a = torch.matmul(scaled.transpose(-1, -2), kf16).float()
+            del scaled
         a = 0.5 * (a + a.transpose(-1, -2))
-        b = torch.matmul(vb.transpose(-1, -2), kf).float()
+        vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
+        b = torch.matmul(vb.transpose(-1, -2), kf16).float()
         return a, b
 
 

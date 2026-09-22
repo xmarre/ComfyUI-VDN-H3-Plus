@@ -64,7 +64,11 @@ class RuntimeLinearBranch(B.LinearBranch):
         query, key, value = self._features(
             w, *qkv_raw, num_frames, frame_size,
             q_fhsd=self.fuse_epilogue)
-        key_by_frame = key.view(shape).permute(0, 2, 1, 3)
+        # frame_statistics requires frame-major K. Make that ownership explicit so
+        # its contiguous() is a view/no-op and the token-major K allocation can die
+        # before the fp32 A-statistic workset is materialized.
+        key_by_frame = key.view(shape).permute(0, 2, 1, 3).contiguous()
+        del key
         value_by_frame = value.view(shape).permute(0, 2, 1, 3)
         beta = torch.sigmoid(F.linear(xv, w["beta_proj.weight"]))
         beta = beta.view(
@@ -72,6 +76,8 @@ class RuntimeLinearBranch(B.LinearBranch):
 
         a, b = B.frame_statistics(
             key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        del key_by_frame, value_by_frame, value, beta
+
         frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
             dim=1, dtype=torch.float32)
         alpha = B.alpha_gate(
@@ -83,16 +89,15 @@ class RuntimeLinearBranch(B.LinearBranch):
             n_heads,
             head_dim,
         )
+        del frame_mean
 
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
+        del a, b
 
-        gate = torch.sigmoid(
-            F.linear(xv, w["output_gate.down.weight"])
-            @ w["output_gate.up.weight"].T
-            + w["output_gate.up.bias"]
-        )
+        # Gather the outside-window state before allocating the full-row output gate.
+        # None of the scan/statistic buffers are needed by the readout GEMM.
         linear_state = B.gather_linear_state(
             prefix_states,
             suffix_states,
@@ -100,9 +105,10 @@ class RuntimeLinearBranch(B.LinearBranch):
             bounds,
             bridge=self.bridge,
             text_state=text_state,
-            out_dtype=gate.dtype,
+            out_dtype=query.dtype,
             fuse=self.fuse_epilogue,
         )
+        del prefix_states, suffix_states, alpha, text_state
 
         if query.dim() == 4:
             query_fhsd = query
@@ -110,13 +116,25 @@ class RuntimeLinearBranch(B.LinearBranch):
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(
             query_fhsd, linear_state.transpose(-1, -2))
-        return B.linear_epilogue(
+        del query, query_fhsd, linear_state
+
+        # Gate is independent of the scan/readout construction. Delaying it until
+        # the readout is complete prevents another full video-row tensor from
+        # overlapping the branch's largest temporary state.
+        gate = torch.sigmoid(
+            F.linear(xv, w["output_gate.down.weight"])
+            @ w["output_gate.up.weight"].T
+            + w["output_gate.up.bias"]
+        )
+        out = B.linear_epilogue(
             readout,
             w["norm.weight"],
             gate,
             w["norm.weight"].new_tensor(1e-6).item(),
             fuse=self.fuse_epilogue,
         )
+        del readout, gate
+        return out
 
 
 def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
