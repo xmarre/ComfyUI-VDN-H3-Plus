@@ -7,6 +7,7 @@ from vdn_h3.branch import LinearBranch
 from vdn_h3.partitioned_linear import (
     _h3_axis_coordinates,
     _heterogeneous_conv_features,
+    _heterogeneous_conv_features_reference,
     _map_temporal_neighbor,
     partitioned_frame_contract,
     partitioned_linear_readout,
@@ -57,6 +58,88 @@ def _inputs(rows, *, hidden=5, heads=2, head_dim=3, seed=17):
     k = torch.randn((rows, heads, head_dim), generator=generator, dtype=torch.float32)
     v = torch.randn((rows, heads, head_dim), generator=generator, dtype=torch.float32)
     return x, q, k, v
+
+
+def test_batched_heterogeneous_short_conv_matches_scalar_reference():
+    # Two long domains mirror exact-prefix continuation while keeping the CPU
+    # oracle small enough for hosted CI.
+    frame_sizes = ((4, 5),) * 5 + ((3, 4),) * 9
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+
+    generator = torch.Generator(device="cpu").manual_seed(701)
+    tokens = torch.randn((cursor, 2, 3), generator=generator, dtype=torch.float32)
+    channels = 6
+    spatial = torch.randn((channels, 1, 5, 5), generator=generator, dtype=torch.float32) * 0.05
+    temporal = torch.randn((channels, 1, 5), generator=generator, dtype=torch.float32) * 0.05
+
+    reference = _heterogeneous_conv_features_reference(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=True,
+    )
+    batched = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=True,
+    )
+
+    assert batched.shape == reference.shape
+    assert torch.allclose(batched, reference, rtol=2e-5, atol=2e-5)
+
+
+def test_batched_heterogeneous_suppression_matches_scalar_reference_and_stats():
+    frame_sizes = ((3, 4),) * 4 + ((2, 3),) * 6
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+
+    generator = torch.Generator(device="cpu").manual_seed(702)
+    tokens = torch.randn((cursor, 1, 2), generator=generator, dtype=torch.float32)
+    spatial = torch.randn((2, 1, 5, 5), generator=generator, dtype=torch.float32) * 0.05
+    temporal = torch.randn((2, 1, 5), generator=generator, dtype=torch.float32) * 0.05
+    reference_stats = {}
+    batched_stats = {}
+
+    reference = _heterogeneous_conv_features_reference(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        suppress_cross_grid_temporal_taps=True,
+        diagnostic_stats=reference_stats,
+    )
+    batched = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        suppress_cross_grid_temporal_taps=True,
+        diagnostic_stats=batched_stats,
+    )
+
+    assert torch.allclose(batched, reference, rtol=2e-5, atol=2e-5)
+    assert batched_stats == reference_stats
+    assert batched_stats["suppressed_taps"] > 0
 
 
 def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid():
