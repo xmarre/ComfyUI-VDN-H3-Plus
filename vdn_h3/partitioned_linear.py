@@ -206,7 +206,7 @@ def _map_temporal_neighbor(
     ).to(source.dtype)
 
 
-def _heterogeneous_conv_features(
+def _heterogeneous_conv_features_reference(
     tokens: torch.Tensor,
     spatial_weight: torch.Tensor,
     temporal_weight: torch.Tensor,
@@ -218,6 +218,7 @@ def _heterogeneous_conv_features(
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
 ) -> torch.Tensor:
+    """Scalar-frame oracle retained for equivalence coverage of the batched path."""
     maps = [
         _spatial_conv_frame(tokens[start:stop], spatial_weight, grid)
         for (start, stop), grid in zip(offsets, frame_sizes, strict=True)
@@ -233,7 +234,7 @@ def _heterogeneous_conv_features(
         mixed = None
         for tap in range(kernel):
             source_frame = frame + tap - pad
-            if source_frame < 0 or source_frame >= len(maps):
+            if source_frame < 0 or source_frame >= len(frame_sizes):
                 continue
             if (
                 suppress_cross_grid_temporal_taps
@@ -259,6 +260,161 @@ def _heterogeneous_conv_features(
         head_dim = int(tokens.shape[2])
         frame_tokens = mixed[0].permute(1, 2, 0).reshape(rows, heads, head_dim)
         outputs.append(B._activate(frame_tokens, l2norm=l2norm))
+    return torch.cat(outputs, dim=0)
+
+
+def _contiguous_grid_runs(
+    frame_sizes: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int, tuple[int, int]], ...]:
+    if not frame_sizes:
+        raise RuntimeError("partitioned VDN linear requires at least one frame")
+    runs = []
+    start = 0
+    current = tuple(map(int, frame_sizes[0]))
+    for index in range(1, len(frame_sizes)):
+        grid = tuple(map(int, frame_sizes[index]))
+        if grid == current:
+            continue
+        runs.append((start, index, current))
+        start = index
+        current = grid
+    runs.append((start, len(frame_sizes), current))
+    return tuple(runs)
+
+
+def _batched_spatial_conv_maps(
+    tokens: torch.Tensor,
+    spatial_weight: torch.Tensor,
+    frame_sizes: Sequence[tuple[int, int]],
+    offsets: Sequence[tuple[int, int]],
+) -> tuple[list[torch.Tensor], list[tuple[int, int]], tuple[tuple[int, int, tuple[int, int]], ...]]:
+    """Run one grouped spatial convolution per contiguous grid domain.
+
+    Return the domain tensors directly rather than materializing a second
+    frame-by-frame copy. Cross-grid temporal taps address individual frames by
+    (run_index, local_index) views into these same tensors.
+    """
+    heads = int(tokens.shape[1])
+    head_dim = int(tokens.shape[2])
+    channels = heads * head_dim
+    runs = _contiguous_grid_runs(frame_sizes)
+    run_maps = []
+    frame_owner: list[tuple[int, int]] = [(-1, -1)] * len(frame_sizes)
+    for run_index, (start_frame, stop_frame, grid) in enumerate(runs):
+        grid_h, grid_w = grid
+        row_start = offsets[start_frame][0]
+        row_stop = offsets[stop_frame - 1][1]
+        frames = stop_frame - start_frame
+        expected_rows = frames * grid_h * grid_w
+        if row_stop - row_start != expected_rows:
+            raise RuntimeError("partitioned VDN batched spatial rows do not match frame geometry")
+        volume = (
+            tokens[row_start:row_stop]
+            .reshape(frames, grid_h, grid_w, channels)
+            .permute(0, 3, 1, 2)
+        )
+        run_maps.append(F.conv2d(volume, spatial_weight, padding=2, groups=channels))
+        for local_index, frame in enumerate(range(start_frame, stop_frame)):
+            frame_owner[frame] = (run_index, local_index)
+    if any(run_index < 0 for run_index, _local_index in frame_owner):
+        raise RuntimeError("partitioned VDN batched spatial mapping left an unowned frame")
+    return run_maps, frame_owner, runs
+
+
+def _heterogeneous_conv_features(
+    tokens: torch.Tensor,
+    spatial_weight: torch.Tensor,
+    temporal_weight: torch.Tensor,
+    frame_sizes: Sequence[tuple[int, int]],
+    offsets: Sequence[tuple[int, int]],
+    *,
+    l2norm: bool,
+    grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
+    suppress_cross_grid_temporal_taps: bool = False,
+    diagnostic_stats: dict[str, int] | None = None,
+) -> torch.Tensor:
+    """Equivalent variable-grid short-conv with domain-batched same-grid work.
+
+    Exact-prefix continuation has long contiguous target-prefix and source-suffix
+    runs. The former implementation launched one spatial conv and up to one
+    temporal operation per tap per frame. This keeps the same tap arithmetic and
+    H3 physical cross-grid mapping, but batches spatial convolution, temporal
+    accumulation and activation by contiguous grid domain. Only the few taps that
+    actually cross a grid boundary retain per-frame physical resampling.
+    """
+    run_maps, frame_owner, runs = _batched_spatial_conv_maps(
+        tokens,
+        spatial_weight,
+        frame_sizes,
+        offsets,
+    )
+    temporal = temporal_weight.squeeze(1)
+    if temporal.ndim != 2 or temporal.shape[1] <= 0 or temporal.shape[1] % 2 == 0:
+        raise RuntimeError("partitioned VDN temporal short-conv requires an odd depthwise kernel")
+    kernel = int(temporal.shape[1])
+    pad = kernel // 2
+    mixed_runs = [torch.zeros_like(run) for run in run_maps]
+
+    # Preserve tap accumulation order. Same-grid contributions use one tensor
+    # operation per domain/tap rather than one operation per frame/tap.
+    for tap in range(kernel):
+        temporal_offset = tap - pad
+        for run_index, ((start_frame, stop_frame, _grid), run) in enumerate(zip(runs, run_maps, strict=True)):
+            run_frames = stop_frame - start_frame
+            weight = temporal[:, tap].to(run.dtype).view(1, -1, 1, 1)
+            if temporal_offset < 0:
+                shift = -temporal_offset
+                if shift < run_frames:
+                    mixed_runs[run_index][shift:] += run[: run_frames - shift] * weight
+            elif temporal_offset > 0:
+                shift = temporal_offset
+                if shift < run_frames:
+                    mixed_runs[run_index][: run_frames - shift] += run[shift:] * weight
+            else:
+                mixed_runs[run_index] += run * weight
+
+        if temporal_offset == 0:
+            continue
+
+        # Only taps crossing a target-prefix/source-suffix grid boundary need
+        # physical coordinate transport. For a five-tap kernel this is bounded
+        # to the two frames nearest each side of each domain boundary.
+        for frame, grid in enumerate(frame_sizes):
+            source_frame = frame + temporal_offset
+            if source_frame < 0 or source_frame >= len(frame_sizes):
+                continue
+            if tuple(frame_sizes[source_frame]) == tuple(grid):
+                continue
+            target_h, target_w = grid
+            if suppress_cross_grid_temporal_taps:
+                if diagnostic_stats is not None:
+                    diagnostic_stats["suppressed_taps"] = diagnostic_stats.get("suppressed_taps", 0) + 1
+                    diagnostic_stats["suppressed_rows"] = (
+                        diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
+                    )
+                continue
+            source_run_index, source_local_index = frame_owner[source_frame]
+            source = _map_temporal_neighbor(
+                run_maps[source_run_index][source_local_index : source_local_index + 1],
+                (target_h, target_w),
+                grid_cache=grid_cache,
+            )
+            weight = temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
+            run_index, local_index = frame_owner[frame]
+            mixed_runs[run_index][local_index : local_index + 1] += source * weight
+
+    heads = int(tokens.shape[1])
+    head_dim = int(tokens.shape[2])
+    outputs = []
+    for (start_frame, stop_frame, grid), mixed in zip(runs, mixed_runs, strict=True):
+        target_h, target_w = grid
+        frames = stop_frame - start_frame
+        rows = target_h * target_w
+        run_tokens = (
+            mixed.permute(0, 2, 3, 1)
+            .reshape(frames * rows, heads, head_dim)
+        )
+        outputs.append(B._activate(run_tokens, l2norm=l2norm))
     return torch.cat(outputs, dim=0)
 
 
