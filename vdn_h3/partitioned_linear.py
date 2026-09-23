@@ -331,8 +331,8 @@ def _heterogeneous_conv_features(
     Exact-prefix continuation has long contiguous target-prefix and source-suffix
     runs. The former implementation launched one spatial conv and up to one
     temporal operation per tap per frame. This keeps the same tap arithmetic and
-    H3 physical cross-grid mapping, but batches spatial convolution by grid domain
-    and vectorizes same-grid temporal taps across each run. Only the few taps that
+    H3 physical cross-grid mapping, but batches spatial convolution, temporal
+    accumulation and activation by contiguous grid domain. Only the few taps that
     actually cross a grid boundary retain per-frame physical resampling.
     """
     maps = _batched_spatial_conv_maps(tokens, spatial_weight, frame_sizes, offsets)
@@ -341,37 +341,41 @@ def _heterogeneous_conv_features(
         raise RuntimeError("partitioned VDN temporal short-conv requires an odd depthwise kernel")
     kernel = int(temporal.shape[1])
     pad = kernel // 2
-    mixed = [item.new_zeros(item.shape) for item in maps]
     runs = _contiguous_grid_runs(frame_sizes)
+    run_maps = [torch.cat(maps[start:stop], dim=0) for start, stop, _grid in runs]
+    mixed_runs = [torch.zeros_like(run) for run in run_maps]
 
-    # Preserve tap accumulation order. Same-grid contributions are vectorized
-    # over every destination frame in one domain; cross-grid taps remain mapped
-    # individually on H3's physical lattice.
+    frame_owner: list[tuple[int, int]] = [(-1, -1)] * len(frame_sizes)
+    for run_index, (start_frame, stop_frame, _grid) in enumerate(runs):
+        for local_index, frame in enumerate(range(start_frame, stop_frame)):
+            frame_owner[frame] = (run_index, local_index)
+    if any(run_index < 0 for run_index, _local_index in frame_owner):
+        raise RuntimeError("partitioned VDN temporal batching left an unowned frame")
+
+    # Preserve tap accumulation order. Same-grid contributions use one tensor
+    # operation per domain/tap rather than one operation per frame/tap.
     for tap in range(kernel):
         temporal_offset = tap - pad
-        for start_frame, stop_frame, grid in runs:
-            run = torch.cat(maps[start_frame:stop_frame], dim=0)
+        for run_index, ((start_frame, stop_frame, _grid), run) in enumerate(zip(runs, run_maps, strict=True)):
             run_frames = stop_frame - start_frame
             weight = temporal[:, tap].to(run.dtype).view(1, -1, 1, 1)
             if temporal_offset < 0:
                 shift = -temporal_offset
                 if shift < run_frames:
-                    contribution = run[: run_frames - shift] * weight
-                    for local_index, frame in enumerate(range(start_frame + shift, stop_frame)):
-                        mixed[frame] += contribution[local_index : local_index + 1]
+                    mixed_runs[run_index][shift:] += run[: run_frames - shift] * weight
             elif temporal_offset > 0:
                 shift = temporal_offset
                 if shift < run_frames:
-                    contribution = run[shift:] * weight
-                    for local_index, frame in enumerate(range(start_frame, stop_frame - shift)):
-                        mixed[frame] += contribution[local_index : local_index + 1]
+                    mixed_runs[run_index][: run_frames - shift] += run[shift:] * weight
             else:
-                contribution = run * weight
-                for local_index, frame in enumerate(range(start_frame, stop_frame)):
-                    mixed[frame] += contribution[local_index : local_index + 1]
+                mixed_runs[run_index] += run * weight
 
         if temporal_offset == 0:
             continue
+
+        # Only taps crossing a target-prefix/source-suffix grid boundary need
+        # physical coordinate transport. For a five-tap kernel this is bounded
+        # to the two frames nearest each side of each domain boundary.
         for frame, grid in enumerate(frame_sizes):
             source_frame = frame + temporal_offset
             if source_frame < 0 or source_frame >= len(maps):
@@ -392,16 +396,21 @@ def _heterogeneous_conv_features(
                 grid_cache=grid_cache,
             )
             weight = temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
-            mixed[frame] += source * weight
+            run_index, local_index = frame_owner[frame]
+            mixed_runs[run_index][local_index : local_index + 1] += source * weight
 
-    outputs = []
     heads = int(tokens.shape[1])
     head_dim = int(tokens.shape[2])
-    for frame, grid in enumerate(frame_sizes):
+    outputs = []
+    for (start_frame, stop_frame, grid), mixed in zip(runs, mixed_runs, strict=True):
         target_h, target_w = grid
+        frames = stop_frame - start_frame
         rows = target_h * target_w
-        frame_tokens = mixed[frame][0].permute(1, 2, 0).reshape(rows, heads, head_dim)
-        outputs.append(B._activate(frame_tokens, l2norm=l2norm))
+        run_tokens = (
+            mixed.permute(0, 2, 3, 1)
+            .reshape(frames * rows, heads, head_dim)
+        )
+        outputs.append(B._activate(run_tokens, l2norm=l2norm))
     return torch.cat(outputs, dim=0)
 
 
