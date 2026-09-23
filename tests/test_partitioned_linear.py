@@ -5,6 +5,10 @@ import torch
 
 from vdn_h3.branch import LinearBranch
 from vdn_h3.partitioned_linear import (
+    _batched_frame_statistics,
+    _batched_output_readout,
+    _framewise_output_reference,
+    _framewise_statistics_reference,
     _h3_axis_coordinates,
     _heterogeneous_conv_features,
     _heterogeneous_conv_features_reference,
@@ -140,6 +144,98 @@ def test_batched_heterogeneous_suppression_matches_scalar_reference_and_stats():
     assert torch.allclose(batched, reference, rtol=2e-5, atol=2e-5)
     assert batched_stats == reference_stats
     assert batched_stats["suppressed_taps"] > 0
+
+
+def test_batched_heterogeneous_statistics_match_scalar_reference():
+    weights = _weights(seed=703)
+    branch = _branch(weights)
+    frame_sizes = ((4, 5),) * 5 + ((3, 4),) * 9
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+
+    x, _q, key, value = _inputs(cursor, seed=704)
+    beta_rows = torch.sigmoid(torch.nn.functional.linear(x, weights["beta_proj.weight"]))
+    measures = tuple(
+        0.55 + 0.45 * (index / max(1, len(frame_sizes) - 1))
+        for index in range(len(frame_sizes))
+    )
+
+    reference = _framewise_statistics_reference(
+        branch,
+        x,
+        key,
+        value,
+        beta_rows,
+        offsets,
+        measures,
+    )
+    batched = _batched_frame_statistics(
+        branch,
+        x,
+        key,
+        value,
+        beta_rows,
+        frame_sizes,
+        offsets,
+        measures,
+    )
+
+    for actual, expected in zip(batched, reference, strict=True):
+        assert actual.shape == expected.shape
+        assert torch.allclose(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+def test_batched_heterogeneous_output_matches_scalar_reference():
+    frame_sizes = ((4, 5),) * 5 + ((3, 4),) * 9
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+
+    generator = torch.Generator(device="cpu").manual_seed(705)
+    heads = 2
+    head_dim = 3
+    frames = len(frame_sizes)
+    query = torch.randn((cursor, heads, head_dim), generator=generator, dtype=torch.float32)
+    linear_state = torch.randn(
+        (frames, heads, head_dim, head_dim),
+        generator=generator,
+        dtype=torch.float32,
+    )
+    gate = torch.sigmoid(
+        torch.randn((cursor, heads * head_dim), generator=generator, dtype=torch.float32)
+    )
+    norm_weight = torch.randn((head_dim,), generator=generator, dtype=torch.float32).abs() + 0.5
+    eps = 1e-6
+
+    reference = _framewise_output_reference(
+        query,
+        linear_state,
+        gate,
+        offsets,
+        norm_weight,
+        eps,
+    )
+    batched = _batched_output_readout(
+        query,
+        linear_state,
+        gate,
+        frame_sizes,
+        offsets,
+        norm_weight,
+        eps,
+    )
+
+    assert batched.shape == reference.shape
+    assert torch.allclose(batched, reference, rtol=2e-5, atol=2e-5)
 
 
 def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid():
@@ -326,6 +422,7 @@ def test_variable_grid_linear_component_recorder_is_observational():
         "vdn_linear_output",
     ]
 
+
 def test_cross_grid_temporal_map_follows_h3_physical_rope_lattice():
     source_hw = (28, 38)
     target_hw = (20, 27)
@@ -381,7 +478,6 @@ def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
         )
         assert torch.allclose(actual_y, expected_y, rtol=0.0, atol=2e-6)
         assert torch.allclose(actual_x, expected_x, rtol=0.0, atol=2e-6)
-
 
 
 def test_cross_grid_temporal_diagnostic_suppresses_only_cross_domain_taps():
