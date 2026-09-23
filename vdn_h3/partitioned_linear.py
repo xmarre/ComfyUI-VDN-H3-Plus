@@ -381,7 +381,7 @@ def _heterogeneous_conv_features(
         # to the two frames nearest each side of each domain boundary.
         for frame, grid in enumerate(frame_sizes):
             source_frame = frame + temporal_offset
-            if source_frame < 0 or source_frame >= len(maps):
+            if source_frame < 0 or source_frame >= len(frame_sizes):
                 continue
             if tuple(frame_sizes[source_frame]) == tuple(grid):
                 continue
