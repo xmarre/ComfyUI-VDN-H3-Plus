@@ -455,6 +455,166 @@ def _variable_features(
     )
 
 
+def _framewise_statistics_reference(
+    branch,
+    x_video: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta_rows: torch.Tensor,
+    offsets: Sequence[tuple[int, int]],
+    measure_scales: Sequence[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Scalar-frame statistics oracle retained for batched equivalence coverage."""
+    a_frames = []
+    b_frames = []
+    means = []
+    for (start, stop), measure in zip(offsets, measure_scales, strict=True):
+        key_frame = key[start:stop].permute(1, 0, 2).unsqueeze(0)
+        value_frame = value[start:stop].permute(1, 0, 2).unsqueeze(0)
+        beta_frame = beta_rows[start:stop].transpose(0, 1).unsqueeze(0)
+        beta_frame = beta_frame * float(measure)
+        frame_a, frame_b = B.frame_statistics(
+            key_frame,
+            value_frame,
+            beta_frame,
+            a_fp32=branch.a_fp32,
+        )
+        a_frames.append(frame_a)
+        b_frames.append(frame_b)
+        means.append(x_video[start:stop].mean(dim=0, dtype=torch.float32))
+    return torch.cat(a_frames, dim=0), torch.cat(b_frames, dim=0), torch.stack(means, dim=0)
+
+
+def _batched_frame_statistics(
+    branch,
+    x_video: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    beta_rows: torch.Tensor,
+    frame_sizes: Sequence[tuple[int, int]],
+    offsets: Sequence[tuple[int, int]],
+    measure_scales: Sequence[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Batch frame statistics by contiguous equal-grid domain."""
+    heads = int(branch.num_heads)
+    head_dim = int(branch.head_dim)
+    a_runs = []
+    b_runs = []
+    mean_runs = []
+    for start_frame, stop_frame, grid in _contiguous_grid_runs(frame_sizes):
+        grid_h, grid_w = grid
+        rows = grid_h * grid_w
+        frames = stop_frame - start_frame
+        row_start = offsets[start_frame][0]
+        row_stop = offsets[stop_frame - 1][1]
+        expected_rows = frames * rows
+        if row_stop - row_start != expected_rows:
+            raise RuntimeError("partitioned VDN batched statistics rows do not match frame geometry")
+        key_run = (
+            key[row_start:row_stop]
+            .reshape(frames, rows, heads, head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        value_run = (
+            value[row_start:row_stop]
+            .reshape(frames, rows, heads, head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        beta_run = (
+            beta_rows[row_start:row_stop]
+            .reshape(frames, rows, heads)
+            .permute(0, 2, 1)
+        )
+        measure = torch.tensor(
+            measure_scales[start_frame:stop_frame],
+            device=beta_run.device,
+            dtype=beta_run.dtype,
+        ).view(frames, 1, 1)
+        beta_run = beta_run * measure
+        run_a, run_b = B.frame_statistics(
+            key_run,
+            value_run,
+            beta_run,
+            a_fp32=branch.a_fp32,
+        )
+        a_runs.append(run_a)
+        b_runs.append(run_b)
+        mean_runs.append(
+            x_video[row_start:row_stop]
+            .reshape(frames, rows, -1)
+            .mean(dim=1, dtype=torch.float32)
+        )
+    return torch.cat(a_runs, dim=0), torch.cat(b_runs, dim=0), torch.cat(mean_runs, dim=0)
+
+
+def _framewise_output_reference(
+    query: torch.Tensor,
+    linear_state: torch.Tensor,
+    gate: torch.Tensor,
+    offsets: Sequence[tuple[int, int]],
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Scalar-frame output oracle retained for batched equivalence coverage."""
+    outputs = []
+    for frame, (start, stop) in enumerate(offsets):
+        query_frame = query[start:stop].permute(1, 0, 2)
+        readout = torch.matmul(query_frame, linear_state[frame].transpose(-1, -2)).unsqueeze(0)
+        outputs.append(
+            B.linear_epilogue(
+                readout,
+                norm_weight,
+                gate[start:stop],
+                eps,
+                fuse=False,
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
+def _batched_output_readout(
+    query: torch.Tensor,
+    linear_state: torch.Tensor,
+    gate: torch.Tensor,
+    frame_sizes: Sequence[tuple[int, int]],
+    offsets: Sequence[tuple[int, int]],
+    norm_weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Batch the per-frame linear readout and epilogue by equal-grid domain."""
+    heads = int(query.shape[1])
+    head_dim = int(query.shape[2])
+    outputs = []
+    for start_frame, stop_frame, grid in _contiguous_grid_runs(frame_sizes):
+        grid_h, grid_w = grid
+        rows = grid_h * grid_w
+        frames = stop_frame - start_frame
+        row_start = offsets[start_frame][0]
+        row_stop = offsets[stop_frame - 1][1]
+        expected_rows = frames * rows
+        if row_stop - row_start != expected_rows:
+            raise RuntimeError("partitioned VDN batched output rows do not match frame geometry")
+        query_run = (
+            query[row_start:row_stop]
+            .reshape(frames, rows, heads, head_dim)
+            .permute(0, 2, 1, 3)
+        )
+        readout = torch.matmul(
+            query_run,
+            linear_state[start_frame:stop_frame].transpose(-1, -2),
+        )
+        outputs.append(
+            B.linear_epilogue(
+                readout,
+                norm_weight,
+                gate[row_start:row_stop],
+                eps,
+                fuse=False,
+            )
+        )
+    return torch.cat(outputs, dim=0)
+
+
 def _core_readout(
     branch,
     weights,
@@ -513,26 +673,16 @@ def _core_readout(
         if tuple(beta_rows.shape) != (x_video.shape[0], heads):
             raise RuntimeError("partitioned VDN beta projection has unexpected geometry")
 
-        a_frames = []
-        b_frames = []
-        means = []
-        for (start, stop), measure in zip(offsets, measure_scales, strict=True):
-            key_frame = key[start:stop].permute(1, 0, 2).unsqueeze(0)
-            value_frame = value[start:stop].permute(1, 0, 2).unsqueeze(0)
-            beta_frame = beta_rows[start:stop].transpose(0, 1).unsqueeze(0)
-            beta_frame = beta_frame * float(measure)
-            frame_a, frame_b = B.frame_statistics(
-                key_frame,
-                value_frame,
-                beta_frame,
-                a_fp32=branch.a_fp32,
-            )
-            a_frames.append(frame_a)
-            b_frames.append(frame_b)
-            means.append(x_video[start:stop].mean(dim=0, dtype=torch.float32))
-        a_raw = torch.cat(a_frames, dim=0)
-        b_raw = torch.cat(b_frames, dim=0)
-        frame_mean = torch.stack(means, dim=0)
+        a_raw, b_raw, frame_mean = _batched_frame_statistics(
+            branch,
+            x_video,
+            key,
+            value,
+            beta_rows,
+            frame_sizes,
+            offsets,
+            measure_scales,
+        )
         alpha = B.alpha_gate(
             frame_mean,
             weights["alpha.down.weight"],
@@ -596,7 +746,6 @@ def _core_readout(
             time.perf_counter() - gather_started,
         )
 
-    outputs = []
     epsilon_started = time.perf_counter()
     with component_span("vdn_linear_epsilon_scalar"):
         eps = weights["norm.weight"].new_tensor(1e-6).item()
@@ -607,19 +756,15 @@ def _core_readout(
         )
     output_started = time.perf_counter()
     with component_span("vdn_linear_output"):
-        for frame, (start, stop) in enumerate(offsets):
-            query_frame = query[start:stop].permute(1, 0, 2)
-            readout = torch.matmul(query_frame, linear_state[frame].transpose(-1, -2)).unsqueeze(0)
-            outputs.append(
-                B.linear_epilogue(
-                    readout,
-                    weights["norm.weight"],
-                    gate[start:stop],
-                    eps,
-                    fuse=False,
-                )
-            )
-        result = torch.cat(outputs, dim=0)
+        result = _batched_output_readout(
+            query,
+            linear_state,
+            gate,
+            frame_sizes,
+            offsets,
+            weights["norm.weight"],
+            eps,
+        )
     if record_component is not None:
         record_component(
             "vdn_linear_output_host_wall_s",
