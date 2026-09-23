@@ -234,7 +234,7 @@ def _heterogeneous_conv_features_reference(
         mixed = None
         for tap in range(kernel):
             source_frame = frame + tap - pad
-            if source_frame < 0 or source_frame >= len(maps):
+            if source_frame < 0 or source_frame >= len(frame_sizes):
                 continue
             if (
                 suppress_cross_grid_temporal_taps
@@ -246,9 +246,8 @@ def _heterogeneous_conv_features_reference(
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
-            source_run_index, source_local_index = frame_owner[source_frame]
             source = _map_temporal_neighbor(
-                run_maps[source_run_index][source_local_index : source_local_index + 1],
+                maps[source_frame],
                 (target_h, target_w),
                 grid_cache=grid_cache,
             )
@@ -394,8 +393,9 @@ def _heterogeneous_conv_features(
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
+            source_run_index, source_local_index = frame_owner[source_frame]
             source = _map_temporal_neighbor(
-                maps[source_frame],
+                run_maps[source_run_index][source_local_index : source_local_index + 1],
                 (target_h, target_w),
                 grid_cache=grid_cache,
             )
