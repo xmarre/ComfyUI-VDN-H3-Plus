@@ -383,24 +383,26 @@ def _heterogeneous_conv_features(
             source_frame = frame + temporal_offset
             if source_frame < 0 or source_frame >= len(frame_sizes):
                 continue
-            if tuple(frame_sizes[source_frame]) == tuple(grid):
+            source_run_index, source_local_index = frame_owner[source_frame]
+            run_index, local_index = frame_owner[frame]
+            if source_run_index == run_index:
+                # Same-run taps were already accumulated by the vectorized shifted add.
                 continue
             target_h, target_w = grid
-            if suppress_cross_grid_temporal_taps:
+            cross_grid = tuple(frame_sizes[source_frame]) != tuple(grid)
+            if suppress_cross_grid_temporal_taps and cross_grid:
                 if diagnostic_stats is not None:
                     diagnostic_stats["suppressed_taps"] = diagnostic_stats.get("suppressed_taps", 0) + 1
                     diagnostic_stats["suppressed_rows"] = (
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
-            source_run_index, source_local_index = frame_owner[source_frame]
             source = _map_temporal_neighbor(
                 run_maps[source_run_index][source_local_index : source_local_index + 1],
                 (target_h, target_w),
                 grid_cache=grid_cache,
             )
             weight = temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
-            run_index, local_index = frame_owner[frame]
             mixed_runs[run_index][local_index : local_index + 1] += source * weight
 
     heads = int(tokens.shape[1])
@@ -525,12 +527,17 @@ def _batched_frame_statistics(
             .reshape(frames, rows, heads)
             .permute(0, 2, 1)
         )
+        opmath_dtype = (
+            torch.float32
+            if beta_run.dtype in (torch.float16, torch.bfloat16)
+            else beta_run.dtype
+        )
         measure = torch.tensor(
             measure_scales[start_frame:stop_frame],
             device=beta_run.device,
-            dtype=beta_run.dtype,
+            dtype=opmath_dtype,
         ).view(frames, 1, 1)
-        beta_run = beta_run * measure
+        beta_run = (beta_run.to(opmath_dtype) * measure).to(beta_run.dtype)
         run_a, run_b = B.frame_statistics(
             key_run,
             value_run,
