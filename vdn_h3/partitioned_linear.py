@@ -246,8 +246,9 @@ def _heterogeneous_conv_features_reference(
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
+            source_run_index, source_local_index = frame_owner[source_frame]
             source = _map_temporal_neighbor(
-                maps[source_frame],
+                run_maps[source_run_index][source_local_index : source_local_index + 1],
                 (target_h, target_w),
                 grid_cache=grid_cache,
             )
@@ -287,13 +288,20 @@ def _batched_spatial_conv_maps(
     spatial_weight: torch.Tensor,
     frame_sizes: Sequence[tuple[int, int]],
     offsets: Sequence[tuple[int, int]],
-) -> list[torch.Tensor]:
-    """Run one grouped spatial convolution per contiguous grid domain."""
+) -> tuple[list[torch.Tensor], list[tuple[int, int]], tuple[tuple[int, int, tuple[int, int]], ...]]:
+    """Run one grouped spatial convolution per contiguous grid domain.
+
+    Return the domain tensors directly rather than materializing a second
+    frame-by-frame copy. Cross-grid temporal taps address individual frames by
+    (run_index, local_index) views into these same tensors.
+    """
     heads = int(tokens.shape[1])
     head_dim = int(tokens.shape[2])
     channels = heads * head_dim
-    maps: list[torch.Tensor | None] = [None] * len(frame_sizes)
-    for start_frame, stop_frame, grid in _contiguous_grid_runs(frame_sizes):
+    runs = _contiguous_grid_runs(frame_sizes)
+    run_maps = []
+    frame_owner: list[tuple[int, int]] = [(-1, -1)] * len(frame_sizes)
+    for run_index, (start_frame, stop_frame, grid) in enumerate(runs):
         grid_h, grid_w = grid
         row_start = offsets[start_frame][0]
         row_stop = offsets[stop_frame - 1][1]
@@ -306,12 +314,12 @@ def _batched_spatial_conv_maps(
             .reshape(frames, grid_h, grid_w, channels)
             .permute(0, 3, 1, 2)
         )
-        convolved = F.conv2d(volume, spatial_weight, padding=2, groups=channels)
+        run_maps.append(F.conv2d(volume, spatial_weight, padding=2, groups=channels))
         for local_index, frame in enumerate(range(start_frame, stop_frame)):
-            maps[frame] = convolved[local_index : local_index + 1]
-    if any(item is None for item in maps):
+            frame_owner[frame] = (run_index, local_index)
+    if any(run_index < 0 for run_index, _local_index in frame_owner):
         raise RuntimeError("partitioned VDN batched spatial mapping left an unowned frame")
-    return [item for item in maps if item is not None]
+    return run_maps, frame_owner, runs
 
 
 def _heterogeneous_conv_features(
@@ -335,22 +343,18 @@ def _heterogeneous_conv_features(
     accumulation and activation by contiguous grid domain. Only the few taps that
     actually cross a grid boundary retain per-frame physical resampling.
     """
-    maps = _batched_spatial_conv_maps(tokens, spatial_weight, frame_sizes, offsets)
+    run_maps, frame_owner, runs = _batched_spatial_conv_maps(
+        tokens,
+        spatial_weight,
+        frame_sizes,
+        offsets,
+    )
     temporal = temporal_weight.squeeze(1)
     if temporal.ndim != 2 or temporal.shape[1] <= 0 or temporal.shape[1] % 2 == 0:
         raise RuntimeError("partitioned VDN temporal short-conv requires an odd depthwise kernel")
     kernel = int(temporal.shape[1])
     pad = kernel // 2
-    runs = _contiguous_grid_runs(frame_sizes)
-    run_maps = [torch.cat(maps[start:stop], dim=0) for start, stop, _grid in runs]
     mixed_runs = [torch.zeros_like(run) for run in run_maps]
-
-    frame_owner: list[tuple[int, int]] = [(-1, -1)] * len(frame_sizes)
-    for run_index, (start_frame, stop_frame, _grid) in enumerate(runs):
-        for local_index, frame in enumerate(range(start_frame, stop_frame)):
-            frame_owner[frame] = (run_index, local_index)
-    if any(run_index < 0 for run_index, _local_index in frame_owner):
-        raise RuntimeError("partitioned VDN temporal batching left an unowned frame")
 
     # Preserve tap accumulation order. Same-grid contributions use one tensor
     # operation per domain/tap rather than one operation per frame/tap.
