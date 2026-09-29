@@ -599,6 +599,21 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         if raw_token_measure:
             measure_scales = tuple(1.0 for _ in measure_scales)
         linear_started = time.perf_counter()
+        from .boundary_witness import claim_feature_witness
+
+        observation = claim_feature_witness(
+            options, block_index=block_index, plan_digest=grouped.plan_digest,
+            mode=linear_diagnostic_mode,
+        )
+        if observation is not None:
+            observation.context.update(
+                skip_ends=(cfg["anchor_frames"] == "both"),
+                frame_index_origin=(1 if cfg["anchor_frames"] == "both" else 0),
+                short_conv=tuple(base_branch.short_conv or ()),
+                measure_scales=measure_scales,
+                feature_dtype=str(k_raw_video.dtype),
+                a_fp32=base_branch.a_fp32,
+            )
         readout = partitioned_linear_readout(
             base_branch,
             weights,
@@ -617,7 +632,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             diagnostic_stats=cross_grid_temporal_stats,
             record_component=record_component,
             cuda_span=cuda_span,
+            observation=observation,
         )
+        if observation is not None:
+            observation.finish()
         if cross_grid_temporal_stats is not None:
             _record_partitioned_cross_grid_temporal_suppression(
                 options,
@@ -733,6 +751,7 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
+    partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
