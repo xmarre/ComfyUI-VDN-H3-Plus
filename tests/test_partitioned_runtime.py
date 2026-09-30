@@ -279,6 +279,34 @@ def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
     assert wrapped._vdn_partitioned_temporal_carrier_short_conv_spec == _temporal_carrier_short_conv_spec(base_branch)
 
 
+def test_native_bridge_install_does_not_require_destination_stencil_capability():
+    base_branch = SimpleNamespace(
+        short_conv=(),
+        delta_rule="different_rule",
+        num_heads=56,
+        head_dim=128,
+        a_fp32=True,
+    )
+    block_index = 0
+    cfg = {}
+    head_dim = 128
+    heads = 56
+    k_norm = SimpleNamespace()
+    out_proj = SimpleNamespace()
+    q_norm = SimpleNamespace()
+    qkv_proj = SimpleNamespace()
+    state = SimpleNamespace()
+
+    def current(x, rope_freqs=None, transformer_options=None):
+        _ = (base_branch, block_index, cfg, head_dim, heads, k_norm, out_proj, q_norm, qkv_proj, state)
+        return x
+
+    current._vdn_forward = True
+    wrapped = _wrap_vdn_forward(current)
+    assert tuple(wrapped._vdn_partitioned_temporal_carrier_policies) == (VDN_TEMPORAL_CARRIER_NATIVE,)
+    assert wrapped._vdn_partitioned_temporal_carrier_short_conv_spec is None
+
+
 def test_destination_temporal_carrier_contract_binds_plan_diagnostic_and_checkpoint_spec():
     plan, _options, _layout, _values = _fixture()
     branch = SimpleNamespace(
