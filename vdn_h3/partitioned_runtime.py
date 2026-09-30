@@ -110,22 +110,11 @@ def _record_destination_grid_stencil(options, stats: dict[str, int], contract: d
     runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
     metrics = getattr(runtime, "metrics", None)
     increment = getattr(metrics, "increment", None)
-    event = getattr(metrics, "event", None)
     if callable(increment):
         increment("partitioned_vdn_destination_grid_stencil_calls")
         increment("partitioned_vdn_destination_grid_stencil_taps", taps)
         increment("partitioned_vdn_destination_grid_stencil_carriers", carriers)
         increment("partitioned_vdn_destination_grid_stencil_rows", rows)
-    if callable(event):
-        event(
-            "partitioned_vdn_temporal_carrier_applied",
-            policy=VDN_TEMPORAL_CARRIER_DESTINATION,
-            numerical_digest=contract["numerical_digest"],
-            cross_grid_taps=taps,
-            mapped_carriers=carriers,
-            mapped_carrier_rows=rows,
-            output_space_mutation=False,
-        )
 
 
 def _component_recorder(options):
