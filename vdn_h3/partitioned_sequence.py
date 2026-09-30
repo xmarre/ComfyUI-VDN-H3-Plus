@@ -64,8 +64,8 @@ class PartitionedSequence:
             raise ValueError("partitioned sequence requires a generated suffix")
         if self.source_grid_h > self.target_grid_h or self.source_grid_w > self.target_grid_w:
             raise ValueError("partitioned source grid exceeds target grid")
-        if self.source_rows >= self.target_rows:
-            raise ValueError("partitioned source grid must be strictly smaller")
+        if self.source_rows > self.target_rows:
+            raise ValueError("partitioned source grid must not exceed target grid")
 
     @property
     def source_rows(self):
