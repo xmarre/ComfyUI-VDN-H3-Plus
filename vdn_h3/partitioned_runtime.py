@@ -85,8 +85,10 @@ def _validate_destination_stencil_weights(branch, weights) -> None:
 
 
 def _resolve_temporal_carrier_policy(options, plan, diagnostic_mode, branch):
-    short_conv_spec = _temporal_carrier_short_conv_spec(branch)
     raw = options.get(VDN_TEMPORAL_CARRIER_KEY)
+    if raw is None:
+        return VDN_TEMPORAL_CARRIER_NATIVE, None, None
+    short_conv_spec = _temporal_carrier_short_conv_spec(branch)
     try:
         policy, contract = validate_temporal_carrier_contract(
             raw,
@@ -864,10 +866,18 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
-    partitioned_aware._vdn_partitioned_temporal_carrier_policies = VDN_TEMPORAL_CARRIER_POLICIES
-    partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = _temporal_carrier_short_conv_spec(
-        values["base_branch"]
-    )
+    try:
+        carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        carrier_spec = None
+    carrier_features = tuple(getattr(values["base_branch"], "short_conv", ()) or ())
+    if carrier_spec is not None and carrier_features:
+        partitioned_aware._vdn_partitioned_temporal_carrier_policies = VDN_TEMPORAL_CARRIER_POLICIES
+        partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = carrier_spec
+    else:
+        # Candidate capability must never make legacy/native bridge installation fail.
+        partitioned_aware._vdn_partitioned_temporal_carrier_policies = (VDN_TEMPORAL_CARRIER_NATIVE,)
+        partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = None
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
