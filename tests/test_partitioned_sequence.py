@@ -59,7 +59,7 @@ def test_flow_partition_contract_rejects_tampering_and_stale_rows():
         validate_flow_partition_contract(contract, sequence_rows=70)
 
 
-def test_partitioned_sequence_requires_smaller_source_and_generated_suffix():
+def test_partitioned_sequence_requires_generated_suffix_and_allows_equal_grid_control():
     with pytest.raises(ValueError, match="generated suffix"):
         PartitionedSequence(
             video_start=5,
@@ -70,13 +70,17 @@ def test_partitioned_sequence_requires_smaller_source_and_generated_suffix():
             target_grid_h=4,
             target_grid_w=4,
         )
-    with pytest.raises(ValueError, match="strictly smaller"):
-        PartitionedSequence(
-            video_start=5,
-            temporal=3,
-            prefix_t=1,
-            source_grid_h=4,
-            source_grid_w=4,
-            target_grid_h=4,
-            target_grid_w=4,
-        )
+
+    plan = PartitionedSequence(
+        video_start=5,
+        temporal=3,
+        prefix_t=1,
+        source_grid_h=4,
+        source_grid_w=4,
+        target_grid_h=4,
+        target_grid_w=4,
+    )
+    contract = plan.canonical_contract()
+    assert plan.prefix_log_key_measure == 0.0
+    assert contract["heterogeneous_spatial_domains"] is False
+    assert validate_flow_partition_contract(contract, sequence_rows=53) == plan
