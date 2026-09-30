@@ -9,6 +9,11 @@ from vdn_h3.partitioned_runtime import (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+    VDN_TEMPORAL_CARRIER_API,
+    VDN_TEMPORAL_CARRIER_DESTINATION,
+    VDN_TEMPORAL_CARRIER_KEY,
+    VDN_TEMPORAL_CARRIER_NATIVE,
+    VDN_TEMPORAL_CARRIER_POLICIES,
     _mixed_layout_matches_plan,
     _partitioned_linear_diagnostic_mode,
     _partitioned_query_summary,
@@ -16,11 +21,14 @@ from vdn_h3.partitioned_runtime import (
     _record_partitioned_linear_bypass,
     _record_partitioned_raw_token_measure,
     _resolve_partitioned_linear_runtime,
+    _resolve_temporal_carrier_policy,
+    _temporal_carrier_short_conv_spec,
     _wrap_vdn_forward,
 )
 from vdn_h3.partitioned_sequence import (
     PARTITIONED_PREFIX_KEY,
     PartitionedSequence,
+    make_temporal_carrier_contract,
     make_vdn_partitioned_external_contract,
 )
 
@@ -238,7 +246,13 @@ def test_partitioned_cross_grid_temporal_suppression_records_explicit_flow_metri
 
 
 def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
-    base_branch = SimpleNamespace()
+    base_branch = SimpleNamespace(
+        short_conv=("k", "v"),
+        delta_rule="vdn_solve",
+        num_heads=56,
+        head_dim=128,
+        a_fp32=True,
+    )
     block_index = 0
     cfg = {}
     head_dim = 128
@@ -260,3 +274,70 @@ def test_partitioned_linear_bridge_publishes_diagnostic_capability_api():
     assert tuple(wrapped._vdn_partitioned_linear_diagnostic_modes) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL in wrapped._vdn_partitioned_linear_diagnostic_modes
     assert VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE in wrapped._vdn_partitioned_linear_diagnostic_modes
+    assert wrapped._vdn_partitioned_temporal_carrier_api == VDN_TEMPORAL_CARRIER_API
+    assert tuple(wrapped._vdn_partitioned_temporal_carrier_policies) == VDN_TEMPORAL_CARRIER_POLICIES
+    assert wrapped._vdn_partitioned_temporal_carrier_short_conv_spec == _temporal_carrier_short_conv_spec(base_branch)
+
+
+def test_destination_temporal_carrier_contract_binds_plan_diagnostic_and_checkpoint_spec():
+    plan, _options, _layout, _values = _fixture()
+    branch = SimpleNamespace(
+        short_conv=("k", "v"),
+        delta_rule="vdn_solve",
+        num_heads=56,
+        head_dim=128,
+        a_fp32=True,
+    )
+    spec = _temporal_carrier_short_conv_spec(branch)
+    flow_digest = plan.canonical_contract()["semantic_digest"]
+    contract = make_temporal_carrier_contract(
+        policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+        flow_semantic_digest=flow_digest,
+        diagnostic_mode=VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+        short_conv_spec=spec,
+    )
+
+    policy, validated, resolved_spec = _resolve_temporal_carrier_policy(
+        {VDN_TEMPORAL_CARRIER_KEY: contract},
+        plan,
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+        branch,
+    )
+    assert policy == VDN_TEMPORAL_CARRIER_DESTINATION
+    assert validated == contract
+    assert resolved_spec == spec
+    assert len(contract["numerical_digest"]) == 64
+
+    native, absent, _ = _resolve_temporal_carrier_policy(
+        {},
+        plan,
+        VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+        branch,
+    )
+    assert native == VDN_TEMPORAL_CARRIER_NATIVE
+    assert absent is None
+
+    tampered = dict(contract)
+    tampered["numerical_digest"] = "0" * 64
+    import pytest
+
+    with pytest.raises(RuntimeError, match="numerical policy"):
+        _resolve_temporal_carrier_policy(
+            {VDN_TEMPORAL_CARRIER_KEY: tampered},
+            plan,
+            VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL,
+            branch,
+        )
+    with pytest.raises(RuntimeError, match="requires vdn_linear_diagnostic='normal'"):
+        suppression_contract = make_temporal_carrier_contract(
+            policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+            flow_semantic_digest=flow_digest,
+            diagnostic_mode=VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+            short_conv_spec=spec,
+        )
+        _resolve_temporal_carrier_policy(
+            {VDN_TEMPORAL_CARRIER_KEY: suppression_contract},
+            plan,
+            VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+            branch,
+        )
