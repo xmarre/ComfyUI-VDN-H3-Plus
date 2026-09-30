@@ -9,6 +9,11 @@ from vdn_h3.partitioned_runtime import (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS,
     VDN_TEMPORAL_CARRIER_API,
     VDN_TEMPORAL_CARRIER_DESTINATION,
     VDN_TEMPORAL_CARRIER_KEY,
@@ -16,8 +21,11 @@ from vdn_h3.partitioned_runtime import (
     VDN_TEMPORAL_CARRIER_POLICIES,
     _mixed_layout_matches_plan,
     _partitioned_linear_diagnostic_mode,
+    _partitioned_local_force_dense,
+    _partitioned_softmax_diagnostic_mode,
     _partitioned_query_summary,
     _record_partitioned_cross_grid_temporal_suppression,
+    _record_partitioned_dense_suffix_same_domain,
     _record_partitioned_linear_bypass,
     _record_partitioned_raw_token_measure,
     _resolve_partitioned_linear_runtime,
@@ -369,3 +377,92 @@ def test_destination_temporal_carrier_contract_binds_plan_diagnostic_and_checkpo
             VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
             branch,
         )
+
+
+def test_partitioned_softmax_diagnostic_defaults_to_normal_and_is_suffix_only():
+    assert _partitioned_softmax_diagnostic_mode({}) == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL
+    selected = {
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY:
+            VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    }
+    assert (
+        _partitioned_softmax_diagnostic_mode(selected)
+        == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
+    )
+
+    prefix = SimpleNamespace(query_prefix_domain=True)
+    suffix = SimpleNamespace(query_prefix_domain=False)
+    assert _partitioned_local_force_dense(
+        prefix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    ) == (True, False)
+    assert _partitioned_local_force_dense(
+        suffix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    ) == (False, False)
+    assert _partitioned_local_force_dense(
+        prefix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    ) == (True, False)
+    assert _partitioned_local_force_dense(
+        suffix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    ) == (True, True)
+
+
+def test_partitioned_softmax_diagnostic_rejects_unknown_mode():
+    import pytest
+
+    with pytest.raises(RuntimeError, match="partitioned VDN softmax diagnostic mode"):
+        _partitioned_softmax_diagnostic_mode(
+            {VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY: "invalid"}
+        )
+
+
+def test_partitioned_dense_suffix_records_explicit_flow_metrics():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+    metrics = Metrics()
+    options = {
+        "h3_flow_partitioned_stage_v1": SimpleNamespace(metrics=metrics),
+    }
+    _record_partitioned_dense_suffix_same_domain(options, q_rows=13, kv_rows=31)
+    _record_partitioned_dense_suffix_same_domain(options, q_rows=17, kv_rows=37)
+    assert metrics.values["partitioned_vdn_dense_suffix_same_domain_calls"] == 2
+    assert metrics.values["partitioned_vdn_dense_suffix_same_domain_q_rows"] == 30
+    assert metrics.values["partitioned_vdn_dense_suffix_same_domain_kv_rows"] == 68
+
+
+def test_partitioned_softmax_bridge_publishes_diagnostic_capability_api():
+    base_branch = SimpleNamespace(
+        short_conv=("k", "v"),
+        delta_rule="vdn_solve",
+        num_heads=56,
+        head_dim=128,
+        a_fp32=True,
+    )
+    block_index = 0
+    cfg = {}
+    head_dim = 128
+    heads = 56
+    k_norm = SimpleNamespace()
+    out_proj = SimpleNamespace()
+    q_norm = SimpleNamespace()
+    qkv_proj = SimpleNamespace()
+    state = SimpleNamespace()
+
+    def current(x, rope_freqs=None, transformer_options=None):
+        _ = (base_branch, block_index, cfg, head_dim, heads, k_norm, out_proj, q_norm, qkv_proj, state)
+        return x
+
+    current._vdn_forward = True
+    wrapped = _wrap_vdn_forward(current)
+    assert VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API == 1
+    assert wrapped._vdn_partitioned_softmax_diagnostic_api == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    assert tuple(wrapped._vdn_partitioned_softmax_diagnostic_modes) == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
+    assert VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX in wrapped._vdn_partitioned_softmax_diagnostic_modes
