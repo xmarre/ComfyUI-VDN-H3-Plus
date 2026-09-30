@@ -997,7 +997,8 @@ def partitioned_frame_contract(plan) -> tuple[tuple[tuple[int, int], ...], tuple
     temporal = int(plan.temporal)
     source_rows = int(plan.source_rows)
     target_rows = int(plan.target_rows)
-    if not 0 < prefix_t < temporal or not 0 < source_rows < target_rows:
+    # Flow's same-grid control is valid and carries unit physical measure.
+    if not 0 < prefix_t < temporal or not 0 < source_rows <= target_rows:
         raise RuntimeError("partitioned VDN linear received invalid Flow geometry")
     prefix_measure = source_rows / target_rows
     frame_sizes = (target,) * prefix_t + (source,) * (temporal - prefix_t)
