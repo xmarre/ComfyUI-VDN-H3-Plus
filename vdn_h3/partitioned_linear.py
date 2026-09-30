@@ -32,6 +32,11 @@ import torch.nn.functional as F
 
 from . import branch as B
 from .retained import run_scans_runtime
+from .partitioned_sequence import (
+    VDN_TEMPORAL_CARRIER_DESTINATION,
+    VDN_TEMPORAL_CARRIER_NATIVE,
+    VDN_TEMPORAL_CARRIER_POLICIES,
+)
 
 
 def _frame_offsets(frame_sizes: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
@@ -95,6 +100,22 @@ def _spatial_conv_frame(tokens: torch.Tensor, weight: torch.Tensor, grid: tuple[
     channels = heads * head_dim
     volume = tokens.reshape(grid_h, grid_w, channels).permute(2, 0, 1).unsqueeze(0)
     return F.conv2d(volume, weight, padding=2, groups=channels)
+
+
+def _raw_frame_volume(tokens: torch.Tensor, grid: tuple[int, int]) -> torch.Tensor:
+    grid_h, grid_w = map(int, grid)
+    rows, heads, head_dim = tokens.shape
+    if rows != grid_h * grid_w:
+        raise RuntimeError("partitioned VDN raw short-conv frame rows do not match its grid")
+    channels = heads * head_dim
+    return tokens.reshape(grid_h, grid_w, channels).permute(2, 0, 1).unsqueeze(0)
+
+
+def _validate_temporal_carrier_policy(policy: str) -> str:
+    policy = str(policy)
+    if policy not in VDN_TEMPORAL_CARRIER_POLICIES:
+        raise RuntimeError(f"unsupported partitioned VDN temporal-carrier policy {policy!r}")
+    return policy
 
 
 def _h3_axis_geometry(grid_h: int, grid_w: int, axis: int) -> tuple[int, float, float]:
@@ -217,8 +238,10 @@ def _heterogeneous_conv_features_reference(
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    temporal_carrier_policy: str = VDN_TEMPORAL_CARRIER_NATIVE,
 ) -> torch.Tensor:
     """Scalar-frame oracle retained for equivalence coverage of the batched path."""
+    temporal_carrier_policy = _validate_temporal_carrier_policy(temporal_carrier_policy)
     maps = [
         _spatial_conv_frame(tokens[start:stop], spatial_weight, grid)
         for (start, stop), grid in zip(offsets, frame_sizes, strict=True)
@@ -246,11 +269,23 @@ def _heterogeneous_conv_features_reference(
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
-            source = _map_temporal_neighbor(
-                maps[source_frame],
-                (target_h, target_w),
-                grid_cache=grid_cache,
-            )
+            cross_grid = tuple(frame_sizes[source_frame]) != tuple(grid)
+            if cross_grid and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+                start, stop = offsets[source_frame]
+                raw = _raw_frame_volume(tokens[start:stop], frame_sizes[source_frame])
+                mapped = _map_temporal_neighbor(
+                    raw,
+                    (target_h, target_w),
+                    grid_cache=grid_cache,
+                )
+                channels = int(spatial_weight.shape[0])
+                source = F.conv2d(mapped, spatial_weight, padding=2, groups=channels)
+            else:
+                source = _map_temporal_neighbor(
+                    maps[source_frame],
+                    (target_h, target_w),
+                    grid_cache=grid_cache,
+                )
             part = source * temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
             mixed = part if mixed is None else mixed + part
         if mixed is None:  # pragma: no cover - an odd kernel always includes the current frame
@@ -332,6 +367,8 @@ def _heterogeneous_conv_features(
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    temporal_carrier_policy: str = VDN_TEMPORAL_CARRIER_NATIVE,
+    carrier_stats: dict[str, int] | None = None,
     observation=None,
     feature_name=None,
 ) -> torch.Tensor:
@@ -344,6 +381,7 @@ def _heterogeneous_conv_features(
     accumulation and activation by contiguous grid domain. Only the few taps that
     actually cross a grid boundary retain per-frame physical resampling.
     """
+    temporal_carrier_policy = _validate_temporal_carrier_policy(temporal_carrier_policy)
     run_maps, frame_owner, runs = _batched_spatial_conv_maps(
         tokens,
         spatial_weight,
@@ -358,6 +396,7 @@ def _heterogeneous_conv_features(
     kernel = int(temporal.shape[1])
     pad = kernel // 2
     mixed_runs = [torch.zeros_like(run) for run in run_maps]
+    destination_cache: dict[tuple[int, tuple[int, int]], torch.Tensor] = {}
 
     # Preserve tap accumulation order. Same-grid contributions use one tensor
     # operation per domain/tap rather than one operation per frame/tap.
@@ -401,11 +440,33 @@ def _heterogeneous_conv_features(
                         diagnostic_stats.get("suppressed_rows", 0) + target_h * target_w
                     )
                 continue
-            source = _map_temporal_neighbor(
-                run_maps[source_run_index][source_local_index : source_local_index + 1],
-                (target_h, target_w),
-                grid_cache=grid_cache,
-            )
+            target_hw = (target_h, target_w)
+            if cross_grid and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+                cache_key = (source_frame, target_hw)
+                source = destination_cache.get(cache_key)
+                if source is None:
+                    source_start, source_stop = offsets[source_frame]
+                    raw = _raw_frame_volume(
+                        tokens[source_start:source_stop],
+                        frame_sizes[source_frame],
+                    )
+                    mapped = _map_temporal_neighbor(raw, target_hw, grid_cache=grid_cache)
+                    channels = int(spatial_weight.shape[0])
+                    source = F.conv2d(mapped, spatial_weight, padding=2, groups=channels)
+                    destination_cache[cache_key] = source
+                    if carrier_stats is not None:
+                        carrier_stats["mapped_carriers"] = carrier_stats.get("mapped_carriers", 0) + 1
+                        carrier_stats["mapped_carrier_rows"] = (
+                            carrier_stats.get("mapped_carrier_rows", 0) + target_h * target_w
+                        )
+                if carrier_stats is not None:
+                    carrier_stats["cross_grid_taps"] = carrier_stats.get("cross_grid_taps", 0) + 1
+            else:
+                source = _map_temporal_neighbor(
+                    run_maps[source_run_index][source_local_index : source_local_index + 1],
+                    target_hw,
+                    grid_cache=grid_cache,
+                )
             weight = temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
             part = source * weight
             if observation is not None and cross_grid:
@@ -440,6 +501,8 @@ def _variable_features(
     *,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    temporal_carrier_policy: str = VDN_TEMPORAL_CARRIER_NATIVE,
+    carrier_stats: dict[str, int] | None = None,
     observation=None,
 ):
     conv = tuple(getattr(branch, "short_conv", ()) or ())
@@ -463,6 +526,8 @@ def _variable_features(
             grid_cache=grid_cache,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            temporal_carrier_policy=temporal_carrier_policy,
+            carrier_stats=carrier_stats,
             observation=observation,
             feature_name=name,
         )
@@ -655,6 +720,8 @@ def _core_readout(
     text_v_raw=None,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    temporal_carrier_policy: str = VDN_TEMPORAL_CARRIER_NATIVE,
+    carrier_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
     observation=None,
@@ -692,6 +759,8 @@ def _core_readout(
             offsets,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            temporal_carrier_policy=temporal_carrier_policy,
+            carrier_stats=carrier_stats,
             observation=observation,
         )
     if record_component is not None:
@@ -825,6 +894,8 @@ def partitioned_linear_readout(
     skip_ends: bool = False,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    temporal_carrier_policy: str = VDN_TEMPORAL_CARRIER_NATIVE,
+    carrier_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
     observation=None,
@@ -874,6 +945,8 @@ def partitioned_linear_readout(
             text_v_raw=text_v_raw,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            temporal_carrier_policy=temporal_carrier_policy,
+            carrier_stats=carrier_stats,
             observation=observation,
             record_component=record_component,
             cuda_span=cuda_span,
@@ -902,6 +975,8 @@ def partitioned_linear_readout(
         text_v_raw=text_v_raw,
         suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
         diagnostic_stats=diagnostic_stats,
+        temporal_carrier_policy=temporal_carrier_policy,
+        carrier_stats=carrier_stats,
         observation=observation,
         record_component=record_component,
         cuda_span=cuda_span,
@@ -922,7 +997,8 @@ def partitioned_frame_contract(plan) -> tuple[tuple[tuple[int, int], ...], tuple
     temporal = int(plan.temporal)
     source_rows = int(plan.source_rows)
     target_rows = int(plan.target_rows)
-    if not 0 < prefix_t < temporal or not 0 < source_rows < target_rows:
+    # Flow's same-grid control is valid and carries unit physical measure.
+    if not 0 < prefix_t < temporal or not 0 < source_rows <= target_rows:
         raise RuntimeError("partitioned VDN linear received invalid Flow geometry")
     prefix_measure = source_rows / target_rows
     frame_sizes = (target,) * prefix_t + (source,) * (temporal - prefix_t)

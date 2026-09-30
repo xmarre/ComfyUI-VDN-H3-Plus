@@ -17,6 +17,11 @@ from vdn_h3.partitioned_linear import (
     partitioned_frame_contract,
     partitioned_linear_readout,
 )
+from vdn_h3.partitioned_sequence import (
+    PartitionedSequence,
+    VDN_TEMPORAL_CARRIER_DESTINATION,
+    VDN_TEMPORAL_CARRIER_NATIVE,
+)
 
 
 def _weights(*, hidden=5, heads=2, head_dim=3, rank=4, seed=91):
@@ -193,6 +198,126 @@ def test_batched_noncontiguous_same_grid_runs_match_scalar_reference(suppress):
     assert batched_stats == reference_stats
 
 
+def test_destination_grid_stencil_matches_independent_scalar_reference():
+    frame_sizes = ((4, 5),) * 4 + ((3, 4),) * 6
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+
+    generator = torch.Generator(device="cpu").manual_seed(709)
+    tokens = torch.randn((cursor, 2, 3), generator=generator, dtype=torch.float32)
+    channels = 6
+    spatial = torch.randn((channels, 1, 5, 5), generator=generator, dtype=torch.float32) * 0.05
+    temporal = torch.randn((channels, 1, 5), generator=generator, dtype=torch.float32) * 0.05
+    stats = {}
+
+    reference = _heterogeneous_conv_features_reference(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=True,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+    )
+    candidate = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=True,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+        carrier_stats=stats,
+    )
+
+    assert torch.allclose(candidate, reference, rtol=2e-5, atol=2e-5)
+    assert stats == {
+        "cross_grid_taps": 6,
+        "mapped_carriers": 4,
+        "mapped_carrier_rows": 64,
+    }
+
+
+def test_destination_grid_stencil_is_exact_noop_without_cross_grid_taps():
+    frame_sizes = ((3, 4),) * 5
+    offsets = tuple((index * 12, (index + 1) * 12) for index in range(5))
+    generator = torch.Generator(device="cpu").manual_seed(710)
+    tokens = torch.randn((60, 1, 2), generator=generator, dtype=torch.float32)
+    spatial = torch.randn((2, 1, 5, 5), generator=generator, dtype=torch.float32) * 0.05
+    temporal = torch.randn((2, 1, 5), generator=generator, dtype=torch.float32) * 0.05
+    stats = {}
+
+    native = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_NATIVE,
+    )
+    candidate = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+        carrier_stats=stats,
+    )
+
+    assert torch.equal(candidate, native)
+    assert stats == {}
+
+
+def test_destination_grid_stencil_changes_only_noncommuting_cross_grid_order():
+    frame_sizes = ((5, 7),) * 3 + ((3, 4),) * 4
+    offsets = []
+    cursor = 0
+    for grid_h, grid_w in frame_sizes:
+        next_cursor = cursor + grid_h * grid_w
+        offsets.append((cursor, next_cursor))
+        cursor = next_cursor
+    offsets = tuple(offsets)
+    generator = torch.Generator(device="cpu").manual_seed(711)
+    tokens = torch.randn((cursor, 1, 3), generator=generator, dtype=torch.float32)
+    spatial = torch.randn((3, 1, 5, 5), generator=generator, dtype=torch.float32) * 0.1
+    temporal = torch.randn((3, 1, 5), generator=generator, dtype=torch.float32) * 0.1
+
+    native = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_NATIVE,
+    )
+    candidate = _heterogeneous_conv_features(
+        tokens,
+        spatial,
+        temporal,
+        frame_sizes,
+        offsets,
+        l2norm=False,
+        temporal_carrier_policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+    )
+
+    # Frames beyond the five-tap radius never receive another grid and therefore
+    # remain bitwise on the audited native path; boundary-adjacent rows differ.
+    assert torch.equal(native[slice(*offsets[0])], candidate[slice(*offsets[0])])
+    assert torch.equal(native[slice(*offsets[-1])], candidate[slice(*offsets[-1])])
+    boundary_rows = slice(offsets[1][0], offsets[4][1])
+    assert not torch.equal(native[boundary_rows], candidate[boundary_rows])
+    assert torch.isfinite(candidate).all()
+
+
 def test_batched_heterogeneous_statistics_match_scalar_reference():
     weights = _weights(seed=703)
     branch = _branch(weights)
@@ -332,20 +457,36 @@ def test_batched_heterogeneous_output_matches_scalar_reference():
     assert torch.allclose(batched, reference, rtol=2e-5, atol=2e-5)
 
 
-def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid():
+@pytest.mark.parametrize("prefix_t", (1, 2, 3))
+@pytest.mark.parametrize("grid", ((2, 2), (2, 3)))
+@pytest.mark.parametrize("skip_ends", (False, True))
+def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid(prefix_t, grid, skip_ends):
     weights = _weights()
     branch = _branch(weights)
     frames = 4
-    grid = (2, 2)
+    plan = PartitionedSequence(
+        video_start=1,
+        temporal=frames,
+        prefix_t=prefix_t,
+        source_grid_h=grid[0],
+        source_grid_w=grid[1],
+        target_grid_h=grid[0],
+        target_grid_w=grid[1],
+    )
+    frame_sizes, measures = partitioned_frame_contract(plan)
+    assert frame_sizes == (grid,) * frames
+    assert measures == (1.0,) * frames
     rows_per_frame = grid[0] * grid[1]
     rows = frames * rows_per_frame
     bounds = ((0, 1), (0, 2), (1, 3), (2, 3))
     x, q, k, v = _inputs(rows)
 
-    released = branch._readout(
+    released = branch.readout(
         weights,
         x,
-        (q, k, v),
+        q,
+        k,
+        v,
         frames,
         rows_per_frame,
         bounds,
@@ -353,6 +494,7 @@ def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid():
         None,
         None,
         None,
+        skip_ends=skip_ends,
     )
     partitioned = partitioned_linear_readout(
         branch,
@@ -361,13 +503,30 @@ def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid():
         q,
         k,
         v,
-        frame_sizes=(grid,) * frames,
+        frame_sizes=frame_sizes,
         bounds=bounds,
-        measure_scales=(1.0,) * frames,
+        measure_scales=measures,
+        skip_ends=skip_ends,
     )
 
     assert partitioned.shape == released.shape
     assert torch.allclose(partitioned, released, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("prefix_t, source_rows", ((0, 4), (4, 4), (2, 0), (2, 5)))
+def test_partitioned_frame_contract_rejects_invalid_geometry(prefix_t, source_rows):
+    plan = SimpleNamespace(
+        target_grid_h=2,
+        target_grid_w=2,
+        source_grid_h=2,
+        source_grid_w=2,
+        prefix_t=prefix_t,
+        temporal=4,
+        target_rows=4,
+        source_rows=source_rows,
+    )
+    with pytest.raises(RuntimeError, match="invalid Flow geometry"):
+        partitioned_frame_contract(plan)
 
 
 def test_variable_grid_linear_runs_target_prefix_and_source_suffix_with_physical_measure():

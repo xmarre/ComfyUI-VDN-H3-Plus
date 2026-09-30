@@ -88,7 +88,7 @@ class FeatureWitness:
         self.sink.finish(self.context)
 
 
-def claim_feature_witness(options, *, block_index, plan_digest, mode):
+def claim_feature_witness(options, *, block_index, plan_digest, mode, policy="native_grid_then_map_v1"):
     sink = options.get(WITNESS_KEY)
     if sink is None:
         return None
@@ -102,6 +102,6 @@ def claim_feature_witness(options, *, block_index, plan_digest, mode):
         "block_index": block_index,
         "plan_digest": plan_digest,
         "diagnostic_mode": mode,
-        "policy": "native_grid_then_map_v1",
+        "policy": str(policy),
     }
     return FeatureWitness(sink, context) if sink.claim(context) else None

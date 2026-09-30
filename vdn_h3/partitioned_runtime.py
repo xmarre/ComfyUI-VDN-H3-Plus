@@ -27,8 +27,14 @@ from .partitioned_sequence import (
     PARTITIONED_PREFIX_TOPOLOGY,
     VDN_PARTITIONED_SEQUENCE_API,
     VDN_PARTITIONED_SEQUENCE_MODE,
+    VDN_TEMPORAL_CARRIER_API,
+    VDN_TEMPORAL_CARRIER_DESTINATION,
+    VDN_TEMPORAL_CARRIER_KEY,
+    VDN_TEMPORAL_CARRIER_NATIVE,
+    VDN_TEMPORAL_CARRIER_POLICIES,
     make_vdn_partitioned_external_contract,
     validate_flow_partition_contract,
+    validate_temporal_carrier_contract,
 )
 
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
@@ -46,7 +52,84 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
 )
+
+# Flow-owned discriminator for the remaining exact-prefix boundary defect.
+# It changes only the Sol execution mode of suffix local-query groups. The
+# grouped Q/K/V gather, key ranges, target-prefix measure bias and VDN linear
+# ownership remain identical to the normal path.
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic_v1"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+)
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
+
+
+def _temporal_carrier_short_conv_spec(branch) -> str:
+    conv = tuple(str(name) for name in (getattr(branch, "short_conv", ()) or ()))
+    if any(name not in {"q", "k", "v"} for name in conv) or len(set(conv)) != len(conv):
+        raise RuntimeError("partitioned VDN temporal-carrier checkpoint short-conv declaration is invalid")
+    if getattr(branch, "delta_rule", None) != "vdn_solve":
+        raise RuntimeError("partitioned VDN temporal-carrier policy requires the released vdn_solve rule")
+    return (
+        "vdn_solve_short_conv_v1|"
+        f"heads={int(branch.num_heads)}|head_dim={int(branch.head_dim)}|"
+        f"conv={','.join(conv)}|spatial=5x5|temporal=5|a_fp32={int(bool(branch.a_fp32))}"
+    )
+
+
+def _validate_destination_stencil_weights(branch, weights) -> None:
+    channels = int(branch.num_heads) * int(branch.head_dim)
+    conv = tuple(getattr(branch, "short_conv", ()) or ())
+    if not conv:
+        raise RuntimeError("destination-grid temporal stencil requires checkpoint short-conv features")
+    for name in conv:
+        spatial = weights.get(f"short_conv.{name}_sp.weight")
+        temporal = weights.get(f"short_conv.{name}_tm.weight")
+        if spatial is None or temporal is None:
+            raise RuntimeError(f"destination-grid temporal stencil is missing {name!r} short-conv weights")
+        if tuple(spatial.shape) != (channels, 1, 5, 5):
+            raise RuntimeError(f"destination-grid temporal stencil requires 5x5 depthwise {name!r} spatial weights")
+        if tuple(temporal.shape) != (channels, 1, 5):
+            raise RuntimeError(f"destination-grid temporal stencil requires five-tap depthwise {name!r} temporal weights")
+
+
+def _resolve_temporal_carrier_policy(options, plan, diagnostic_mode, branch):
+    raw = options.get(VDN_TEMPORAL_CARRIER_KEY)
+    if raw is None:
+        return VDN_TEMPORAL_CARRIER_NATIVE, None, None
+    short_conv_spec = _temporal_carrier_short_conv_spec(branch)
+    try:
+        policy, contract = validate_temporal_carrier_contract(
+            raw,
+            flow_semantic_digest=plan.canonical_contract()["semantic_digest"],
+            diagnostic_mode=diagnostic_mode,
+            short_conv_spec=short_conv_spec,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if policy == VDN_TEMPORAL_CARRIER_DESTINATION and diagnostic_mode != VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL:
+        raise RuntimeError("destination-grid temporal stencil requires vdn_linear_diagnostic='normal'")
+    return policy, contract, short_conv_spec
+
+
+def _record_destination_grid_stencil(options, stats: dict[str, int], contract: dict) -> None:
+    taps = int(stats.get("cross_grid_taps", 0))
+    carriers = int(stats.get("mapped_carriers", 0))
+    rows = int(stats.get("mapped_carrier_rows", 0))
+    if taps <= 0 or carriers <= 0 or rows <= 0:
+        raise RuntimeError("destination-grid temporal stencil executed without bounded cross-grid carrier work")
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_destination_grid_stencil_calls")
+        increment("partitioned_vdn_destination_grid_stencil_taps", taps)
+        increment("partitioned_vdn_destination_grid_stencil_carriers", carriers)
+        increment("partitioned_vdn_destination_grid_stencil_rows", rows)
 
 
 def _component_recorder(options):
@@ -82,6 +165,52 @@ def _resolve_partitioned_linear_runtime(layout, cfg, options: dict[str, Any]):
         would_run and mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
     )
     return bool(would_run and not bypassed), bypassed, mode
+
+
+def _partitioned_softmax_diagnostic_mode(options: dict[str, Any]) -> str:
+    raw = options.get(
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    )
+    if raw not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
+        raise RuntimeError(
+            "partitioned VDN softmax diagnostic mode must be one of "
+            f"{VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS!r}, got {raw!r}"
+        )
+    return str(raw)
+
+
+def _partitioned_local_force_dense(group, mode: str) -> tuple[bool, bool]:
+    """Return force_dense and diagnostic_suffix for one existing local group.
+
+    The group has already fixed the gathered Q/K/V domain and prefix measure.
+    This helper is intentionally downstream of that ownership so the diagnostic
+    can change only Sol sparse selection.
+    """
+
+    if mode not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
+        raise RuntimeError(f"unsupported partitioned VDN softmax diagnostic {mode!r}")
+    diagnostic_suffix = bool(
+        mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
+        and not bool(group.query_prefix_domain)
+    )
+    return bool(group.query_prefix_domain or diagnostic_suffix), diagnostic_suffix
+
+
+def _record_partitioned_dense_suffix_same_domain(
+    options: dict[str, Any],
+    *,
+    q_rows: int,
+    kv_rows: int,
+) -> None:
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if not callable(increment):
+        return
+    increment("partitioned_vdn_dense_suffix_same_domain_calls")
+    increment("partitioned_vdn_dense_suffix_same_domain_q_rows", int(q_rows))
+    increment("partitioned_vdn_dense_suffix_same_domain_kv_rows", int(kv_rows))
 
 
 def _record_partitioned_linear_bypass(options: dict[str, Any], video_rows: int) -> None:
@@ -350,6 +479,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         cfg,
         options,
     )
+    temporal_carrier_policy, temporal_carrier_contract, _short_conv_spec = _resolve_temporal_carrier_policy(
+        options,
+        plan,
+        linear_diagnostic_mode,
+        base_branch,
+    )
+    if temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION and not linear_active:
+        raise RuntimeError("destination-grid temporal stencil was selected but the learned linear branch is inactive")
     if linear_bypassed:
         _record_partitioned_linear_bypass(
             options,
@@ -435,6 +572,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         ) from exc
 
     scale = head_dim**-0.5
+    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
     raw_token_measure = (
         linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE
     )
@@ -503,6 +641,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             k_group = k[k_index]
             v_group = v[k_index]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
+            group,
+            softmax_diagnostic_mode,
+        )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[q_index] = partitioned_request_attention(
@@ -518,10 +660,16 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 prefix_log_key_measure=measure,
                 semantic_digest=semantic_digest,
                 query_position_map=wire,
-                # Target-prefix hidden rows become K/V context for every deeper
-                # block. Keep those query updates exact; suffix query groups use the
-                # mapped sparse Sol route.
-                force_dense=group.query_prefix_domain,
+                # Target-prefix hidden rows are always exact. The diagnostic arm
+                # forces only suffix local-query groups dense after the same
+                # grouped Q/K/V gather and measure bias have been fixed.
+                force_dense=force_dense,
+            )
+        if diagnostic_dense_suffix:
+            _record_partitioned_dense_suffix_same_domain(
+                options,
+                q_rows=group.q_rows,
+                kv_rows=group.kv_rows,
             )
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
         del q_group, k_group, v_group
@@ -588,6 +736,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     linear_added = False
     cross_grid_temporal_suppressed = False
     cross_grid_temporal_stats: dict[str, int] | None = None
+    temporal_carrier_stats: dict[str, int] | None = None
     if linear_active:
         from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
 
@@ -595,6 +744,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL
         )
         cross_grid_temporal_stats = {} if suppress_cross_grid_temporal else None
+        if temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+            if temporal_carrier_contract is None:
+                raise RuntimeError("destination-grid temporal stencil is missing its numerical-policy contract")
+            _validate_destination_stencil_weights(base_branch, weights)
+            temporal_carrier_stats = {}
         frame_sizes, measure_scales = partitioned_frame_contract(plan)
         if raw_token_measure:
             measure_scales = tuple(1.0 for _ in measure_scales)
@@ -602,8 +756,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         from .boundary_witness import claim_feature_witness
 
         observation = claim_feature_witness(
-            options, block_index=block_index, plan_digest=grouped.plan_digest,
+            options,
+            block_index=block_index,
+            plan_digest=grouped.plan_digest,
             mode=linear_diagnostic_mode,
+            policy=temporal_carrier_policy,
         )
         if observation is not None:
             observation.context.update(
@@ -613,6 +770,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 full_measure_scales=measure_scales,
                 feature_dtype=str(k_raw_video.dtype),
                 a_fp32=base_branch.a_fp32,
+                temporal_carrier_policy=temporal_carrier_policy,
+                temporal_carrier_numerical_digest=(
+                    temporal_carrier_contract["numerical_digest"] if temporal_carrier_contract is not None else None
+                ),
             )
         readout = partitioned_linear_readout(
             base_branch,
@@ -630,6 +791,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             skip_ends=(cfg["anchor_frames"] == "both"),
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal,
             diagnostic_stats=cross_grid_temporal_stats,
+            temporal_carrier_policy=temporal_carrier_policy,
+            carrier_stats=temporal_carrier_stats,
             record_component=record_component,
             cuda_span=cuda_span,
             observation=observation,
@@ -642,6 +805,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 cross_grid_temporal_stats,
             )
             cross_grid_temporal_suppressed = True
+        if temporal_carrier_stats is not None:
+            _record_destination_grid_stencil(
+                options,
+                temporal_carrier_stats,
+                temporal_carrier_contract,
+            )
         _record_component(
             record_component,
             "vdn_linear_readout_total_host_wall_s",
@@ -666,6 +835,21 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             _record_partitioned_raw_token_measure(options, plan)
 
     from .hybrid import _once
+
+    if softmax_diagnostic_mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+                linear_diagnostic_mode,
+            ),
+            "partitioned exact-prefix: suffix local-query groups use weighted dense Sol "
+            "over the unchanged gathered domain and target-prefix measure; "
+            f"softmax_diagnostic={softmax_diagnostic_mode}; "
+            f"linear_diagnostic={linear_diagnostic_mode}",
+        )
 
     if linear_bypassed:
         _once(
@@ -701,6 +885,19 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             "partitioned exact-prefix: grouped VDN softmax active; variable-grid linear complement "
             "active with cross-grid temporal short-conv taps diagnostic-suppressed; "
             f"diagnostic_mode={linear_diagnostic_mode}",
+        )
+    elif temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                VDN_TEMPORAL_CARRIER_DESTINATION,
+                temporal_carrier_contract["numerical_digest"],
+            ),
+            "partitioned exact-prefix: grouped VDN softmax and learned-linear complement active; "
+            "cross-grid temporal carriers use destination-grid spatial stencils; "
+            f"numerical_digest={temporal_carrier_contract['numerical_digest']}",
         )
     else:
         # Preserve the existing normal-path logging identity and wording exactly.
@@ -753,6 +950,21 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
+    partitioned_aware._vdn_partitioned_softmax_diagnostic_api = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
+    partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
+    try:
+        carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        carrier_spec = None
+    carrier_features = tuple(getattr(values["base_branch"], "short_conv", ()) or ())
+    if carrier_spec is not None and carrier_features:
+        partitioned_aware._vdn_partitioned_temporal_carrier_policies = VDN_TEMPORAL_CARRIER_POLICIES
+        partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = carrier_spec
+    else:
+        # Candidate capability must never make legacy/native bridge installation fail.
+        partitioned_aware._vdn_partitioned_temporal_carrier_policies = (VDN_TEMPORAL_CARRIER_NATIVE,)
+        partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = None
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
@@ -785,6 +997,16 @@ __all__ = [
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS",
+    "VDN_TEMPORAL_CARRIER_API",
+    "VDN_TEMPORAL_CARRIER_DESTINATION",
+    "VDN_TEMPORAL_CARRIER_KEY",
+    "VDN_TEMPORAL_CARRIER_NATIVE",
+    "VDN_TEMPORAL_CARRIER_POLICIES",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
 ]
