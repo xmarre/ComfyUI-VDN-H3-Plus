@@ -52,6 +52,19 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
 )
+
+# Flow-owned discriminator for the remaining exact-prefix boundary defect.
+# It changes only the Sol execution mode of suffix local-query groups. The
+# grouped Q/K/V gather, key ranges, target-prefix measure bias and VDN linear
+# ownership remain identical to the normal path.
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic_v1"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+)
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
 
@@ -152,6 +165,52 @@ def _resolve_partitioned_linear_runtime(layout, cfg, options: dict[str, Any]):
         would_run and mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS
     )
     return bool(would_run and not bypassed), bypassed, mode
+
+
+def _partitioned_softmax_diagnostic_mode(options: dict[str, Any]) -> str:
+    raw = options.get(
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+    )
+    if raw not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
+        raise RuntimeError(
+            "partitioned VDN softmax diagnostic mode must be one of "
+            f"{VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS!r}, got {raw!r}"
+        )
+    return str(raw)
+
+
+def _partitioned_local_force_dense(group, mode: str) -> tuple[bool, bool]:
+    """Return force_dense and diagnostic_suffix for one existing local group.
+
+    The group has already fixed the gathered Q/K/V domain and prefix measure.
+    This helper is intentionally downstream of that ownership so the diagnostic
+    can change only Sol sparse selection.
+    """
+
+    if mode not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
+        raise RuntimeError(f"unsupported partitioned VDN softmax diagnostic {mode!r}")
+    diagnostic_suffix = bool(
+        mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
+        and not bool(group.query_prefix_domain)
+    )
+    return bool(group.query_prefix_domain or diagnostic_suffix), diagnostic_suffix
+
+
+def _record_partitioned_dense_suffix_same_domain(
+    options: dict[str, Any],
+    *,
+    q_rows: int,
+    kv_rows: int,
+) -> None:
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if not callable(increment):
+        return
+    increment("partitioned_vdn_dense_suffix_same_domain_calls")
+    increment("partitioned_vdn_dense_suffix_same_domain_q_rows", int(q_rows))
+    increment("partitioned_vdn_dense_suffix_same_domain_kv_rows", int(kv_rows))
 
 
 def _record_partitioned_linear_bypass(options: dict[str, Any], video_rows: int) -> None:
@@ -513,6 +572,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         ) from exc
 
     scale = head_dim**-0.5
+    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
     raw_token_measure = (
         linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE
     )
@@ -581,6 +641,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             k_group = k[k_index]
             v_group = v[k_index]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
+            group,
+            softmax_diagnostic_mode,
+        )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[q_index] = partitioned_request_attention(
@@ -596,10 +660,16 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 prefix_log_key_measure=measure,
                 semantic_digest=semantic_digest,
                 query_position_map=wire,
-                # Target-prefix hidden rows become K/V context for every deeper
-                # block. Keep those query updates exact; suffix query groups use the
-                # mapped sparse Sol route.
-                force_dense=group.query_prefix_domain,
+                # Target-prefix hidden rows are always exact. The diagnostic arm
+                # forces only suffix local-query groups dense after the same
+                # grouped Q/K/V gather and measure bias have been fixed.
+                force_dense=force_dense,
+            )
+        if diagnostic_dense_suffix:
+            _record_partitioned_dense_suffix_same_domain(
+                options,
+                q_rows=group.q_rows,
+                kv_rows=group.kv_rows,
             )
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
         del q_group, k_group, v_group
@@ -766,6 +836,21 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     from .hybrid import _once
 
+    if softmax_diagnostic_mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+                linear_diagnostic_mode,
+            ),
+            "partitioned exact-prefix: suffix local-query groups use weighted dense Sol "
+            "over the unchanged gathered domain and target-prefix measure; "
+            f"softmax_diagnostic={softmax_diagnostic_mode}; "
+            f"linear_diagnostic={linear_diagnostic_mode}",
+        )
+
     if linear_bypassed:
         _once(
             (
@@ -865,6 +950,8 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
+    partitioned_aware._vdn_partitioned_softmax_diagnostic_api = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
     try:
         carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
@@ -910,6 +997,11 @@ __all__ = [
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL",
+    "VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS",
     "VDN_TEMPORAL_CARRIER_API",
     "VDN_TEMPORAL_CARRIER_DESTINATION",
     "VDN_TEMPORAL_CARRIER_KEY",
