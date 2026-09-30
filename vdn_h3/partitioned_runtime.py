@@ -27,8 +27,14 @@ from .partitioned_sequence import (
     PARTITIONED_PREFIX_TOPOLOGY,
     VDN_PARTITIONED_SEQUENCE_API,
     VDN_PARTITIONED_SEQUENCE_MODE,
+    VDN_TEMPORAL_CARRIER_API,
+    VDN_TEMPORAL_CARRIER_DESTINATION,
+    VDN_TEMPORAL_CARRIER_KEY,
+    VDN_TEMPORAL_CARRIER_NATIVE,
+    VDN_TEMPORAL_CARRIER_POLICIES,
     make_vdn_partitioned_external_contract,
     validate_flow_partition_contract,
+    validate_temporal_carrier_contract,
 )
 
 VDN_EXTERNAL_SEQUENCE_KEY = "vdn_h3_external_sequence_v1"
@@ -47,6 +53,79 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE,
 )
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
+
+
+def _temporal_carrier_short_conv_spec(branch) -> str:
+    conv = tuple(str(name) for name in (getattr(branch, "short_conv", ()) or ()))
+    if any(name not in {"q", "k", "v"} for name in conv) or len(set(conv)) != len(conv):
+        raise RuntimeError("partitioned VDN temporal-carrier checkpoint short-conv declaration is invalid")
+    if getattr(branch, "delta_rule", None) != "vdn_solve":
+        raise RuntimeError("partitioned VDN temporal-carrier policy requires the released vdn_solve rule")
+    return (
+        "vdn_solve_short_conv_v1|"
+        f"heads={int(branch.num_heads)}|head_dim={int(branch.head_dim)}|"
+        f"conv={','.join(conv)}|spatial=5x5|temporal=5|a_fp32={int(bool(branch.a_fp32))}"
+    )
+
+
+def _validate_destination_stencil_weights(branch, weights) -> None:
+    channels = int(branch.num_heads) * int(branch.head_dim)
+    conv = tuple(getattr(branch, "short_conv", ()) or ())
+    if not conv:
+        raise RuntimeError("destination-grid temporal stencil requires checkpoint short-conv features")
+    for name in conv:
+        spatial = weights.get(f"short_conv.{name}_sp.weight")
+        temporal = weights.get(f"short_conv.{name}_tm.weight")
+        if spatial is None or temporal is None:
+            raise RuntimeError(f"destination-grid temporal stencil is missing {name!r} short-conv weights")
+        if tuple(spatial.shape) != (channels, 1, 5, 5):
+            raise RuntimeError(f"destination-grid temporal stencil requires 5x5 depthwise {name!r} spatial weights")
+        if tuple(temporal.shape) != (channels, 1, 5):
+            raise RuntimeError(f"destination-grid temporal stencil requires five-tap depthwise {name!r} temporal weights")
+
+
+def _resolve_temporal_carrier_policy(options, plan, diagnostic_mode, branch):
+    short_conv_spec = _temporal_carrier_short_conv_spec(branch)
+    raw = options.get(VDN_TEMPORAL_CARRIER_KEY)
+    try:
+        policy, contract = validate_temporal_carrier_contract(
+            raw,
+            flow_semantic_digest=plan.canonical_contract()["semantic_digest"],
+            diagnostic_mode=diagnostic_mode,
+            short_conv_spec=short_conv_spec,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    if policy == VDN_TEMPORAL_CARRIER_DESTINATION and diagnostic_mode != VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL:
+        raise RuntimeError("destination-grid temporal stencil requires vdn_linear_diagnostic='normal'")
+    return policy, contract, short_conv_spec
+
+
+def _record_destination_grid_stencil(options, stats: dict[str, int], contract: dict) -> None:
+    taps = int(stats.get("cross_grid_taps", 0))
+    carriers = int(stats.get("mapped_carriers", 0))
+    rows = int(stats.get("mapped_carrier_rows", 0))
+    if taps <= 0 or carriers <= 0 or rows <= 0:
+        raise RuntimeError("destination-grid temporal stencil executed without bounded cross-grid carrier work")
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    event = getattr(metrics, "event", None)
+    if callable(increment):
+        increment("partitioned_vdn_destination_grid_stencil_calls")
+        increment("partitioned_vdn_destination_grid_stencil_taps", taps)
+        increment("partitioned_vdn_destination_grid_stencil_carriers", carriers)
+        increment("partitioned_vdn_destination_grid_stencil_rows", rows)
+    if callable(event):
+        event(
+            "partitioned_vdn_temporal_carrier_applied",
+            policy=VDN_TEMPORAL_CARRIER_DESTINATION,
+            numerical_digest=contract["numerical_digest"],
+            cross_grid_taps=taps,
+            mapped_carriers=carriers,
+            mapped_carrier_rows=rows,
+            output_space_mutation=False,
+        )
 
 
 def _component_recorder(options):
@@ -350,6 +429,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         cfg,
         options,
     )
+    temporal_carrier_policy, temporal_carrier_contract, _short_conv_spec = _resolve_temporal_carrier_policy(
+        options,
+        plan,
+        linear_diagnostic_mode,
+        base_branch,
+    )
+    if temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION and not linear_active:
+        raise RuntimeError("destination-grid temporal stencil was selected but the learned linear branch is inactive")
     if linear_bypassed:
         _record_partitioned_linear_bypass(
             options,
@@ -588,6 +675,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     linear_added = False
     cross_grid_temporal_suppressed = False
     cross_grid_temporal_stats: dict[str, int] | None = None
+    temporal_carrier_stats: dict[str, int] | None = None
     if linear_active:
         from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
 
@@ -595,6 +683,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL
         )
         cross_grid_temporal_stats = {} if suppress_cross_grid_temporal else None
+        if temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+            if temporal_carrier_contract is None:
+                raise RuntimeError("destination-grid temporal stencil is missing its numerical-policy contract")
+            _validate_destination_stencil_weights(base_branch, weights)
+            temporal_carrier_stats = {}
         frame_sizes, measure_scales = partitioned_frame_contract(plan)
         if raw_token_measure:
             measure_scales = tuple(1.0 for _ in measure_scales)
@@ -602,8 +695,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         from .boundary_witness import claim_feature_witness
 
         observation = claim_feature_witness(
-            options, block_index=block_index, plan_digest=grouped.plan_digest,
+            options,
+            block_index=block_index,
+            plan_digest=grouped.plan_digest,
             mode=linear_diagnostic_mode,
+            policy=temporal_carrier_policy,
         )
         if observation is not None:
             observation.context.update(
@@ -613,6 +709,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 full_measure_scales=measure_scales,
                 feature_dtype=str(k_raw_video.dtype),
                 a_fp32=base_branch.a_fp32,
+                temporal_carrier_policy=temporal_carrier_policy,
+                temporal_carrier_numerical_digest=(
+                    temporal_carrier_contract["numerical_digest"] if temporal_carrier_contract is not None else None
+                ),
             )
         readout = partitioned_linear_readout(
             base_branch,
@@ -630,6 +730,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             skip_ends=(cfg["anchor_frames"] == "both"),
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal,
             diagnostic_stats=cross_grid_temporal_stats,
+            temporal_carrier_policy=temporal_carrier_policy,
+            carrier_stats=temporal_carrier_stats,
             record_component=record_component,
             cuda_span=cuda_span,
             observation=observation,
@@ -642,6 +744,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 cross_grid_temporal_stats,
             )
             cross_grid_temporal_suppressed = True
+        if temporal_carrier_stats is not None:
+            _record_destination_grid_stencil(
+                options,
+                temporal_carrier_stats,
+                temporal_carrier_contract,
+            )
         _record_component(
             record_component,
             "vdn_linear_readout_total_host_wall_s",
@@ -702,6 +810,19 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             "active with cross-grid temporal short-conv taps diagnostic-suppressed; "
             f"diagnostic_mode={linear_diagnostic_mode}",
         )
+    elif temporal_carrier_policy == VDN_TEMPORAL_CARRIER_DESTINATION:
+        _once(
+            (
+                "partitioned-grouped-v4",
+                grouped.plan_digest,
+                block_index,
+                VDN_TEMPORAL_CARRIER_DESTINATION,
+                temporal_carrier_contract["numerical_digest"],
+            ),
+            "partitioned exact-prefix: grouped VDN softmax and learned-linear complement active; "
+            "cross-grid temporal carriers use destination-grid spatial stencils; "
+            f"numerical_digest={temporal_carrier_contract['numerical_digest']}",
+        )
     else:
         # Preserve the existing normal-path logging identity and wording exactly.
         _once(
@@ -753,6 +874,11 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
+    partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
+    partitioned_aware._vdn_partitioned_temporal_carrier_policies = VDN_TEMPORAL_CARRIER_POLICIES
+    partitioned_aware._vdn_partitioned_temporal_carrier_short_conv_spec = _temporal_carrier_short_conv_spec(
+        values["base_branch"]
+    )
     partitioned_aware._vdn_partitioned_released_forward = current
     partitioned_aware.vdn_query_position_plan_v1 = query_position_plan
     return partitioned_aware
@@ -785,6 +911,11 @@ __all__ = [
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_SUPPRESS_CROSS_GRID_TEMPORAL",
+    "VDN_TEMPORAL_CARRIER_API",
+    "VDN_TEMPORAL_CARRIER_DESTINATION",
+    "VDN_TEMPORAL_CARRIER_KEY",
+    "VDN_TEMPORAL_CARRIER_NATIVE",
+    "VDN_TEMPORAL_CARRIER_POLICIES",
     "install_partitioned_external_sequence_bridge",
     "validate_partitioned_external_execution",
 ]
