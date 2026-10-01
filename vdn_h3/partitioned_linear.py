@@ -784,6 +784,7 @@ def _core_readout(
             offsets,
             measure_scales,
         )
+        del key, value, beta_rows
         alpha = B.alpha_gate(
             frame_mean,
             weights["alpha.down.weight"],
@@ -793,6 +794,7 @@ def _core_readout(
             heads,
             head_dim,
         )
+        del frame_mean
     if record_component is not None:
         record_component(
             "vdn_linear_statistics_host_wall_s",
@@ -815,6 +817,7 @@ def _core_readout(
             b_raw,
             text_state=text_state,
         )
+        del a_raw, b_raw
     if record_component is not None:
         record_component(
             "vdn_linear_scans_host_wall_s",
@@ -844,6 +847,7 @@ def _core_readout(
             out_dtype=gate.dtype,
             fuse=False,
         )
+        del prefix_states, suffix_states
     if record_component is not None:
         record_component(
             "vdn_linear_gather_host_wall_s",
@@ -899,6 +903,7 @@ def partitioned_linear_readout(
     record_component=None,
     cuda_span=None,
     observation=None,
+    execution_stats: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Evaluate VDN's learned linear complement over heterogeneous frame grids."""
     total_started = time.perf_counter()
@@ -917,6 +922,56 @@ def partitioned_linear_readout(
     )
     heads = int(local.num_heads)
     head_dim = int(local.head_dim)
+
+    # Unit-measure, identical grids have the released fixed-grid arithmetic.
+    # Keep witnesses and diagnostic/carrier policies on the observable general
+    # path; q convolution is not implemented by the released readout.
+    conv = tuple(getattr(local, "short_conv", ()) or ())
+    channels = heads * head_dim
+    if (
+        isinstance(local, B.LinearBranch)
+        and all(tuple(grid) == tuple(frame_sizes[0]) for grid in frame_sizes)
+        and all(float(scale) == 1.0 for scale in measure_scales)
+        and all(t.is_contiguous() for t in (x_video, q_raw, k_raw, v_raw))
+        and (not skip_ends or len(frame_sizes) > 2)
+        and not suppress_cross_grid_temporal_taps
+        and diagnostic_stats is None
+        and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_NATIVE
+        and carrier_stats is None
+        and observation is None
+        and all(
+            name in {"k", "v"}
+            and getattr(weights.get(f"short_conv.{name}_sp.weight"), "shape", None) == (channels, 1, 5, 5)
+            and getattr(weights.get(f"short_conv.{name}_tm.weight"), "shape", None) == (channels, 1, 5)
+            for name in conv
+        )
+    ):
+        if skip_ends:
+            # The general path validates the trimmed readout domain as well.
+            # Bounds that cover only a removed anchor must still fail closed.
+            inner = slice(offsets[0][1], offsets[-1][0])
+            _validate_inputs(
+                local, x_video[inner], q_raw[inner], k_raw[inner], v_raw[inner],
+                frame_sizes[1:-1], tuple((lo - 1, hi - 1) for lo, hi in bounds[1:-1]),
+                measure_scales[1:-1],
+            )
+        native_started = time.perf_counter()
+        span = nullcontext() if cuda_span is None else cuda_span("vdn_linear_native_uniform")
+        with span:
+            result = local.readout(
+                weights, x_video, q_raw, k_raw, v_raw,
+                len(frame_sizes), frame_sizes[0][0] * frame_sizes[0][1], tuple(bounds),
+                frame_size=tuple(frame_sizes[0]), text_x=text_x,
+                text_k_raw=text_k_raw, text_v_raw=text_v_raw, skip_ends=skip_ends,
+            )
+        if execution_stats is not None:
+            execution_stats["native_uniform_calls"] = execution_stats.get("native_uniform_calls", 0) + 1
+            if local.fuse_epilogue:
+                execution_stats["native_uniform_fast_requested_calls"] = execution_stats.get("native_uniform_fast_requested_calls", 0) + 1
+        if record_component is not None:
+            record_component("vdn_linear_native_uniform_host_wall_s", time.perf_counter() - native_started)
+            record_component("vdn_linear_api_host_wall_s", time.perf_counter() - total_started)
+        return result
 
     if skip_ends:
         if len(frame_sizes) <= 2:
