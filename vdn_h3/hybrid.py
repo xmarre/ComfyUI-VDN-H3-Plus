@@ -5,6 +5,7 @@ import collections
 import contextvars
 import copy
 import logging
+import time
 import uuid
 
 import torch
@@ -469,7 +470,7 @@ def make_prepare_sampling_memory_wrapper(state):
 
     HIGH_VRAM can leave unrelated text encoders and VAEs resident after conditioning.
     Evict those unrelated models at the sampler-admission boundary while preserving
-    an already-loaded copy of this H3 ModelPatcher when possible. Core
+    resident patcher clones of this H3 model. Core
     prepare_sampling then reloads only models required for the current invocation.
     """
 
@@ -482,6 +483,8 @@ def make_prepare_sampling_memory_wrapper(state):
         force_full_load=False,
         force_offload=False,
     ):
+        prepare_started = None
+        stage = None
         if state.retain_buffers:
             device = torch.device(
                 getattr(
@@ -503,28 +506,54 @@ def make_prepare_sampling_memory_wrapper(state):
                 )
                 before_allocator = _cuda_allocator_snapshot()
                 keep_loaded = [comfy.model_management.LoadedModel(model)]
+                for loaded in tuple(comfy.model_management.current_loaded_models):
+                    resident = loaded.model
+                    if resident is not None and model.is_clone(resident):
+                        # LoadedModel equality compares patcher identity. A new
+                        # chunk's clone is unequal even when its weights remain
+                        # resident. Let Core detach/switch clones and reconcile
+                        # differing patches rather than fully unloading here.
+                        keep_loaded.append(loaded)
+                eviction_started = time.perf_counter()
                 unloaded = comfy.model_management.free_memory(
                     1e30,
                     device,
                     keep_loaded=keep_loaded,
                 )
+                eviction_elapsed_ms = (time.perf_counter() - eviction_started) * 1000.0
                 after_allocator = _cuda_allocator_snapshot()
                 _log.info(
                     "[vdn] sampling admission eviction stage=%s unloaded=%d "
+                    "kept_resident_h3=%d eviction_elapsed_ms=%.3f "
                     "allocator_before=%s allocator_after=%s",
                     stage,
                     len(unloaded),
+                    len(keep_loaded) - 1,
+                    eviction_elapsed_ms,
                     before_allocator,
                     after_allocator,
                 )
-        return executor(
-            model,
-            noise_shape,
-            conds,
-            model_options=model_options,
-            force_full_load=force_full_load,
-            force_offload=force_offload,
-        )
+                prepare_started = time.perf_counter()
+        success = False
+        try:
+            result = executor(
+                model,
+                noise_shape,
+                conds,
+                model_options=model_options,
+                force_full_load=force_full_load,
+                force_offload=force_offload,
+            )
+            success = True
+            return result
+        finally:
+            if prepare_started is not None:
+                _log.info(
+                    "[vdn] sampling preparation stage=%s success=%s prepare_elapsed_ms=%.3f",
+                    stage,
+                    success,
+                    (time.perf_counter() - prepare_started) * 1000.0,
+                )
 
     return wrap
 

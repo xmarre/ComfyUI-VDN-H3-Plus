@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -180,9 +181,10 @@ def test_prepare_sampling_memory_admission_evicts_unrelated_models_before_execut
     ]
 
 
-def test_prepare_sampling_memory_admission_is_inert_without_retained_buffers(monkeypatch):
-    state = SimpleNamespace(retain_buffers=False)
-    model = SimpleNamespace(load_device=torch.device("cuda"))
+@pytest.mark.parametrize("retained,device", [(False, "cuda"), (True, "cpu")])
+def test_prepare_sampling_memory_admission_is_inert_without_retained_buffers(monkeypatch, retained, device):
+    state = SimpleNamespace(retain_buffers=retained)
+    model = SimpleNamespace(load_device=torch.device(device))
     monkeypatch.setattr(
         "comfy.model_management.free_memory",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -198,3 +200,81 @@ def test_prepare_sampling_memory_admission_is_inert_without_retained_buffers(mon
         {},
         model_options={},
     ) == "prepared"
+
+
+@pytest.mark.parametrize("changed_weights", [False, True])
+def test_sampling_admission_keeps_resident_core_clones_for_native_switching(monkeypatch, caplog, changed_weights):
+    from comfy.model_management import LoadedModel
+    from comfy.model_patcher import ModelPatcher
+
+    device = torch.device("cuda")
+    base = ModelPatcher(nn.Linear(2, 2), load_device=device, offload_device=torch.device("cpu"))
+    resident = base.clone()
+    incoming = base.clone()
+    if changed_weights:
+        incoming.add_patches({"weight": (torch.ones_like(base.model.weight),)})
+    unrelated = ModelPatcher(nn.Linear(2, 2), load_device=device, offload_device=torch.device("cpu"))
+    loaded_resident = LoadedModel(resident)
+    loaded_unrelated = LoadedModel(unrelated)
+    # A dead weak reference must not become a keep-list entry.
+    dead = SimpleNamespace(model=None)
+    monkeypatch.setattr("comfy.model_management.current_loaded_models", [loaded_resident, loaded_unrelated, dead])
+    monkeypatch.setattr("vdn_h3.hybrid._cuda_allocator_snapshot", lambda: None)
+    clock = iter([1.0, 1.2, 2.0, 2.5])
+    monkeypatch.setattr("vdn_h3.hybrid.time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    caplog.set_level("INFO", logger="comfy.vdn")
+
+    assert incoming.is_clone(resident)
+    assert loaded_resident != LoadedModel(incoming)
+    assert (incoming.patches_uuid != resident.patches_uuid) is changed_weights
+    events = []
+
+    def free_memory(required, requested_device, keep_loaded):
+        assert required == 1e30 and requested_device == device
+        assert loaded_resident in keep_loaded
+        assert loaded_unrelated not in keep_loaded and dead not in keep_loaded
+        events.append("evict_unrelated")
+        return [loaded_unrelated]
+
+    monkeypatch.setattr("comfy.model_management.free_memory", free_memory)
+    options = {"transformer_options": {"h3_flow_stage": "low"}}
+    conds = {"positive": []}
+    sentinel = object()
+
+    def executor(model, shape, actual_conds, **kwargs):
+        # Core remains responsible for applying differing patches and clone detach.
+        assert model is incoming and actual_conds is conds and shape == (1, 2, 3)
+        assert kwargs == {"model_options": options, "force_full_load": True, "force_offload": True}
+        events.append("core_prepare")
+        return sentinel
+
+    wrapped = make_prepare_sampling_memory_wrapper(SimpleNamespace(retain_buffers=True))
+    assert wrapped(executor, incoming, (1, 2, 3), conds, model_options=options,
+                   force_full_load=True, force_offload=True) is sentinel
+    assert events == ["evict_unrelated", "core_prepare"]
+    assert "kept_resident_h3=1 eviction_elapsed_ms=200.000" in caplog.text
+    assert "stage=low success=True prepare_elapsed_ms=500.000" in caplog.text
+
+
+def test_sampling_preparation_failure_is_reported_and_propagated(monkeypatch, caplog):
+    from comfy.model_patcher import ModelPatcher
+
+    model = ModelPatcher(nn.Linear(2, 2), load_device=torch.device("cuda"),
+                         offload_device=torch.device("cpu"))
+    monkeypatch.setattr("comfy.model_management.current_loaded_models", [])
+    monkeypatch.setattr("vdn_h3.hybrid._cuda_allocator_snapshot", lambda: None)
+    monkeypatch.setattr("comfy.model_management.free_memory", lambda *_args, **_kwargs: [])
+    clock = iter([1.0, 1.0, 2.0, 2.25])
+    monkeypatch.setattr("vdn_h3.hybrid.time", SimpleNamespace(perf_counter=lambda: next(clock)))
+    caplog.set_level("INFO", logger="comfy.vdn")
+    failure = RuntimeError("native prepare failed")
+
+    def executor(*_args, **_kwargs):
+        raise failure
+
+    wrapped = make_prepare_sampling_memory_wrapper(SimpleNamespace(retain_buffers=True))
+    with pytest.raises(RuntimeError) as caught:
+        wrapped(executor, model, (), {},
+                model_options={"transformer_options": {"h3_flow_stage": "high"}})
+    assert caught.value is failure
+    assert "stage=high success=False prepare_elapsed_ms=250.000" in caplog.text
