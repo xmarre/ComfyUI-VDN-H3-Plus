@@ -549,6 +549,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             rot_dim=rot,
         )
         q, k = q4[0], k4[0]
+        del q4, k4
     else:
         q = q_norm(q_raw)
         k = k_norm(k_raw)
@@ -709,6 +710,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if covered_rows != grouped.sequence_rows:
         raise RuntimeError("partitioned VDN grouped queries do not cover the complete hidden sequence")
 
+    # The linear branch owns independent raw copies. Drop every remaining
+    # attention QKV view before weight prefetch and linear-workspace allocation.
+    del q, k, v, q_raw, k_raw
+
     weights_started = time.perf_counter()
     with cuda_span("vdn_weights"):
         weights = state.weights_on(block_index, device, dtype)
@@ -727,6 +732,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         else:
             flat = softmax_out.reshape(s, -1)
         out = out_proj(flat.type_as(x))
+        del softmax_out, flat
+        if cfg["enable_softmax_gate"]:
+            del gate
     _record_component(
         record_component,
         "vdn_softmax_epilogue_host_wall_s",
@@ -775,6 +783,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                     temporal_carrier_contract["numerical_digest"] if temporal_carrier_contract is not None else None
                 ),
             )
+        linear_execution_stats: dict[str, int] = {}
         readout = partitioned_linear_readout(
             base_branch,
             weights,
@@ -796,6 +805,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             record_component=record_component,
             cuda_span=cuda_span,
             observation=observation,
+            execution_stats=linear_execution_stats,
         )
         if observation is not None:
             observation.finish()
@@ -819,6 +829,16 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         expected_shape = (grouped.sequence_rows - grouped.video_start, heads * head_dim)
         if tuple(readout.shape) != expected_shape:
             raise RuntimeError("partitioned VDN linear complement returned incompatible rows")
+        metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+        increment = getattr(metrics, "increment", None)
+        if callable(increment):
+            for stat, counter in (
+                ("native_uniform_calls", "partitioned_vdn_uniform_linear_calls"),
+                ("native_uniform_fast_requested_calls", "partitioned_vdn_uniform_fast_requested_calls"),
+            ):
+                count = linear_execution_stats.get(stat, 0)
+                if count:
+                    increment(counter, count)
         linear_projection_started = time.perf_counter()
         with cuda_span("vdn_linear_projection"):
             out[grouped.video_start : grouped.sequence_rows] += F.linear(
