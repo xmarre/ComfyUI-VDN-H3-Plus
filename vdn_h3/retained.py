@@ -72,6 +72,8 @@ class RuntimeLinearBranch(B.LinearBranch):
 
         a, b = B.frame_statistics(
             key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
+        # Features and their views are no longer needed after frame statistics.
+        del key_by_frame, value_by_frame, key, value, beta
         frame_mean = xv.view(num_frames, tokens_per_frame, -1).mean(
             dim=1, dtype=torch.float32)
         alpha = B.alpha_gate(
@@ -83,10 +85,12 @@ class RuntimeLinearBranch(B.LinearBranch):
             n_heads,
             head_dim,
         )
+        del frame_mean
 
         text_state = self._text_state(w, text_x, text_k_raw, text_v_raw)
         prefix_states, suffix_states = run_scans_runtime(
             backend, alpha, a, b, text_state=text_state)
+        del a, b
 
         gate = torch.sigmoid(
             F.linear(xv, w["output_gate.down.weight"])
@@ -103,6 +107,7 @@ class RuntimeLinearBranch(B.LinearBranch):
             out_dtype=gate.dtype,
             fuse=self.fuse_epilogue,
         )
+        del prefix_states, suffix_states
 
         if query.dim() == 4:
             query_fhsd = query
@@ -110,6 +115,7 @@ class RuntimeLinearBranch(B.LinearBranch):
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(
             query_fhsd, linear_state.transpose(-1, -2))
+        del query_fhsd, query, linear_state
         return B.linear_epilogue(
             readout,
             w["norm.weight"],
