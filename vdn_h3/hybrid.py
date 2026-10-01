@@ -5,6 +5,7 @@ import collections
 import contextvars
 import copy
 import logging
+import time
 import uuid
 
 import torch
@@ -14,10 +15,12 @@ import comfy.ldm.common_dit
 import comfy.ldm.minimax.model as minimax_model
 import comfy.model_management
 import comfy.quant_ops
+import comfy.sampler_helpers
 from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_attention
 from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.query_positions import native_plan_summary
+from vdn_h3.policy import RETAINED_SAMPLING_HEADROOM_BYTES
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import full_coverage, window_bounds
@@ -32,6 +35,7 @@ VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
 
 FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_PARTITIONED_PROGRESSIVE_KEY = "h3_flow_partitioned_progressive_v1"
+SAMPLING_ADMISSION_POLICY = "bounded_headroom_v1"
 
 
 def _once(key, message):
@@ -464,14 +468,68 @@ def _cuda_allocator_snapshot():
         return None
 
 
-def make_prepare_sampling_memory_wrapper(state):
-    """Give retained VDN sampling exclusive GPU headroom without changing arithmetic.
+def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_models, device, stage):
+    # Core has now reconciled clones/patches and loaded conditioning, nested
+    # and hook-provided models. Reserve scratch without evicting that set.
+    memory_required, _minimum = comfy.sampler_helpers.estimate_memory(
+        model, noise_shape, conds,
+    )
+    _models, inference_memory = comfy.sampler_helpers.get_additional_models(
+        conds, model.model_dtype(),
+    )
+    required = max(
+        comfy.model_management.minimum_inference_memory(),
+        memory_required + inference_memory + comfy.model_management.extra_reserved_memory(),
+    ) + RETAINED_SAMPLING_HEADROOM_BYTES
 
-    HIGH_VRAM can leave unrelated text encoders and VAEs resident after conditioning.
-    Evict those unrelated models at the sampler-admission boundary while preserving
-    an already-loaded copy of this H3 ModelPatcher when possible. Core
-    prepare_sampling then reloads only models required for the current invocation.
-    """
+    required_models = dict.fromkeys([model, *additional_models])
+    for required_model in tuple(required_models):
+        required_models.update(dict.fromkeys(required_model.model_patches_models()))
+    keep_loaded = []
+    kept_resident_h3 = 0
+    for loaded in tuple(comfy.model_management.current_loaded_models):
+        resident = loaded.model
+        if resident is None or loaded.device != device:
+            continue
+        if any(required_model.is_clone(resident) for required_model in required_models):
+            keep_loaded.append(loaded)
+            kept_resident_h3 += int(model.is_clone(resident))
+
+    before_allocator = _cuda_allocator_snapshot()
+    free_before = comfy.model_management.get_free_memory(device)
+    eviction_started = time.perf_counter()
+    # Core's disable-smart-memory option ignores finite free_memory targets.
+    # Avoid calling it at all when the requested headroom already fits.
+    unloaded = (
+        comfy.model_management.free_memory(required, device, keep_loaded=keep_loaded)
+        if free_before < required else []
+    )
+    eviction_elapsed_ms = (time.perf_counter() - eviction_started) * 1000.0
+    after_allocator = _cuda_allocator_snapshot()
+    _log.info(
+        "[vdn] sampling admission policy=%s stage=%s unloaded=%d "
+        "kept_resident_h3=%d kept_required=%d eviction_elapsed_ms=%.3f "
+        "required_mib=%.3f free_before_mib=%.3f free_after_mib=%.3f "
+        "eviction_requested=%s unloaded_models=%s "
+        "allocator_before=%s allocator_after=%s",
+        SAMPLING_ADMISSION_POLICY,
+        stage,
+        len(unloaded),
+        kept_resident_h3,
+        len(keep_loaded),
+        eviction_elapsed_ms,
+        required / (1 << 20),
+        free_before / (1 << 20),
+        comfy.model_management.get_free_memory(device) / (1 << 20),
+        free_before < required,
+        tuple(type(item.model.model).__name__ for item in unloaded if item.model is not None),
+        before_allocator,
+        after_allocator,
+    )
+
+
+def make_prepare_sampling_memory_wrapper(state):
+    """Reserve finite retained headroom after Core prepares the required models."""
 
     def wrap(
         executor,
@@ -482,6 +540,8 @@ def make_prepare_sampling_memory_wrapper(state):
         force_full_load=False,
         force_offload=False,
     ):
+        prepare_started = None
+        stage = None
         if state.retain_buffers:
             device = torch.device(
                 getattr(
@@ -501,30 +561,43 @@ def make_prepare_sampling_memory_wrapper(state):
                     if isinstance(transformer, dict)
                     else None
                 )
-                before_allocator = _cuda_allocator_snapshot()
-                keep_loaded = [comfy.model_management.LoadedModel(model)]
-                unloaded = comfy.model_management.free_memory(
-                    1e30,
-                    device,
-                    keep_loaded=keep_loaded,
-                )
-                after_allocator = _cuda_allocator_snapshot()
+                prepare_started = time.perf_counter()
+        success = False
+        try:
+            result = executor(
+                model,
+                noise_shape,
+                conds,
+                model_options=model_options,
+                force_full_load=force_full_load,
+                force_offload=force_offload,
+            )
+            success = True
+        finally:
+            if prepare_started is not None:
                 _log.info(
-                    "[vdn] sampling admission eviction stage=%s unloaded=%d "
-                    "allocator_before=%s allocator_after=%s",
+                    "[vdn] sampling preparation stage=%s success=%s prepare_elapsed_ms=%.3f",
                     stage,
-                    len(unloaded),
-                    before_allocator,
-                    after_allocator,
+                    success,
+                    (time.perf_counter() - prepare_started) * 1000.0,
                 )
-        return executor(
-            model,
-            noise_shape,
-            conds,
-            model_options=model_options,
-            force_full_load=force_full_load,
-            force_offload=force_offload,
-        )
+        if prepare_started is None:
+            return result
+
+        prepared_conds, additional_models = result[1:]
+        try:
+            _reserve_prepared_sampling_memory(
+                model, noise_shape, prepared_conds, additional_models, device, stage,
+            )
+        except BaseException:
+            # Core has not returned this prepared set to the sampler's cleanup
+            # lifetime yet. Release additional-model execution state on failure.
+            try:
+                comfy.sampler_helpers.cleanup_models(prepared_conds, additional_models)
+            except BaseException:
+                _log.exception("[vdn] additional-model cleanup failed after sampling admission failure")
+            raise
+        return result
 
     return wrap
 
@@ -626,3 +699,11 @@ def apply_vdn(new_model, state):
     )
     new_model.add_wrapper_with_key(
         WrappersMP.OUTER_SAMPLE, "vdn_h3_runtime_release", make_outer_release_wrapper(state))
+    _log.info(
+        "[vdn] sampling admission installed policy=%s retained_buffers=%s "
+        "fast_kernels=%s module_file=%s",
+        SAMPLING_ADMISSION_POLICY,
+        state.retain_buffers,
+        getattr(state.branches[0], "fuse_epilogue", None),
+        __file__,
+    )
