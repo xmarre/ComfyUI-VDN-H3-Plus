@@ -82,6 +82,20 @@ reference exclusion, original argument/result identity and failure propagation.
 Runtime timings and output comparison are required to qualify a speed or
 generated-quality change.
 
+## Adapter activation workspace
+
+In inference, a VDN low-rank post-forward hook adds the module output into its
+newly allocated projection delta when both are ordinary tensors with identical
+shape, dtype and strides. This avoids a third output-sized allocation while
+preserving the module output, including aliases retained by earlier hooks or
+the caller. The factors and bias cached at injection remain read-only.
+
+Gradient-enabled calls, tensor subclasses, differing layouts, dtype promotion,
+broadcast outputs and bias-only hooks retain out-of-place addition. Bias-only
+hooks cannot reuse the delta because that tensor belongs to the factor cache.
+Projection math, compiled factor scaling, strengths and hook order are unchanged.
+This local storage correction does not make admission a worst-case peak bound.
+
 ## Patcher application
 
 For this stacked draft, retain overlays #33 -> #34 -> #35 -> #36 on the existing
