@@ -549,6 +549,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             rot_dim=rot,
         )
         q, k = q4[0], k4[0]
+        del q4, k4
     else:
         q = q_norm(q_raw)
         k = k_norm(k_raw)
@@ -615,6 +616,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         del q_global
 
     owner = state.query_position_owner_generation
+    if grouped.groups:
+        # Keep one block-local pair, as in native grouped attention. Do not
+        # retain it across the subsequent linear/MLP workspace lifetime.
+        max_kv_rows = max(group.kv_rows for group in grouped.groups)
+        with cuda_span("vdn_gather"):
+            k_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=k.dtype)
+            v_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=v.dtype)
+            k_scratch[:grouped.video_start].copy_(k[:grouped.video_start])
+            v_scratch[:grouped.video_start].copy_(v[:grouped.video_start])
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
@@ -624,22 +634,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 resources=resources,
                 identity=(*index_identity, "q", group.group_index),
             )
-            global_range = ((0, grouped.video_start),) if grouped.video_start else ()
             k_index = _indices_from_ranges(
-                (*global_range, *group.key_ranges),
+                group.key_ranges,
                 device=device,
                 resources=resources,
-                identity=(*index_identity, "k", group.group_index),
+                identity=(*index_identity, "k_window", group.group_index),
             )
-            if q_index.numel() != group.q_rows or k_index.numel() != group.kv_rows:
+            if q_index.numel() != group.q_rows or grouped.video_start + k_index.numel() != group.kv_rows:
                 raise RuntimeError(
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
             q_group = q[q_index]
-            k_group = k[k_index]
-            v_group = v[k_index]
+            torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
+            torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
+            k_group = k_scratch[:group.kv_rows]
+            v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
         force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
             group,
@@ -674,6 +685,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
         del q_group, k_group, v_group
         covered_rows += group.q_rows
+    if grouped.groups:
+        del k_scratch, v_scratch
 
     if grouped.anchor_slices:
         gather_started = time.perf_counter()
@@ -709,6 +722,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if covered_rows != grouped.sequence_rows:
         raise RuntimeError("partitioned VDN grouped queries do not cover the complete hidden sequence")
 
+    # The linear branch owns independent raw copies. Drop every remaining
+    # attention QKV view before weight prefetch and linear-workspace allocation.
+    del q, k, v, q_raw, k_raw
+
     weights_started = time.perf_counter()
     with cuda_span("vdn_weights"):
         weights = state.weights_on(block_index, device, dtype)
@@ -727,6 +744,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         else:
             flat = softmax_out.reshape(s, -1)
         out = out_proj(flat.type_as(x))
+        del softmax_out, flat
+        if cfg["enable_softmax_gate"]:
+            del gate
     _record_component(
         record_component,
         "vdn_softmax_epilogue_host_wall_s",
@@ -775,6 +795,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                     temporal_carrier_contract["numerical_digest"] if temporal_carrier_contract is not None else None
                 ),
             )
+        linear_execution_stats: dict[str, int] = {}
         readout = partitioned_linear_readout(
             base_branch,
             weights,
@@ -796,6 +817,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             record_component=record_component,
             cuda_span=cuda_span,
             observation=observation,
+            execution_stats=linear_execution_stats,
         )
         if observation is not None:
             observation.finish()
@@ -819,6 +841,16 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         expected_shape = (grouped.sequence_rows - grouped.video_start, heads * head_dim)
         if tuple(readout.shape) != expected_shape:
             raise RuntimeError("partitioned VDN linear complement returned incompatible rows")
+        metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+        increment = getattr(metrics, "increment", None)
+        if callable(increment):
+            for stat, counter in (
+                ("native_uniform_calls", "partitioned_vdn_uniform_linear_calls"),
+                ("native_uniform_fast_requested_calls", "partitioned_vdn_uniform_fast_requested_calls"),
+            ):
+                count = linear_execution_stats.get(stat, 0)
+                if count:
+                    increment(counter, count)
         linear_projection_started = time.perf_counter()
         with cuda_span("vdn_linear_projection"):
             out[grouped.video_start : grouped.sequence_rows] += F.linear(

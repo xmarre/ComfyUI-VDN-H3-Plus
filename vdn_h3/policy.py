@@ -16,6 +16,7 @@ from vdn_h3 import spec
 
 _log = logging.getLogger("comfy.vdn")
 _GIB = 1 << 30
+RETAINED_SAMPLING_HEADROOM_BYTES = 10 * _GIB
 
 
 def branch_candidates(path):
@@ -81,7 +82,7 @@ def auto_retain_policy(path, prefer_int8, free_bytes):
     """Adopt upstream's stage-size + 10 GiB scratch-retention headroom rule."""
     branch_path = select_branch_file(path, prefer_int8=prefer_int8)
     size = os.path.getsize(branch_path) if os.path.isfile(branch_path) else 0
-    retain = free_bytes >= size + 10 * _GIB
+    retain = free_bytes >= size + RETAINED_SAMPLING_HEADROOM_BYTES
     _log.info(
         "[vdn] retain_buffers=auto: %s (%.1f GiB free; branch %.2f GiB + 10 GiB)",
         "retained" if retain else "transient",
