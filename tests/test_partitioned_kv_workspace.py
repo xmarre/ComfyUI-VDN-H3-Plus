@@ -17,8 +17,9 @@ from vdn_h3.partitioned_sequence import (
 
 
 @pytest.mark.parametrize("same_grid,anchor,sink", [
-    (True, "none", 0), (True, "both", 5),
-    (False, "none", 5), (False, "both", 0),
+    (True, "none", 1), (True, "both", 5),
+    (False, "none", 5), (False, "both", 1),
+    (False, "rows", 5), (True, "columns", 5),
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_grid, anchor, sink, dtype):
@@ -60,7 +61,7 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
     def dense(q, k, v, bias):
         return F.scaled_dot_product_attention(
             q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None],
-            attn_mask=bias, scale=head_dim ** -0.5,
+            attn_mask=None if bias is None else bias.reshape(1, 1, 1, -1), scale=head_dim ** -0.5,
         )[0].transpose(0, 1)
 
     def attention(q, k, v, **kwargs):
@@ -122,12 +123,12 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
     if sink:
         expected[:sink] = dense(expected_q[:sink], expected_k, expected_v, full_bias)
     for frame, rows in enumerate(frame_rows):
-        if anchor == "both" and frame in (0, plan.temporal - 1):
+        if anchor in ("rows", "both") and frame in (0, plan.temporal - 1):
             keys = list(range(plan.sequence_rows))
         else:
             lo, hi = layout.bounds[frame]
             frames = set(range(max(0, lo), min(plan.temporal - 1, hi) + 1))
-            if anchor == "both":
+            if anchor in ("columns", "both"):
                 frames.update((0, plan.temporal - 1))
             keys = list(range(sink)) + [row for f in sorted(frames) for row in frame_rows[f]]
         expected[rows] = dense(expected_q[rows], expected_k[keys], expected_v[keys], full_bias[keys])
