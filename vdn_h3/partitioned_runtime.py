@@ -518,9 +518,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         # Keep only its projected result through softmax, rather than three
         # full-size raw video copies. Diagnostic and mixed-grid paths stay late.
         resources.release_activation_scratch()
-        linear_started = time.perf_counter()
+        weights_started = time.perf_counter()
         with cuda_span("vdn_weights"):
             weights = state.weights_on(block_index, device, dtype, prefetch_next=False)
+        _record_component(record_component, "vdn_weights_host_wall_s", weights_started)
         if base_branch.enable_text_state and int(layout.text_len):
             text_start = int(layout.text_start)
             text_end = text_start + int(layout.text_len)
@@ -529,29 +530,34 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             text_x = x[text_start:text_end]
             text_k_raw = k_raw[text_start:text_end]
             text_v_raw = v[text_start:text_end]
-        with cuda_span("vdn_linear_native_uniform"):
-            from .partitioned_linear import partitioned_linear_readout
+        from .partitioned_linear import partitioned_linear_readout
 
-            linear_execution_stats = {}
-            readout = partitioned_linear_readout(
-                base_branch,
-                weights, x[grouped.video_start:], q_raw[grouped.video_start:],
-                k_raw[grouped.video_start:], v[grouped.video_start:],
-                frame_sizes=((plan.source_grid_h, plan.source_grid_w),) * plan.temporal,
-                bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
-                measure_scales=(1.0,) * plan.temporal,
-                text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
-                skip_ends=(cfg["anchor_frames"] == "both"),
-                record_component=record_component, cuda_span=cuda_span,
-                execution_stats=linear_execution_stats,
-            )
+        linear_started = time.perf_counter()
+        linear_execution_stats = {}
+        readout = partitioned_linear_readout(
+            base_branch,
+            weights, x[grouped.video_start:], q_raw[grouped.video_start:],
+            k_raw[grouped.video_start:], v[grouped.video_start:],
+            frame_sizes=((plan.source_grid_h, plan.source_grid_w),) * plan.temporal,
+            bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
+            measure_scales=(1.0,) * plan.temporal,
+            text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
+            skip_ends=(cfg["anchor_frames"] == "both"),
+            record_component=record_component, cuda_span=cuda_span,
+            execution_stats=linear_execution_stats,
+        )
+        _record_component(record_component, "vdn_linear_readout_total_host_wall_s", linear_started)
+        projection_started = time.perf_counter()
         with cuda_span("vdn_linear_projection"):
             precomputed_linear = F.linear(readout.type_as(x), weights["to_out_linear.weight"])
+        _record_component(record_component, "vdn_linear_projection_host_wall_s", projection_started)
         if cfg["enable_softmax_gate"]:
-            precomputed_softmax_gate = torch.sigmoid(F.linear(
-                x, weights["softmax_gate.up.weight"], weights["softmax_gate.up.bias"],
-            ))
-        _record_component(record_component, "vdn_linear_readout_total_host_wall_s", linear_started)
+            gate_started = time.perf_counter()
+            with cuda_span("vdn_softmax_epilogue"):
+                precomputed_softmax_gate = torch.sigmoid(F.linear(
+                    x, weights["softmax_gate.up.weight"], weights["softmax_gate.up.bias"],
+                ))
+            _record_component(record_component, "vdn_softmax_epilogue_host_wall_s", gate_started)
         metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
         increment = getattr(metrics, "increment", None)
         if callable(increment):

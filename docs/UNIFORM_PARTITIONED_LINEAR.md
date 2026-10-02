@@ -18,8 +18,10 @@ temporaries no longer overlap subsequent gate/output allocations. Retained scan
 banks remain owned by their execution lease. Release follows the last tensor use
 on the current stream and adds no synchronization or allocator purge.
 
-The shortcut requires contiguous hidden/raw-QKV tensors, native temporal-carrier
+The shortcut requires contiguous hidden tensors, native temporal-carrier
 policy and released K/V short-convolution shapes (or no short convolution).
+Raw QKV split views may retain the native projection's shared row stride;
+the released feature operators support that layout without changing its values.
 Q convolution, nonunit measures, mixed grids, diagnostic statistics, temporal
 suppression, alternate carrier policies and feature witnesses retain the general
 path. Equal area with different grid axes does not qualify. Unit measure is an
@@ -38,11 +40,48 @@ After a successful readout and shape check, Flow's metrics receive:
 - `partitioned_vdn_uniform_linear_calls`: successful fixed-grid shortcut calls.
 - `partitioned_vdn_uniform_fast_requested_calls`: those calls with fast kernels
   requested; this does not prove that compilation succeeded.
+- `partitioned_vdn_uniform_pre_rope_calls`: uniform inference forwards that
+  compute the complement before in-place QK normalization/RoPE.
 
 The optional component recorder reports `vdn_linear_native_uniform_host_wall_s`
 and the enclosing `vdn_linear_api_host_wall_s`. CUDA diagnostics use the
 `vdn_linear_native_uniform` span. These are overlapping intervals. The general
 path keeps its existing component spans and witness observations.
+
+## Uniform projection lifetime
+
+Normal inference on identical physical grids now computes the validated uniform
+readout and its output projection before in-place RoPE. The projection is added
+after the existing softmax output projection, preserving the arithmetic order of
+the residual addition. Raw video Q/K/V and text K/V are consumed directly from the
+native projection views; no preservation copies are created or retained. Any
+previous activation-preservation scratch is released before this path starts.
+Only the projected complement and, when enabled, the softmax gate survive through
+attention. Branch weights are fetched once, with streamed lookahead kept after
+attention as in native VDN.
+
+This forward-lifetime shortcut requires normal linear mode, the native carrier
+policy, released `vdn_solve` with K/V-only or absent short convolution, contiguous
+hidden rows and disabled autograd. Mixed grids, diagnostic policies and witness
+ownership retain their previous late readout and copy lifetimes. Query grouping,
+prefix dense decisions, key measure, descriptors and Sol gates remain unchanged.
+CPU comparisons cover raw strided projection views, text state, anchor trimming,
+FP32/FP16/BF16 and adapter strengths 0, 0.5 and 1. GPU peak memory, latency and
+rendered quality still require measurement.
+
+Normalization epsilon keeps the preceding weight-dtype rounding of `1e-6`.
+Its scalar is now computed once per dtype on CPU, avoiding the CUDA allocation
+and scalar read previously performed at each linear epilogue. No normalization
+strength or epsilon value changes.
+
+## Applied adapter configuration
+
+The Apply node publishes `vdn_h3_adapter_config_v1` in transformer options after
+applying its adapters. It contains the checkpoint name, mode and named strengths
+from the application report, with no tensor payload. Flow can include this
+configuration in its trajectory receipt even when the Apply node itself is
+cached. A missing receipt from older code means the applied strength is unknown;
+it must not be inferred from node defaults.
 
 ## Partitioned attention gather workspace
 

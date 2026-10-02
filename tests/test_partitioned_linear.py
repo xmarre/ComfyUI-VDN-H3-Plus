@@ -527,13 +527,19 @@ def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid(prefix
 
 @pytest.mark.parametrize("fast_kernels", (False, True))
 @pytest.mark.parametrize("skip_ends", (False, True))
-def test_uniform_dispatch_preserves_text_anchors_and_execution_owned_scans(monkeypatch, fast_kernels, skip_ends):
+@pytest.mark.parametrize("strided", [False, True])
+def test_uniform_dispatch_preserves_text_anchors_and_execution_owned_scans(monkeypatch, fast_kernels, skip_ends, strided):
     weights = _weights(seed=311)
     branch = RuntimeLinearBranch(weights, 2, 3, enable_text_state=True)
     branch.fuse_epilogue = fast_kernels
     shared_backend = branch._delta_backend(97)
     shared_key = branch._backend_key
     inputs = _inputs(24)
+    if strided:
+        # The actual QKV projection's split views share a 3*H*d row stride.
+        x, q, k, v = inputs
+        packed = torch.cat((q.flatten(1), k.flatten(1), v.flatten(1)), dim=-1)
+        inputs = (x, *(part.view_as(q) for part in packed.split(q.shape[1] * q.shape[2], dim=-1)))
     text_x, _text_q, text_k, text_v = _inputs(3, seed=313)
     originals = tuple(t.clone() for t in (*inputs, text_x, text_k, text_v))
     kwargs = dict(

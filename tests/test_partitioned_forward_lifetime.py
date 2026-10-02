@@ -12,6 +12,8 @@ from vdn_h3 import partitioned_linear, partitioned_runtime
 from vdn_h3.hybrid import VDNLayout, VDNState
 from vdn_h3 import branch as B
 from vdn_h3.retained import RuntimeLinearBranch
+from vdn_h3.apply import _PostForwardLoRA
+from vdn_h3.boundary_witness import WITNESS_KEY
 from vdn_h3.partitioned_sequence import (
     PARTITIONED_PREFIX_KEY, PartitionedSequence, make_vdn_partitioned_external_contract,
 )
@@ -113,7 +115,9 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
 
 
 @pytest.mark.parametrize("fast_kernels", [False, True])
-def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeypatch, fast_kernels):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("strength", [0.0, 0.5, 1.0])
+def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeypatch, fast_kernels, dtype, strength):
     torch.manual_seed(774)
     plan = PartitionedSequence(
         video_start=7, temporal=5, prefix_t=2,
@@ -133,6 +137,7 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
         "norm.weight": torch.ones(2), "to_out_linear.weight": torch.eye(2),
         "softmax_gate.up.weight": torch.zeros(1, 2), "softmax_gate.up.bias": torch.zeros(1),
     }
+    weights = {name: value.to(dtype) for name, value in weights.items()}
     branch = RuntimeLinearBranch(weights, 1, 2, short_conv=(), enable_text_state=True)
     branch.fuse_epilogue = fast_kernels
     state = VDNState("uniform-linear-test", cfg, [branch], 1, 2, retain_buffers=True)
@@ -142,12 +147,17 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
         radius=1, chunk=1, anchor_frames="none",
     )
     values = {
-        "state": state, "base_branch": branch, "qkv_proj": nn.Linear(2, 6, bias=False),
+        "state": state, "base_branch": branch, "qkv_proj": nn.Linear(2, 6, bias=False, dtype=dtype),
         "out_proj": lambda flat: flat.clone(), "q_norm": nn.RMSNorm(2), "k_norm": nn.RMSNorm(2),
         "heads": 1, "head_dim": 2, "block_index": 0, "cfg": cfg,
     }
-    x = torch.randn(plan.sequence_rows, 2)
+    values["qkv_proj"].register_forward_hook(_PostForwardLoRA([
+        (torch.randn(1, 2).to(dtype), torch.randn(6, 1).to(dtype), strength),
+    ]))
+    x = torch.randn(plan.sequence_rows, 2).to(dtype)
     counters = {}
+    events = []
+    weights_calls = []
 
     def increment(name, value=1):
         counters[name] = counters.get(name, 0) + value
@@ -159,39 +169,71 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     }
     sol_package = ModuleType("sol_h3")
     sol_request = ModuleType("sol_h3.partitioned_request")
-    sol_request.partitioned_request_attention = lambda q, _k, _v, **kwargs: q.clone()
+    def attention(q, _k, _v, **kwargs):
+        events.append("softmax")
+        return q.clone()
+
+    sol_request.partitioned_request_attention = attention
     monkeypatch.setitem(sys.modules, "sol_h3", sol_package)
     monkeypatch.setitem(sys.modules, "sol_h3.partitioned_request", sol_request)
-    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", lambda *args, **kwargs: None)
+    def rope(q4, k4, *args, **kwargs):
+        events.append("rope")
+        q4.add_(1.0)
+        k4.add_(2.0)
+
+    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", rope)
     monkeypatch.setattr("vdn_h3.softmax_provider.preprocess", lambda _options, q, k, v, _heads: (q, k, v))
     monkeypatch.setattr(B, "_run_compiled", lambda _key, body, *args, **kwargs: body(*args, **kwargs))
     epilogue = B.linear_epilogue
     monkeypatch.setattr(B, "linear_epilogue", lambda *args, **kwargs: epilogue(*args, fuse=False))
-    state.weights_on = lambda *args, **kwargs: weights
+    def weights_on(*args, **kwargs):
+        weights_calls.append(kwargs.get("prefetch_next", True))
+        return weights
+
+    state.weights_on = weights_on
+    state.prefetch_next_weights = lambda *args: events.append("prefetch")
+    readout = partitioned_linear.partitioned_linear_readout
+
+    def observed_readout(*args, **kwargs):
+        events.append("linear")
+        return readout(*args, **kwargs)
+
+    monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", observed_readout)
 
     def execute():
         with state.runtime.execution(), torch.no_grad():
             token = state._layout.set(layout)
             try:
-                return partitioned_runtime._partitioned_vdn_forward(
+                result = partitioned_runtime._partitioned_vdn_forward(
                     None, values, x, torch.zeros(1, plan.sequence_rows, 1, 1), options,
                 )
+                if WITNESS_KEY not in options:
+                    assert not state.runtime.current()._activations
+                return result
             finally:
                 state._layout.reset(token)
 
     native = execute()
     assert counters == {
         "partitioned_vdn_uniform_linear_calls": 1,
+        "partitioned_vdn_uniform_pre_rope_calls": 1,
         **({"partitioned_vdn_uniform_fast_requested_calls": 1} if fast_kernels else {}),
     }
+    assert weights_calls == [False]
+    assert events.index("linear") < events.index("rope") < events.index("softmax") < events.index("prefetch")
     counters.clear()
-    readout = partitioned_linear.partitioned_linear_readout
+    weights_calls.clear()
+    events.clear()
 
     def general(*args, **kwargs):
         kwargs["diagnostic_stats"] = {}
         return readout(*args, **kwargs)
 
+    # Witness ownership retains the late/copy path, even when no capture is claimed.
+    options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _context: False)
     monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", general)
     reference = execute()
     assert counters == {}
-    assert torch.allclose(native, reference, rtol=2e-5, atol=2e-5)
+    assert weights_calls == [True]
+    tolerance = 2e-5 if dtype == torch.float32 else 2e-2
+    assert torch.allclose(native.float(), reference.float(), rtol=tolerance, atol=tolerance)
