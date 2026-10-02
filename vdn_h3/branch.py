@@ -19,6 +19,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .runtime import checked_cholesky
+
 _log = logging.getLogger("comfy.vdn")
 
 
@@ -42,7 +44,7 @@ class VdnDelta:
         a32 = a_raw.float()
         eye = torch.eye(a32.shape[-1], device=a32.device,
                         dtype=torch.float32).expand_as(a32)
-        chol = torch.linalg.cholesky(a32 + eye)
+        chol = checked_cholesky(a32 + eye)
         linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
         inv = linv.transpose(-1, -2) @ linv
         transition = alpha.unsqueeze(-1) * inv
@@ -82,7 +84,7 @@ class VdnScaledDelta(VdnDelta):
         a32 = a_raw.float() * self.inv_tokens
         eye = torch.eye(a32.shape[-1], device=a32.device,
                         dtype=torch.float32).expand_as(a32)
-        chol = torch.linalg.cholesky(a32 + eye)
+        chol = checked_cholesky(a32 + eye)
         inv = torch.cholesky_solve(eye.contiguous(), chol)
         transition = alpha.unsqueeze(-1) * inv
         injection = (b_raw.float() * self.inv_sqrt_tokens) @ inv
