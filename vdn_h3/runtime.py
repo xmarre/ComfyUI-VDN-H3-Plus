@@ -72,8 +72,10 @@ def checked_cholesky(matrix):
     prediction can escape. Standalone, CPU, training and captured calls retain
     PyTorch's immediate check. Only statuses are retained, never factors/inputs.
     """
+    if not _can_defer_cholesky(matrix):
+        return torch.linalg.cholesky(matrix)
     buffers = current_runtime_buffers()
-    if buffers is None or not _can_defer_cholesky(matrix):
+    if buffers is None:
         return torch.linalg.cholesky(matrix)
     factor, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
     buffers.defer_cholesky_status(info)
@@ -225,16 +227,20 @@ class RuntimeBuffers:
         self._cholesky_status_bytes = 0
         self._cholesky_calls = 0
         self._cholesky_status_reads = 0
+        self._cholesky_status_stream = None
 
     def defer_cholesky_status(self, info):
         size = info.numel() * info.element_size()
+        stream = torch.cuda.current_stream(info.device) if info.device.type == "cuda" else None
         if self._cholesky_statuses and (
             len(self._cholesky_statuses) >= _MAX_CHOLESKY_STATUSES
             or self._cholesky_status_bytes + size > _MAX_CHOLESKY_STATUS_BYTES
             or self._cholesky_statuses[0].device != info.device
+            or self._cholesky_status_stream != stream
         ):
             self.check_cholesky_statuses()
         self._cholesky_statuses.append(info)
+        self._cholesky_status_stream = stream
         self._cholesky_status_bytes += size
         self._cholesky_calls += 1
         if size > _MAX_CHOLESKY_STATUS_BYTES:
@@ -242,15 +248,22 @@ class RuntimeBuffers:
 
     def check_cholesky_statuses(self):
         pending = self._cholesky_statuses
+        stream = self._cholesky_status_stream
         self._cholesky_statuses = []
         self._cholesky_status_bytes = 0
+        self._cholesky_status_stream = None
         if not pending:
             return
-        codes = torch.cat([info.reshape(-1) for info in pending])
-        self._cholesky_status_reads += 1
-        # One host read for the normal 100 text/video factorizations, rather
-        # than cholesky() synchronizing after every factorization.
-        if bool((codes != 0).any().item()):
+        # Check on the statuses' producer stream. A downstream patch switching
+        # streams flushes the preceding batch, without a cross-stream read or
+        # retaining an event for every layer.
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            codes = torch.cat([info.reshape(-1) for info in pending])
+            self._cholesky_status_reads += 1
+            # One host read for the normal 100 text/video factorizations, rather
+            # than cholesky() synchronizing after every factorization.
+            failed = bool((codes != 0).any().item())
+        if failed:
             raise torch.linalg.LinAlgError(
                 "VDN Cholesky factorization failed; the diffusion prediction "
                 "was rejected before returning to the sampler")
@@ -260,6 +273,7 @@ class RuntimeBuffers:
         self._cholesky_status_bytes = 0
         self._cholesky_calls = 0
         self._cholesky_status_reads = 0
+        self._cholesky_status_stream = None
 
     def delta_scratch(self, shape, device):
         if not self.retain:

@@ -161,6 +161,29 @@ def test_cuda_guard_preserves_training_compile_and_capture_fallback(monkeypatch,
     assert not R._can_defer_cholesky(CudaMatrix())
 
 
+def test_compiled_factorization_does_not_read_runtime_context():
+    alpha, a, b = _inputs()
+    factor = B.VdnDelta()
+    compiled = torch.compile(factor.factor_apply, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        expected = factor.factor_apply(alpha, a, b)
+        actual = compiled(alpha, a, b)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_cuda_compile_guard_runs_before_reading_runtime_context(monkeypatch):
+    class CudaMatrix:
+        device = torch.device("cuda")
+
+    sentinel = object()
+    monkeypatch.setattr(torch, "is_grad_enabled", lambda: False)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(R, "current_runtime_buffers", lambda: pytest.fail("Compiled call read a ContextVar"))
+    monkeypatch.setattr(torch.linalg, "cholesky", lambda _matrix: sentinel)
+    assert R.checked_cholesky(CudaMatrix()) is sentinel
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA factorization parity requires a GPU")
 def test_cuda_factorization_preserves_native_result_and_error_gate():
     alpha, a, b = [tensor.cuda() for tensor in _inputs()]
@@ -175,3 +198,21 @@ def test_cuda_factorization_preserves_native_result_and_error_gate():
         with pytest.raises(torch.linalg.LinAlgError):
             with R.RuntimeBufferOwner(True).execution():
                 backend.factor_apply(alpha, -2 * torch.eye(4, device="cuda").expand_as(a), b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA status stream ownership requires a GPU")
+def test_cuda_status_check_uses_its_producer_stream_and_handles_stream_switch():
+    matrix = torch.eye(4, device="cuda")
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    first.wait_stream(torch.cuda.current_stream())
+    second.wait_stream(torch.cuda.current_stream())
+    with torch.no_grad(), R.RuntimeBufferOwner(True).execution() as buffers:
+        with torch.cuda.stream(first):
+            R.checked_cholesky(matrix)
+            assert buffers._cholesky_status_reads == 0
+        with torch.cuda.stream(second):
+            R.checked_cholesky(matrix)
+            assert buffers._cholesky_status_reads == 1
+        # The execution exits on the original stream; the second batch must
+        # still be read on its producer, and the caller's stream restored.
+        assert buffers._cholesky_status_stream == second
