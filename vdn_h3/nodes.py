@@ -228,6 +228,12 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         stage_path=path,
         verbose=verbose,
     )
+    new_model.model_options.setdefault("transformer_options", {})["vdn_h3_adapter_config_v1"] = {
+        "api": 1,
+        "checkpoint": vdn_checkpoint,
+        "lora_mode": lora_mode,
+        "strengths": {name: report[name]["strength"] for name in sorted(converted)},
+    }
     _log.info(
         "[vdn] %s applied: blocks=%d radius=%d chunk=%d anchors=%s rule=%s "
         "branch=%s/%s buffers=%s backend=%s lora_mode=%s adapters=%s",

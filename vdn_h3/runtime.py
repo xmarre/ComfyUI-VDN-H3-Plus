@@ -42,6 +42,8 @@ _MAX_KV_SCRATCH = 1
 _MAX_ACTIVATION_SCRATCH = 1
 _MAX_PARTITION_INDEX_ENTRIES = 64
 _MAX_PARTITION_INDEX_BYTES = 4 * 1024 * 1024
+_MAX_CHOLESKY_STATUSES = 128
+_MAX_CHOLESKY_STATUS_BYTES = 4 * 1024 * 1024
 _ACTIVE_BUFFERS = contextvars.ContextVar("vdn_active_runtime_buffers", default=None)
 # One worker is enough for one-block lookahead. It never stores branch weights itself;
 # each RuntimeBuffers owns at most one Future/result and drops it on reset.
@@ -52,6 +54,32 @@ _PREFETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 def current_runtime_buffers():
     """Return the pool leased by the current diffusion-model execution, if any."""
     return _ACTIVE_BUFFERS.get()
+
+
+def _can_defer_cholesky(matrix):
+    return bool(
+        matrix.device.type == "cuda"
+        and not torch.is_grad_enabled()
+        and not torch.compiler.is_compiling()
+        and not torch.cuda.is_current_stream_capturing()
+    )
+
+
+def checked_cholesky(matrix):
+    """Preserve factorization errors while avoiding a host barrier at each layer.
+
+    The diffusion execution checks the small LAPACK status tensors before its
+    prediction can escape. Standalone, CPU, training and captured calls retain
+    PyTorch's immediate check. Only statuses are retained, never factors/inputs.
+    """
+    if not _can_defer_cholesky(matrix):
+        return torch.linalg.cholesky(matrix)
+    buffers = current_runtime_buffers()
+    if buffers is None or not buffers.defer_factor_checks:
+        return torch.linalg.cholesky(matrix)
+    factor, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
+    buffers.defer_cholesky_status(info)
+    return factor
 
 
 def _bounded_put(mapping, key, value, limit):
@@ -185,8 +213,9 @@ class _StreamPrefetcher:
 class RuntimeBuffers:
     """Scratch owned by one execution pool; no model/checkpoint weights are cached."""
 
-    def __init__(self, retain: bool):
+    def __init__(self, retain: bool, *, defer_factor_checks: bool = False):
         self.retain = bool(retain)
+        self.defer_factor_checks = bool(defer_factor_checks)
         self._scan = collections.OrderedDict()
         self._delta = collections.OrderedDict()
         self._plans = collections.OrderedDict()
@@ -195,6 +224,57 @@ class RuntimeBuffers:
         self._partition_indices = collections.OrderedDict()
         self._partition_index_bytes = 0
         self._prefetcher = None
+        self._cholesky_statuses = []
+        self._cholesky_status_bytes = 0
+        self._cholesky_calls = 0
+        self._cholesky_status_reads = 0
+        self._cholesky_status_stream = None
+
+    def defer_cholesky_status(self, info):
+        size = info.numel() * info.element_size()
+        stream = torch.cuda.current_stream(info.device) if info.device.type == "cuda" else None
+        if self._cholesky_statuses and (
+            len(self._cholesky_statuses) >= _MAX_CHOLESKY_STATUSES
+            or self._cholesky_status_bytes + size > _MAX_CHOLESKY_STATUS_BYTES
+            or self._cholesky_statuses[0].device != info.device
+            or self._cholesky_status_stream != stream
+        ):
+            self.check_cholesky_statuses()
+        self._cholesky_statuses.append(info)
+        self._cholesky_status_stream = stream
+        self._cholesky_status_bytes += size
+        self._cholesky_calls += 1
+        if size > _MAX_CHOLESKY_STATUS_BYTES:
+            self.check_cholesky_statuses()
+
+    def check_cholesky_statuses(self):
+        pending = self._cholesky_statuses
+        stream = self._cholesky_status_stream
+        self._cholesky_statuses = []
+        self._cholesky_status_bytes = 0
+        self._cholesky_status_stream = None
+        if not pending:
+            return
+        # Check on the statuses' producer stream. A downstream patch switching
+        # streams flushes the preceding batch, without a cross-stream read or
+        # retaining an event for every layer.
+        with torch.cuda.stream(stream) if stream is not None else contextlib.nullcontext():
+            codes = torch.cat([info.reshape(-1) for info in pending])
+            self._cholesky_status_reads += 1
+            # One host read for the normal 100 text/video factorizations, rather
+            # than cholesky() synchronizing after every factorization.
+            failed = bool((codes != 0).any().item())
+        if failed:
+            raise torch.linalg.LinAlgError(
+                "VDN Cholesky factorization failed; the diffusion prediction "
+                "was rejected before returning to the sampler")
+
+    def clear_cholesky_statuses(self):
+        self._cholesky_statuses.clear()
+        self._cholesky_status_bytes = 0
+        self._cholesky_calls = 0
+        self._cholesky_status_reads = 0
+        self._cholesky_status_stream = None
 
     def delta_scratch(self, shape, device):
         if not self.retain:
@@ -405,6 +485,7 @@ class RuntimeBuffers:
         self._activations.clear()
         self._partition_indices.clear()
         self._partition_index_bytes = 0
+        self.clear_cholesky_statuses()
 
     def retained_counts(self):
         return {
@@ -421,9 +502,10 @@ class RuntimeBuffers:
 class RuntimeBufferOwner:
     """Lease one retained pool; concurrent/nested executions get transient scratch."""
 
-    def __init__(self, retain: bool):
+    def __init__(self, retain: bool, *, defer_factor_checks: bool = False):
         self.retain = bool(retain)
-        self._primary = RuntimeBuffers(self.retain)
+        self.defer_factor_checks = bool(defer_factor_checks)
+        self._primary = RuntimeBuffers(self.retain, defer_factor_checks=self.defer_factor_checks)
         self._lease = threading.Lock()
         self._active = contextvars.ContextVar(
             f"vdn_runtime_buffers_{id(self)}", default=None)
@@ -431,12 +513,20 @@ class RuntimeBufferOwner:
     @contextlib.contextmanager
     def execution(self):
         primary = self.retain and self._lease.acquire(blocking=False)
-        buffers = self._primary if primary else RuntimeBuffers(False)
+        buffers = self._primary if primary else RuntimeBuffers(False, defer_factor_checks=self.defer_factor_checks)
         token = self._active.set(buffers)
         global_token = _ACTIVE_BUFFERS.set(buffers)
         try:
             yield buffers
+            buffers.check_cholesky_statuses()
+            if buffers._cholesky_calls:
+                _log.info(
+                    "[vdn] factorization checks deferred_calls=%s status_reads=%s",
+                    buffers._cholesky_calls, buffers._cholesky_status_reads)
         finally:
+            # Errors/cancellation cannot leave device statuses on a retained
+            # pool or contaminate the next (possibly differently shaped) call.
+            buffers.clear_cholesky_statuses()
             _ACTIVE_BUFFERS.reset(global_token)
             self._active.reset(token)
             if primary:
