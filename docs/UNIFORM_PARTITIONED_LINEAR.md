@@ -43,3 +43,19 @@ The optional component recorder reports `vdn_linear_native_uniform_host_wall_s`
 and the enclosing `vdn_linear_api_host_wall_s`. CUDA diagnostics use the
 `vdn_linear_native_uniform` span. These are overlapping intervals. The general
 path keeps its existing component spans and witness observations.
+
+## Partitioned attention gather workspace
+
+The partitioned softmax path uses one block-local K/V workspace pair for its
+temporal groups. Each view exposes exactly the current group's rows, in the
+same order and with the same contiguous strides as the preceding independent
+gathers. Global sink rows are copied once; each group replaces only its video
+rows. Query gathers, mapped-neighbor descriptors, prefix key measure, forced
+dense decisions and all arithmetic gates are unchanged.
+
+The pair is released after the final local group, before anchor attention,
+branch-weight retrieval and learned-linear work. It is not added to the retained
+runtime pool and cannot carry capacity into the following MLP or sampling stage.
+This removes repeated per-group K/V allocations. It does not reduce the number
+of attention calls or full-resolution transformer evaluations, and no GPU
+latency or rendered-quality improvement is established by CPU tests.

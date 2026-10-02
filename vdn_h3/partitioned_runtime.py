@@ -616,6 +616,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         del q_global
 
     owner = state.query_position_owner_generation
+    if grouped.groups:
+        # Keep one block-local pair, as in native grouped attention. Do not
+        # retain it across the subsequent linear/MLP workspace lifetime.
+        max_kv_rows = max(group.kv_rows for group in grouped.groups)
+        with cuda_span("vdn_gather"):
+            k_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=k.dtype)
+            v_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=v.dtype)
+            k_scratch[:grouped.video_start].copy_(k[:grouped.video_start])
+            v_scratch[:grouped.video_start].copy_(v[:grouped.video_start])
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
@@ -625,22 +634,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 resources=resources,
                 identity=(*index_identity, "q", group.group_index),
             )
-            global_range = ((0, grouped.video_start),) if grouped.video_start else ()
             k_index = _indices_from_ranges(
-                (*global_range, *group.key_ranges),
+                group.key_ranges,
                 device=device,
                 resources=resources,
-                identity=(*index_identity, "k", group.group_index),
+                identity=(*index_identity, "k_window", group.group_index),
             )
-            if q_index.numel() != group.q_rows or k_index.numel() != group.kv_rows:
+            if q_index.numel() != group.q_rows or grouped.video_start + k_index.numel() != group.kv_rows:
                 raise RuntimeError(
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
             q_group = q[q_index]
-            k_group = k[k_index]
-            v_group = v[k_index]
+            torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
+            torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
+            k_group = k_scratch[:group.kv_rows]
+            v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
         force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
             group,
@@ -675,6 +685,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
         del q_group, k_group, v_group
         covered_rows += group.q_rows
+    if grouped.groups:
+        del k_scratch, v_scratch
 
     if grouped.anchor_slices:
         gather_started = time.perf_counter()
