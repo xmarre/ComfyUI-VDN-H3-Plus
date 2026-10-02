@@ -5,6 +5,7 @@ This package ports the released Video Delta Attention onto ComfyUI's native
 MiniMax-H3 model as model patches; no ComfyUI core files are modified.
 """
 
+import logging
 import os
 import sys
 
@@ -14,6 +15,15 @@ if _PKG not in sys.path:
 
 from vdn_h3.compiler_guard import install_layout_guard as _install_layout_guard
 from vdn_h3.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+from vdn_h3 import hybrid as _hybrid
+
+logging.getLogger("comfy.vdn").info(
+    "[vdn] sampling admission source policy=%s module_file=%s package_file=%s",
+    getattr(_hybrid, "SAMPLING_ADMISSION_POLICY", "unversioned"),
+    _hybrid.__file__,
+    __file__,
+)
+del _hybrid
 
 _install_layout_guard()
 del _install_layout_guard

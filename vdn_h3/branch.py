@@ -12,6 +12,7 @@ Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM)
 recurrence in fp32 via preallocated banks, bf16 features and readout.
 """
 import collections
+from functools import lru_cache
 import logging
 import math
 
@@ -19,6 +20,12 @@ import torch
 import torch.nn.functional as F
 
 _log = logging.getLogger("comfy.vdn")
+
+
+@lru_cache(maxsize=8)
+def linear_norm_epsilon(dtype):
+    """Preserve the weight-dtype rounding of epsilon without a CUDA scalar read."""
+    return torch.tensor(1e-6, dtype=dtype, device="cpu").item()
 
 
 # ---------------------------------------------------------------- delta rules --
@@ -509,5 +516,5 @@ class LinearBranch:
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(query_fhsd, linear_state.transpose(-1, -2))
         return linear_epilogue(readout, w["norm.weight"], gate,
-                               w["norm.weight"].new_tensor(1e-6).item(),
+                               linear_norm_epsilon(w["norm.weight"].dtype),
                                fuse=self.fuse_epilogue)
