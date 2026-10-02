@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import torch
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,6 +19,24 @@ from vdn_h3 import branch as B
 
 BF16_ATOL = 5e-3
 BF16_RTOL = 1e-2
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+def test_linear_norm_epsilon_keeps_exact_dtype_rounding_on_cpu(monkeypatch, dtype):
+    expected = torch.empty((), dtype=dtype).fill_(1e-6).item()
+    B.linear_norm_epsilon.cache_clear()
+    make_tensor = torch.tensor
+    calls = []
+
+    def cpu_constant(*args, **kwargs):
+        assert kwargs["device"] == "cpu"
+        calls.append(kwargs["dtype"])
+        return make_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", cpu_constant)
+    assert B.linear_norm_epsilon(dtype) == expected
+    assert B.linear_norm_epsilon(dtype) == expected
+    assert calls == [dtype]
 
 
 def test_epilogue_parity():
