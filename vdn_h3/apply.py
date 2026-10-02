@@ -307,6 +307,13 @@ class _PostForwardLoRA:
             delta = bias if delta is None else delta + bias
         if delta is None:
             return output
+        # Only the projection delta is call-owned; output and bias may be shared.
+        if (down is not None and not torch.is_grad_enabled()
+                and type(output) is torch.Tensor and type(delta) is torch.Tensor
+                and output.shape == delta.shape and output.dtype == delta.dtype
+                and output.stride() == delta.stride()):
+            torch.add(output, delta, out=delta)
+            return delta
         return output + delta
 
     def clear(self):
