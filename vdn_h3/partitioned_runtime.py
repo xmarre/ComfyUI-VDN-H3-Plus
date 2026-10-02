@@ -492,9 +492,84 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             options,
             grouped.sequence_rows - grouped.video_start,
         )
+    from . import branch as B
+    from .boundary_witness import WITNESS_KEY
+
+    uniform_linear = (
+        linear_active
+        and not torch.is_grad_enabled()
+        and plan.source_grid_h == plan.target_grid_h
+        and plan.source_grid_w == plan.target_grid_w
+        and linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL
+        and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_NATIVE
+        and options.get(WITNESS_KEY) is None
+        and x.is_contiguous()
+        and isinstance(base_branch, B.LinearBranch)
+        and base_branch.delta_rule == "vdn_solve"
+        and not (set(base_branch.short_conv or ()) - {"k", "v"})
+    )
+    precomputed_linear = None
+    precomputed_softmax_gate = None
     q_raw_video = k_raw_video = v_raw_video = None
     text_x = text_k_raw = text_v_raw = None
-    if linear_active:
+    if uniform_linear:
+        # Native VDN already reads strided projection views before in-place
+        # RoPE. Identical physical grids and unit measure have the same readout.
+        # Keep only its projected result through softmax, rather than three
+        # full-size raw video copies. Diagnostic and mixed-grid paths stay late.
+        resources.release_activation_scratch()
+        weights_started = time.perf_counter()
+        with cuda_span("vdn_weights"):
+            weights = state.weights_on(block_index, device, dtype, prefetch_next=False)
+        _record_component(record_component, "vdn_weights_host_wall_s", weights_started)
+        if base_branch.enable_text_state and int(layout.text_len):
+            text_start = int(layout.text_start)
+            text_end = text_start + int(layout.text_len)
+            if not 0 <= text_start < text_end <= grouped.video_start:
+                raise RuntimeError("partitioned VDN text rows are outside the non-video prefix")
+            text_x = x[text_start:text_end]
+            text_k_raw = k_raw[text_start:text_end]
+            text_v_raw = v[text_start:text_end]
+        from .partitioned_linear import partitioned_linear_readout
+
+        linear_started = time.perf_counter()
+        linear_execution_stats = {}
+        readout = partitioned_linear_readout(
+            base_branch,
+            weights, x[grouped.video_start:], q_raw[grouped.video_start:],
+            k_raw[grouped.video_start:], v[grouped.video_start:],
+            frame_sizes=((plan.source_grid_h, plan.source_grid_w),) * plan.temporal,
+            bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
+            measure_scales=(1.0,) * plan.temporal,
+            text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
+            skip_ends=(cfg["anchor_frames"] == "both"),
+            record_component=record_component, cuda_span=cuda_span,
+            execution_stats=linear_execution_stats,
+        )
+        _record_component(record_component, "vdn_linear_readout_total_host_wall_s", linear_started)
+        projection_started = time.perf_counter()
+        with cuda_span("vdn_linear_projection"):
+            precomputed_linear = F.linear(readout.type_as(x), weights["to_out_linear.weight"])
+        _record_component(record_component, "vdn_linear_projection_host_wall_s", projection_started)
+        if cfg["enable_softmax_gate"]:
+            gate_started = time.perf_counter()
+            with cuda_span("vdn_softmax_epilogue"):
+                precomputed_softmax_gate = torch.sigmoid(F.linear(
+                    x, weights["softmax_gate.up.weight"], weights["softmax_gate.up.bias"],
+                ))
+            _record_component(record_component, "vdn_softmax_epilogue_host_wall_s", gate_started)
+        metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+        increment = getattr(metrics, "increment", None)
+        if callable(increment):
+            for stat, counter in (
+                ("native_uniform_calls", "partitioned_vdn_uniform_linear_calls"),
+                ("native_uniform_fast_requested_calls", "partitioned_vdn_uniform_fast_requested_calls"),
+            ):
+                if linear_execution_stats.get(stat):
+                    increment(counter, linear_execution_stats[stat])
+            increment("partitioned_vdn_uniform_pre_rope_calls")
+        del readout, weights, text_x, text_k_raw, text_v_raw
+    elif linear_active:
         video_start = grouped.video_start
         video_end = grouped.sequence_rows
         text_len = int(layout.text_len) if base_branch.enable_text_state else 0
@@ -549,6 +624,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             rot_dim=rot,
         )
         q, k = q4[0], k4[0]
+        del q4, k4
     else:
         q = q_norm(q_raw)
         k = k_norm(k_raw)
@@ -615,6 +691,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         del q_global
 
     owner = state.query_position_owner_generation
+    if grouped.groups:
+        # Keep one block-local pair, as in native grouped attention. Do not
+        # retain it across the subsequent linear/MLP workspace lifetime.
+        max_kv_rows = max(group.kv_rows for group in grouped.groups)
+        with cuda_span("vdn_gather"):
+            k_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=k.dtype)
+            v_scratch = torch.empty((max_kv_rows, heads, head_dim), device=device, dtype=v.dtype)
+            k_scratch[:grouped.video_start].copy_(k[:grouped.video_start])
+            v_scratch[:grouped.video_start].copy_(v[:grouped.video_start])
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
@@ -624,22 +709,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 resources=resources,
                 identity=(*index_identity, "q", group.group_index),
             )
-            global_range = ((0, grouped.video_start),) if grouped.video_start else ()
             k_index = _indices_from_ranges(
-                (*global_range, *group.key_ranges),
+                group.key_ranges,
                 device=device,
                 resources=resources,
-                identity=(*index_identity, "k", group.group_index),
+                identity=(*index_identity, "k_window", group.group_index),
             )
-            if q_index.numel() != group.q_rows or k_index.numel() != group.kv_rows:
+            if q_index.numel() != group.q_rows or grouped.video_start + k_index.numel() != group.kv_rows:
                 raise RuntimeError(
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
             q_group = q[q_index]
-            k_group = k[k_index]
-            v_group = v[k_index]
+            torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
+            torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
+            k_group = k_scratch[:group.kv_rows]
+            v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
         force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
             group,
@@ -674,6 +760,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
         del q_group, k_group, v_group
         covered_rows += group.q_rows
+    if grouped.groups:
+        del k_scratch, v_scratch
 
     if grouped.anchor_slices:
         gather_started = time.perf_counter()
@@ -709,14 +797,22 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if covered_rows != grouped.sequence_rows:
         raise RuntimeError("partitioned VDN grouped queries do not cover the complete hidden sequence")
 
+    # The linear branch owns independent raw copies. Drop every remaining
+    # attention QKV view before weight prefetch and linear-workspace allocation.
+    del q, k, v, q_raw, k_raw
+
     weights_started = time.perf_counter()
     with cuda_span("vdn_weights"):
-        weights = state.weights_on(block_index, device, dtype)
+        if uniform_linear:
+            # Keep streamed lookahead after softmax, matching native VDN.
+            state.prefetch_next_weights(block_index, device, dtype)
+        else:
+            weights = state.weights_on(block_index, device, dtype)
     _record_component(record_component, "vdn_weights_host_wall_s", weights_started)
     softmax_epilogue_started = time.perf_counter()
     with cuda_span("vdn_softmax_epilogue"):
         if cfg["enable_softmax_gate"]:
-            gate = torch.sigmoid(
+            gate = precomputed_softmax_gate if precomputed_softmax_gate is not None else torch.sigmoid(
                 F.linear(
                     x,
                     weights["softmax_gate.up.weight"],
@@ -727,6 +823,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         else:
             flat = softmax_out.reshape(s, -1)
         out = out_proj(flat.type_as(x))
+        del softmax_out, flat
+        if cfg["enable_softmax_gate"]:
+            del gate
     _record_component(
         record_component,
         "vdn_softmax_epilogue_host_wall_s",
@@ -737,7 +836,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     cross_grid_temporal_suppressed = False
     cross_grid_temporal_stats: dict[str, int] | None = None
     temporal_carrier_stats: dict[str, int] | None = None
-    if linear_active:
+    if precomputed_linear is not None:
+        out[grouped.video_start:] += precomputed_linear
+        del precomputed_linear
+        linear_added = True
+    elif linear_active:
         from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
 
         suppress_cross_grid_temporal = (
@@ -775,6 +878,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                     temporal_carrier_contract["numerical_digest"] if temporal_carrier_contract is not None else None
                 ),
             )
+        linear_execution_stats: dict[str, int] = {}
         readout = partitioned_linear_readout(
             base_branch,
             weights,
@@ -796,6 +900,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             record_component=record_component,
             cuda_span=cuda_span,
             observation=observation,
+            execution_stats=linear_execution_stats,
         )
         if observation is not None:
             observation.finish()
@@ -819,6 +924,16 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         expected_shape = (grouped.sequence_rows - grouped.video_start, heads * head_dim)
         if tuple(readout.shape) != expected_shape:
             raise RuntimeError("partitioned VDN linear complement returned incompatible rows")
+        metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+        increment = getattr(metrics, "increment", None)
+        if callable(increment):
+            for stat, counter in (
+                ("native_uniform_calls", "partitioned_vdn_uniform_linear_calls"),
+                ("native_uniform_fast_requested_calls", "partitioned_vdn_uniform_fast_requested_calls"),
+            ):
+                count = linear_execution_stats.get(stat, 0)
+                if count:
+                    increment(counter, count)
         linear_projection_started = time.perf_counter()
         with cuda_span("vdn_linear_projection"):
             out[grouped.video_start : grouped.sequence_rows] += F.linear(

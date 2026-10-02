@@ -12,13 +12,22 @@ Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM)
 recurrence in fp32 via preallocated banks, bf16 features and readout.
 """
 import collections
+from functools import lru_cache
 import logging
 import math
 
 import torch
 import torch.nn.functional as F
 
+from .runtime import checked_cholesky
+
 _log = logging.getLogger("comfy.vdn")
+
+
+@lru_cache(maxsize=8)
+def linear_norm_epsilon(dtype):
+    """Preserve the weight-dtype rounding of epsilon without a CUDA scalar read."""
+    return torch.tensor(1e-6, dtype=dtype, device="cpu").item()
 
 
 # ---------------------------------------------------------------- delta rules --
@@ -35,7 +44,7 @@ class VdnDelta:
         a32 = a_raw.float()
         eye = torch.eye(a32.shape[-1], device=a32.device,
                         dtype=torch.float32).expand_as(a32)
-        chol = torch.linalg.cholesky(a32 + eye)
+        chol = checked_cholesky(a32 + eye)
         linv = torch.linalg.solve_triangular(chol, eye, upper=False, left=True)
         inv = linv.transpose(-1, -2) @ linv
         transition = alpha.unsqueeze(-1) * inv
@@ -75,7 +84,7 @@ class VdnScaledDelta(VdnDelta):
         a32 = a_raw.float() * self.inv_tokens
         eye = torch.eye(a32.shape[-1], device=a32.device,
                         dtype=torch.float32).expand_as(a32)
-        chol = torch.linalg.cholesky(a32 + eye)
+        chol = checked_cholesky(a32 + eye)
         inv = torch.cholesky_solve(eye.contiguous(), chol)
         transition = alpha.unsqueeze(-1) * inv
         injection = (b_raw.float() * self.inv_sqrt_tokens) @ inv
@@ -509,5 +518,5 @@ class LinearBranch:
             query_fhsd = query.view(shape).permute(0, 2, 1, 3)
         readout = torch.matmul(query_fhsd, linear_state.transpose(-1, -2))
         return linear_epilogue(readout, w["norm.weight"], gate,
-                               w["norm.weight"].new_tensor(1e-6).item(),
+                               linear_norm_epsilon(w["norm.weight"].dtype),
                                fuse=self.fuse_epilogue)
