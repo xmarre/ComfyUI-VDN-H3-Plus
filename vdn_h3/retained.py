@@ -120,7 +120,7 @@ class RuntimeLinearBranch(B.LinearBranch):
             readout,
             w["norm.weight"],
             gate,
-            w["norm.weight"].new_tensor(1e-6).item(),
+            B.linear_norm_epsilon(w["norm.weight"].dtype),
             fuse=self.fuse_epilogue,
         )
 

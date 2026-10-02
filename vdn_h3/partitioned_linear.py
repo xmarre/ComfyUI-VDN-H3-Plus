@@ -856,7 +856,7 @@ def _core_readout(
 
     epsilon_started = time.perf_counter()
     with component_span("vdn_linear_epsilon_scalar"):
-        eps = weights["norm.weight"].new_tensor(1e-6).item()
+        eps = B.linear_norm_epsilon(weights["norm.weight"].dtype)
     if record_component is not None:
         record_component(
             "vdn_linear_epsilon_scalar_host_wall_s",
