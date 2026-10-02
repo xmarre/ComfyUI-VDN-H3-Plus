@@ -932,7 +932,7 @@ def partitioned_linear_readout(
         isinstance(local, B.LinearBranch)
         and all(tuple(grid) == tuple(frame_sizes[0]) for grid in frame_sizes)
         and all(float(scale) == 1.0 for scale in measure_scales)
-        and all(t.is_contiguous() for t in (x_video, q_raw, k_raw, v_raw))
+        and x_video.is_contiguous()
         and (not skip_ends or len(frame_sizes) > 2)
         and not suppress_cross_grid_temporal_taps
         and diagnostic_stats is None
