@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Partitioned exact-prefix attention keeps the first generated local-query group
+  dense. This preserves one attention operator across the carried/generated
+  boundary while later generated groups retain native sparse Sol routing. The
+  boundary group uses the existing gathered Q/K/V domain and prefix measure and
+  adds no model evaluations.
 - Retained sampling prepares required models through Core before reserving
   finite scratch headroom. Sufficient memory preserves unrelated resident
   models; pressure uses Core's eviction policy while protecting prepared models

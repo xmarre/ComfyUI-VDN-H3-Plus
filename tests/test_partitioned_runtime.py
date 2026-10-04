@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 from vdn_h3.partitioned_runtime import (
     VDN_EXTERNAL_SEQUENCE_KEY,
+    VDN_PARTITIONED_BOUNDARY_QUERY_API,
+    VDN_PARTITIONED_BOUNDARY_QUERY_POLICY,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS,
     VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY,
@@ -24,6 +26,7 @@ from vdn_h3.partitioned_runtime import (
     _partitioned_local_force_dense,
     _partitioned_softmax_diagnostic_mode,
     _partitioned_query_summary,
+    _record_partitioned_boundary_suffix_dense,
     _record_partitioned_cross_grid_temporal_suppression,
     _record_partitioned_dense_suffix_same_domain,
     _record_partitioned_linear_bypass,
@@ -379,7 +382,7 @@ def test_destination_temporal_carrier_contract_binds_plan_diagnostic_and_checkpo
         )
 
 
-def test_partitioned_softmax_diagnostic_defaults_to_normal_and_is_suffix_only():
+def test_partitioned_softmax_policy_keeps_boundary_suffix_group_dense_and_later_suffix_sparse():
     assert _partitioned_softmax_diagnostic_mode({}) == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL
     selected = {
         VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY:
@@ -390,24 +393,42 @@ def test_partitioned_softmax_diagnostic_defaults_to_normal_and_is_suffix_only():
         == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
     )
 
-    prefix = SimpleNamespace(query_prefix_domain=True)
-    suffix = SimpleNamespace(query_prefix_domain=False)
+    prefix_t = 12
+    prefix = SimpleNamespace(query_prefix_domain=True, query_frames=(10, 11))
+    boundary_suffix = SimpleNamespace(
+        query_prefix_domain=False,
+        query_frames=(12, 13, 14),
+    )
+    later_suffix = SimpleNamespace(
+        query_prefix_domain=False,
+        query_frames=(15, 16, 17, 18, 19),
+    )
+
     assert _partitioned_local_force_dense(
         prefix,
         VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
-    ) == (True, False)
+        prefix_t=prefix_t,
+    ) == (True, False, False)
     assert _partitioned_local_force_dense(
-        suffix,
+        boundary_suffix,
         VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
-    ) == (False, False)
+        prefix_t=prefix_t,
+    ) == (True, False, True)
     assert _partitioned_local_force_dense(
-        prefix,
-        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
-    ) == (True, False)
+        later_suffix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
+        prefix_t=prefix_t,
+    ) == (False, False, False)
     assert _partitioned_local_force_dense(
-        suffix,
+        boundary_suffix,
         VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
-    ) == (True, True)
+        prefix_t=prefix_t,
+    ) == (True, False, True)
+    assert _partitioned_local_force_dense(
+        later_suffix,
+        VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+        prefix_t=prefix_t,
+    ) == (True, True, False)
 
 
 def test_partitioned_softmax_diagnostic_rejects_unknown_mode():
@@ -417,6 +438,59 @@ def test_partitioned_softmax_diagnostic_rejects_unknown_mode():
         _partitioned_softmax_diagnostic_mode(
             {VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY: "invalid"}
         )
+
+
+def test_partitioned_boundary_suffix_dense_records_explicit_flow_metrics_and_receipt():
+    class Metrics:
+        def __init__(self):
+            self.values = {}
+            self.events = []
+
+        def increment(self, name, value=1):
+            self.values[name] = self.values.get(name, 0) + value
+
+        def event(self, kind, **fields):
+            self.events.append((kind, fields))
+
+    metrics = Metrics()
+    options = {
+        "h3_flow_partitioned_stage_v1": SimpleNamespace(metrics=metrics),
+        "h3_flow_stage": "high",
+    }
+    group = SimpleNamespace(
+        query_prefix_domain=False,
+        query_frames=(12, 13, 14),
+        q_rows=2850,
+        kv_rows=15250,
+    )
+    _record_partitioned_boundary_suffix_dense(
+        options,
+        group=group,
+        prefix_t=12,
+        block_index=0,
+    )
+    _record_partitioned_boundary_suffix_dense(
+        options,
+        group=group,
+        prefix_t=12,
+        block_index=1,
+    )
+
+    assert metrics.values["partitioned_vdn_boundary_suffix_dense_calls"] == 2
+    assert metrics.values["partitioned_vdn_boundary_suffix_dense_q_rows"] == 5700
+    assert metrics.values["partitioned_vdn_boundary_suffix_dense_kv_rows"] == 30500
+    assert metrics.values["partitioned_vdn_boundary_suffix_dense_query_frames"] == 6
+    assert len(metrics.events) == 1
+    kind, fields = metrics.events[0]
+    assert kind == "partitioned_vdn_boundary_suffix_dense"
+    assert fields["policy"] == VDN_PARTITIONED_BOUNDARY_QUERY_POLICY
+    assert fields["stage"] == "high"
+    assert fields["prefix_t"] == 12
+    assert fields["query_frames"] == (12, 13, 14)
+    assert fields["grouped_qkv_unchanged"] is True
+    assert fields["prefix_measure_unchanged"] is True
+    assert fields["later_suffix_sparse"] is True
+    assert fields["extra_model_calls"] == 0
 
 
 def test_partitioned_dense_suffix_records_explicit_flow_metrics():
@@ -462,7 +536,13 @@ def test_partitioned_softmax_bridge_publishes_diagnostic_capability_api():
 
     current._vdn_forward = True
     wrapped = _wrap_vdn_forward(current)
+    assert VDN_PARTITIONED_BOUNDARY_QUERY_API == 1
+    assert wrapped._vdn_partitioned_boundary_query_api == VDN_PARTITIONED_BOUNDARY_QUERY_API
+    assert wrapped._vdn_partitioned_boundary_query_policy == VDN_PARTITIONED_BOUNDARY_QUERY_POLICY
     assert VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API == 1
-    assert wrapped._vdn_partitioned_softmax_diagnostic_api == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    assert (
+        wrapped._vdn_partitioned_softmax_diagnostic_api
+        == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    )
     assert tuple(wrapped._vdn_partitioned_softmax_diagnostic_modes) == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     assert VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX in wrapped._vdn_partitioned_softmax_diagnostic_modes
