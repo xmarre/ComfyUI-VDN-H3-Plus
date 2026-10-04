@@ -59,6 +59,8 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
 # ownership remain identical to the normal path.
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
+VDN_PARTITIONED_BOUNDARY_QUERY_API = 1
+VDN_PARTITIONED_BOUNDARY_QUERY_POLICY = "boundary_suffix_local_group_dense_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
@@ -180,21 +182,92 @@ def _partitioned_softmax_diagnostic_mode(options: dict[str, Any]) -> str:
     return str(raw)
 
 
-def _partitioned_local_force_dense(group, mode: str) -> tuple[bool, bool]:
-    """Return force_dense and diagnostic_suffix for one existing local group.
+def _partitioned_local_force_dense(
+    group,
+    mode: str,
+    *,
+    prefix_t: int,
+) -> tuple[bool, bool, bool]:
+    """Return dense-routing ownership for one existing local query group.
 
-    The group has already fixed the gathered Q/K/V domain and prefix measure.
-    This helper is intentionally downstream of that ownership so the diagnostic
-    can change only Sol sparse selection.
+    Exact-prefix transport splits a native chunk-aligned VDN query group at the
+    carried/generated boundary. Prefix queries were already forced dense, but
+    the first generated subgroup still used sparse Sol selection. Adjacent
+    queries from the same native local window therefore used different attention
+    operators exactly at the continuation boundary. Keep the first generated
+    subgroup dense as well; later generated groups retain native sparse routing.
+
+    The group has already fixed the gathered Q/K/V domain and prefix measure, so
+    this policy changes only the Sol execution mode. The all-suffix diagnostic
+    remains available and reports only additional later suffix groups that it
+    forces dense beyond the production boundary subgroup.
     """
 
     if mode not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
         raise RuntimeError(f"unsupported partitioned VDN softmax diagnostic {mode!r}")
+    if type(prefix_t) is not int or prefix_t <= 0:
+        raise RuntimeError(
+            "partitioned VDN boundary-query policy requires a positive integer prefix"
+        )
+    query_frames = tuple(getattr(group, "query_frames", ()))
+    if not query_frames or any(type(frame) is not int for frame in query_frames):
+        raise RuntimeError(
+            "partitioned VDN local group is missing integer query-frame ownership"
+        )
+    boundary_suffix = bool(
+        not bool(group.query_prefix_domain)
+        and prefix_t in query_frames
+    )
     diagnostic_suffix = bool(
         mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
         and not bool(group.query_prefix_domain)
+        and not boundary_suffix
     )
-    return bool(group.query_prefix_domain or diagnostic_suffix), diagnostic_suffix
+    return (
+        bool(group.query_prefix_domain or boundary_suffix or diagnostic_suffix),
+        diagnostic_suffix,
+        boundary_suffix,
+    )
+
+
+def _record_partitioned_boundary_suffix_dense(
+    options: dict[str, Any],
+    *,
+    group,
+    prefix_t: int,
+    block_index: int,
+    softmax_diagnostic_mode: str,
+) -> None:
+    runtime = options.get(FLOW_PARTITIONED_STAGE_KEY)
+    metrics = getattr(runtime, "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_boundary_suffix_dense_calls")
+        increment("partitioned_vdn_boundary_suffix_dense_q_rows", int(group.q_rows))
+        increment("partitioned_vdn_boundary_suffix_dense_kv_rows", int(group.kv_rows))
+        increment(
+            "partitioned_vdn_boundary_suffix_dense_query_frames",
+            len(tuple(group.query_frames)),
+        )
+    event = getattr(metrics, "event", None)
+    if callable(event) and int(block_index) == 0:
+        event(
+            "partitioned_vdn_boundary_suffix_dense",
+            policy=VDN_PARTITIONED_BOUNDARY_QUERY_POLICY,
+            stage=options.get("h3_flow_stage"),
+            prefix_t=int(prefix_t),
+            query_frames=tuple(int(frame) for frame in group.query_frames),
+            q_rows=int(group.q_rows),
+            kv_rows=int(group.kv_rows),
+            query_prefix_domain=bool(group.query_prefix_domain),
+            grouped_qkv_unchanged=True,
+            prefix_measure_unchanged=True,
+            softmax_diagnostic_mode=str(softmax_diagnostic_mode),
+            later_suffix_sparse=(
+                softmax_diagnostic_mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL
+            ),
+            extra_model_calls=0,
+        )
 
 
 def _record_partitioned_dense_suffix_same_domain(
@@ -727,9 +800,12 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             k_group = k_scratch[:group.kv_rows]
             v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
-        force_dense, diagnostic_dense_suffix = _partitioned_local_force_dense(
-            group,
-            softmax_diagnostic_mode,
+        force_dense, diagnostic_dense_suffix, boundary_dense_suffix = (
+            _partitioned_local_force_dense(
+                group,
+                softmax_diagnostic_mode,
+                prefix_t=plan.prefix_t,
+            )
         )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
@@ -750,6 +826,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 # forces only suffix local-query groups dense after the same
                 # grouped Q/K/V gather and measure bias have been fixed.
                 force_dense=force_dense,
+            )
+        if boundary_dense_suffix:
+            _record_partitioned_boundary_suffix_dense(
+                options,
+                group=group,
+                prefix_t=plan.prefix_t,
+                block_index=block_index,
+                softmax_diagnostic_mode=softmax_diagnostic_mode,
             )
         if diagnostic_dense_suffix:
             _record_partitioned_dense_suffix_same_domain(
@@ -1067,6 +1151,10 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_softmax_diagnostic_api = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
+    partitioned_aware._vdn_partitioned_boundary_query_api = VDN_PARTITIONED_BOUNDARY_QUERY_API
+    partitioned_aware._vdn_partitioned_boundary_query_policy = (
+        VDN_PARTITIONED_BOUNDARY_QUERY_POLICY
+    )
     partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
     try:
@@ -1106,6 +1194,8 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 __all__ = [
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
+    "VDN_PARTITIONED_BOUNDARY_QUERY_API",
+    "VDN_PARTITIONED_BOUNDARY_QUERY_POLICY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",

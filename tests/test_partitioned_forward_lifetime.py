@@ -157,6 +157,7 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     x = torch.randn(plan.sequence_rows, 2).to(dtype)
     counters = {}
     events = []
+    force_dense_calls = []
     weights_calls = []
 
     def increment(name, value=1):
@@ -171,6 +172,7 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     sol_request = ModuleType("sol_h3.partitioned_request")
     def attention(q, _k, _v, **kwargs):
         events.append("softmax")
+        force_dense_calls.append(bool(kwargs["force_dense"]))
         return q.clone()
 
     sol_request.partitioned_request_attention = attention
@@ -214,14 +216,25 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
                 state._layout.reset(token)
 
     native = execute()
+    expected_boundary_counters = {
+        "partitioned_vdn_boundary_suffix_dense_calls": 1,
+        "partitioned_vdn_boundary_suffix_dense_q_rows": 6,
+        "partitioned_vdn_boundary_suffix_dense_kv_rows": 25,
+        "partitioned_vdn_boundary_suffix_dense_query_frames": 1,
+    }
     assert counters == {
         "partitioned_vdn_uniform_linear_calls": 1,
         "partitioned_vdn_uniform_pre_rope_calls": 1,
         **({"partitioned_vdn_uniform_fast_requested_calls": 1} if fast_kernels else {}),
+        **expected_boundary_counters,
     }
     assert weights_calls == [False]
+    # One global packed-sequence call is dense, followed by per-frame local groups:
+    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
+    assert force_dense_calls == [True, True, True, True, False, False]
     assert events.index("linear") < events.index("rope") < events.index("softmax") < events.index("prefetch")
     counters.clear()
+    force_dense_calls.clear()
     weights_calls.clear()
     events.clear()
 
@@ -233,7 +246,10 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _context: False)
     monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", general)
     reference = execute()
-    assert counters == {}
+    assert counters == expected_boundary_counters
+    # One global packed-sequence call is dense, followed by per-frame local groups:
+    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
+    assert force_dense_calls == [True, True, True, True, False, False]
     assert weights_calls == [True]
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     assert torch.allclose(native.float(), reference.float(), rtol=tolerance, atol=tolerance)
