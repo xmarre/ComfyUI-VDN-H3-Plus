@@ -332,6 +332,8 @@ def _heterogeneous_conv_features(
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] | None = None,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    observation=None,
+    feature_name=None,
 ) -> torch.Tensor:
     """Equivalent variable-grid short-conv with domain-batched same-grid work.
 
@@ -348,6 +350,8 @@ def _heterogeneous_conv_features(
         frame_sizes,
         offsets,
     )
+    if observation is not None:
+        observation.native(feature_name, run_maps, frame_owner)
     temporal = temporal_weight.squeeze(1)
     if temporal.ndim != 2 or temporal.shape[1] <= 0 or temporal.shape[1] % 2 == 0:
         raise RuntimeError("partitioned VDN temporal short-conv requires an odd depthwise kernel")
@@ -403,7 +407,10 @@ def _heterogeneous_conv_features(
                 grid_cache=grid_cache,
             )
             weight = temporal[:, tap].to(source.dtype).view(1, -1, 1, 1)
-            mixed_runs[run_index][local_index : local_index + 1] += source * weight
+            part = source * weight
+            if observation is not None and cross_grid:
+                observation.tap(feature_name, frame, source_frame, tap, source, part)
+            mixed_runs[run_index][local_index : local_index + 1] += part
 
     heads = int(tokens.shape[1])
     head_dim = int(tokens.shape[2])
@@ -417,6 +424,8 @@ def _heterogeneous_conv_features(
             .reshape(frames * rows, heads, head_dim)
         )
         outputs.append(B._activate(run_tokens, l2norm=l2norm))
+    if observation is not None:
+        observation.mixed(feature_name, runs, mixed_runs, outputs, offsets)
     return torch.cat(outputs, dim=0)
 
 
@@ -431,6 +440,7 @@ def _variable_features(
     *,
     suppress_cross_grid_temporal_taps: bool = False,
     diagnostic_stats: dict[str, int] | None = None,
+    observation=None,
 ):
     conv = tuple(getattr(branch, "short_conv", ()) or ())
     grid_cache: dict[tuple[tuple[int, int], tuple[int, int], str], torch.Tensor] = {}
@@ -438,6 +448,11 @@ def _variable_features(
     def feature(name: str, raw: torch.Tensor, *, l2norm: bool):
         if name not in conv:
             return B._activate(raw, l2norm=l2norm)
+        if observation is not None:
+            observation.raw(
+                name, raw, weights[f"short_conv.{name}_sp.weight"],
+                weights[f"short_conv.{name}_tm.weight"], frame_sizes, offsets, l2norm=l2norm,
+            )
         return _heterogeneous_conv_features(
             raw,
             weights[f"short_conv.{name}_sp.weight"],
@@ -448,6 +463,8 @@ def _variable_features(
             grid_cache=grid_cache,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            observation=observation,
+            feature_name=name,
         )
 
     return (
@@ -640,6 +657,7 @@ def _core_readout(
     diagnostic_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
+    observation=None,
 ):
     offsets = _validate_inputs(
         branch,
@@ -653,6 +671,12 @@ def _core_readout(
     )
     heads = int(branch.num_heads)
     head_dim = int(branch.head_dim)
+    if observation is not None:
+        # These describe the actual readout domain after optional anchor trimming.
+        observation.context.update(
+            bounds=tuple(bounds), measure_scales=tuple(measure_scales),
+            statistics_domain="readout_frames_after_optional_anchor_trim",
+        )
     def component_span(name):
         return nullcontext() if cuda_span is None else cuda_span(name)
 
@@ -668,6 +692,7 @@ def _core_readout(
             offsets,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            observation=observation,
         )
     if record_component is not None:
         record_component(
@@ -704,6 +729,9 @@ def _core_readout(
             "vdn_linear_statistics_host_wall_s",
             time.perf_counter() - statistics_started,
         )
+
+    if observation is not None:
+        observation.statistics(a_raw, b_raw, alpha)
 
     scans_started = time.perf_counter()
     with component_span("vdn_linear_scans"):
@@ -799,6 +827,7 @@ def partitioned_linear_readout(
     diagnostic_stats: dict[str, int] | None = None,
     record_component=None,
     cuda_span=None,
+    observation=None,
 ) -> torch.Tensor:
     """Evaluate VDN's learned linear complement over heterogeneous frame grids."""
     total_started = time.perf_counter()
@@ -845,6 +874,7 @@ def partitioned_linear_readout(
             text_v_raw=text_v_raw,
             suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
             diagnostic_stats=diagnostic_stats,
+            observation=observation,
             record_component=record_component,
             cuda_span=cuda_span,
         )
@@ -872,6 +902,7 @@ def partitioned_linear_readout(
         text_v_raw=text_v_raw,
         suppress_cross_grid_temporal_taps=suppress_cross_grid_temporal_taps,
         diagnostic_stats=diagnostic_stats,
+        observation=observation,
         record_component=record_component,
         cuda_span=cuda_span,
     )
