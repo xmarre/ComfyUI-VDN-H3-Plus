@@ -10,6 +10,9 @@
   carrier, and their contracts and semantic digests are unchanged. The bridged
   forward advertises the accepted carriers in
   `_vdn_partitioned_native_carrier_grids`.
+- Optional native carrier row counts require an explicit target carrier and
+  integer values in the Flow and external-sequence contracts. Undeclared or
+  non-integer counts are rejected before attention execution.
 - Partitioned exact-prefix attention keeps the first generated local-query group
   dense. This preserves one attention operator across the carried/generated
   boundary while later generated groups retain native sparse Sol routing. The

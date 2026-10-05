@@ -232,7 +232,11 @@ def validate_flow_partition_contract(contract, *, sequence_rows):
         carrier = contract["native_carrier_grid"]
         if carrier != PARTITIONED_NATIVE_CARRIER_TARGET:
             raise ValueError("partitioned exact-prefix publishes native_carrier_grid only for the target carrier")
+        if type(contract.get("native_carrier_rows_per_frame")) is not int:
+            raise ValueError("partitioned exact-prefix native_carrier_rows_per_frame must be an integer")
     else:
+        if "native_carrier_rows_per_frame" in contract:
+            raise ValueError("partitioned exact-prefix native_carrier_rows_per_frame requires native_carrier_grid")
         carrier = PARTITIONED_NATIVE_CARRIER_SOURCE
     parsed = PartitionedSequence(
         **{name: contract[name] for name in geometry_names},

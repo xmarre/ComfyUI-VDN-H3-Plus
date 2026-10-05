@@ -124,3 +124,32 @@ def test_bridge_advertises_native_carrier_capability():
     current._vdn_forward = True
     wrapped = _wrap_vdn_forward(current)
     assert tuple(wrapped._vdn_partitioned_native_carrier_grids) == PARTITIONED_NATIVE_CARRIER_GRIDS
+
+
+@pytest.mark.parametrize("rows", [None, 6, 999])
+def test_source_carrier_rejects_an_undeclared_native_row_count(rows):
+    plan = PartitionedSequence(**_GEOMETRY)
+    contract = dict(plan.canonical_contract(), native_carrier_rows_per_frame=rows)
+    with pytest.raises(ValueError, match="requires native_carrier_grid"):
+        validate_flow_partition_contract(contract, sequence_rows=plan.sequence_rows)
+
+
+@pytest.mark.parametrize("rows", [None, 12.0, "12", True])
+def test_target_carrier_requires_integer_native_rows_in_both_contracts(rows):
+    plan = PartitionedSequence(**_GEOMETRY, native_carrier_grid=PARTITIONED_NATIVE_CARRIER_TARGET)
+    contract = plan.canonical_contract()
+    with pytest.raises(ValueError, match="native_carrier_rows_per_frame must be an integer"):
+        validate_flow_partition_contract(
+            dict(contract, native_carrier_rows_per_frame=rows), sequence_rows=plan.sequence_rows,
+        )
+    options = {
+        PARTITIONED_PREFIX_KEY: contract,
+        VDN_EXTERNAL_SEQUENCE_KEY: dict(
+            make_vdn_partitioned_external_contract(plan), native_carrier_rows_per_frame=rows,
+        ),
+    }
+    with pytest.raises(RuntimeError, match="native_carrier_rows_per_frame must be an integer"):
+        validate_partitioned_external_execution(
+            options, _native_layout(plan, plan.native_rows_per_frame), plan.sequence_rows,
+            torch.zeros(1, plan.sequence_rows, 2),
+        )

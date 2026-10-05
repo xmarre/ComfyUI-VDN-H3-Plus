@@ -24,6 +24,7 @@ from typing import Any
 from .partitioned_grouped import PartitionedGroupedPlan, build_partitioned_grouped_plan
 from .partitioned_sequence import (
     PARTITIONED_NATIVE_CARRIER_GRIDS,
+    PARTITIONED_NATIVE_CARRIER_TARGET,
     PARTITIONED_PREFIX_KEY,
     PARTITIONED_PREFIX_TOPOLOGY,
     VDN_PARTITIONED_SEQUENCE_API,
@@ -390,6 +391,11 @@ def validate_partitioned_external_execution(
     expected = make_vdn_partitioned_external_contract(plan)
     if not isinstance(external, dict):
         raise RuntimeError("VDN partitioned execution is missing its external-sequence contract")
+    if (
+        plan.native_carrier_grid == PARTITIONED_NATIVE_CARRIER_TARGET
+        and type(external.get("native_carrier_rows_per_frame")) is not int
+    ):
+        raise RuntimeError("VDN partitioned external native_carrier_rows_per_frame must be an integer")
     if external != expected:
         raise RuntimeError("VDN partitioned external-sequence contract does not match Flow geometry")
     if (

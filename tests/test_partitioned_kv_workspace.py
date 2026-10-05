@@ -22,7 +22,10 @@ from vdn_h3.partitioned_sequence import (
     (False, "rows", 5), (True, "columns", 5),
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_grid, anchor, sink, dtype):
+@pytest.mark.parametrize("native_carrier", ["source", "target"])
+def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_grid, anchor, sink, dtype, native_carrier):
+    if same_grid and native_carrier == "target":
+        pytest.skip("target carrier requires heterogeneous frame grids")
     torch.manual_seed(815)
     heads, head_dim = 2, 4
     width = heads * head_dim
@@ -30,14 +33,17 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
         video_start=sink, temporal=7, prefix_t=3,
         source_grid_h=2, source_grid_w=3,
         target_grid_h=2 if same_grid else 3, target_grid_w=3 if same_grid else 4,
+        native_carrier_grid=native_carrier,
     )
     cfg = {"radius": 1, "chunk": 2, "anchor_frames": anchor,
            "enable_softmax_gate": False, "linear_enabled": False}
     state = VDNState("partitioned-kv-workspace", cfg, [SimpleNamespace()], heads, head_dim,
                      retain_buffers=True)
+    frame_size = (3, 4) if native_carrier == "target" else (2, 3)
+    native_rows = plan.native_rows_per_frame
     layout = VDNLayout(
-        video_start=sink, video_end=sink + 7 * 6, num_frames=7, tokens_per_frame=6,
-        frame_size=(2, 3), text_start=0, text_len=sink, seq_len=sink + 7 * 6,
+        video_start=sink, video_end=sink + 7 * native_rows, num_frames=7, tokens_per_frame=native_rows,
+        frame_size=frame_size, text_start=0, text_len=sink, seq_len=sink + 7 * native_rows,
         radius=1, chunk=2, anchor_frames=anchor,
     )
     x = torch.randn(plan.sequence_rows, width).to(dtype)
