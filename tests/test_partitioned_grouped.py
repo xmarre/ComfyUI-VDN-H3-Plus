@@ -123,3 +123,37 @@ def test_partitioned_grouped_plan_keeps_prefix_measure_range_contiguous_after_gl
         start, end = group.prefix_k_range
         assert start == group.sink_rows
         assert end - start == len(prefix_frames) * flow.target_rows
+
+
+def test_chunk_aligned_boundary_splits_one_native_window_into_prefix_and_suffix_query_groups():
+    flow = PartitionedSequence(
+        video_start=7,
+        temporal=20,
+        prefix_t=12,
+        source_grid_h=2,
+        source_grid_w=3,
+        target_grid_h=3,
+        target_grid_w=4,
+    )
+    grouped = build_partitioned_grouped_plan(
+        flow,
+        bounds=window_bounds(flow.temporal, radius=1, chunk=5),
+        anchor_frames="both",
+        semantic_digest="e" * 64,
+    )
+
+    boundary_suffix = next(
+        group for group in grouped.groups
+        if flow.prefix_t in group.query_frames
+    )
+    prefix_sibling = next(
+        group for group in grouped.groups
+        if group.query_prefix_domain
+        and group.key_frames == boundary_suffix.key_frames
+    )
+
+    assert prefix_sibling.query_frames == (10, 11)
+    assert boundary_suffix.query_frames == (12, 13, 14)
+    assert prefix_sibling.query_prefix_domain is True
+    assert boundary_suffix.query_prefix_domain is False
+    assert prefix_sibling.key_frames == boundary_suffix.key_frames
