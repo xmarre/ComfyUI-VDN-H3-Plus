@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- The partitioned exact-prefix contract may declare `native_carrier_grid="target"`
+  with `native_carrier_rows_per_frame`. The native (pre-partition) sequence is
+  then the uniform target grid while the partition presented to VDN keeps its
+  `[target-grid head | source-grid tail]` layout. VDN validates its native layout
+  against the declared carrier. Contracts without the field keep the reduced-grid
+  carrier, and their contracts and semantic digests are unchanged. The bridged
+  forward advertises the accepted carriers in
+  `_vdn_partitioned_native_carrier_grids`.
 - Partitioned exact-prefix attention keeps the first generated local-query group
   dense. This preserves one attention operator across the carried/generated
   boundary while later generated groups retain native sparse Sol routing. The
