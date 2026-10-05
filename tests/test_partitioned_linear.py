@@ -1,10 +1,14 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
 
 from vdn_h3.branch import LinearBranch
+from vdn_h3 import branch as B
+from vdn_h3.retained import RuntimeLinearBranch
+from vdn_h3.runtime import RuntimeBufferOwner, current_runtime_buffers
 from vdn_h3.partitioned_linear import (
     _batched_frame_statistics,
     _batched_output_readout,
@@ -508,9 +512,246 @@ def test_variable_grid_linear_reduces_to_released_readout_on_uniform_grid(prefix
         measure_scales=measures,
         skip_ends=skip_ends,
     )
+    # Force the original general path without changing uniform-grid arithmetic,
+    # so dispatch to released readout cannot make this oracle tautological.
+    general = partitioned_linear_readout(
+        branch, weights, x, q, k, v,
+        frame_sizes=frame_sizes, bounds=bounds, measure_scales=measures,
+        skip_ends=skip_ends, diagnostic_stats={},
+    )
 
     assert partitioned.shape == released.shape
     assert torch.allclose(partitioned, released, rtol=2e-5, atol=2e-5)
+    assert torch.allclose(partitioned, general, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("fast_kernels", (False, True))
+@pytest.mark.parametrize("skip_ends", (False, True))
+@pytest.mark.parametrize("strided", [False, True])
+def test_uniform_dispatch_preserves_text_anchors_and_execution_owned_scans(monkeypatch, fast_kernels, skip_ends, strided):
+    weights = _weights(seed=311)
+    branch = RuntimeLinearBranch(weights, 2, 3, enable_text_state=True)
+    branch.fuse_epilogue = fast_kernels
+    shared_backend = branch._delta_backend(97)
+    shared_key = branch._backend_key
+    inputs = _inputs(24)
+    if strided:
+        # The actual QKV projection's split views share a 3*H*d row stride.
+        x, q, k, v = inputs
+        packed = torch.cat((q.flatten(1), k.flatten(1), v.flatten(1)), dim=-1)
+        inputs = (x, *(part.view_as(q) for part in packed.split(q.shape[1] * q.shape[2], dim=-1)))
+    text_x, _text_q, text_k, text_v = _inputs(3, seed=313)
+    originals = tuple(t.clone() for t in (*inputs, text_x, text_k, text_v))
+    kwargs = dict(
+        frame_sizes=((2, 3),) * 4, measure_scales=(1.0,) * 4,
+        bounds=((-1, 1), (0, 2), (1, 3), (2, 4)), skip_ends=skip_ends,
+        text_x=text_x, text_k_raw=text_k, text_v_raw=text_v,
+    )
+    reference = partitioned_linear_readout(branch, weights, *inputs, diagnostic_stats={}, **kwargs)
+    compiled_keys = []
+    epilogue_flags = []
+    epilogue = B.linear_epilogue
+
+    def compiled_body(key, body, *args, **kw):
+        compiled_keys.append(key)
+        return body(*args, **kw)
+
+    def checked_epilogue(*args, fuse=False):
+        epilogue_flags.append(fuse)
+        return epilogue(*args, fuse=False)
+
+    # Test flag routing and math without compiling a CPU kernel that would not
+    # qualify the CUDA implementation.
+    monkeypatch.setattr(B, "_run_compiled", compiled_body)
+    monkeypatch.setattr(B, "linear_epilogue", checked_epilogue)
+    recorded = {}
+    spans = []
+
+    @contextmanager
+    def cuda_span(name):
+        spans.append(name)
+        yield
+
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as outer:
+        stats = {}
+        got = partitioned_linear_readout(
+            branch, weights, *inputs, **kwargs, execution_stats=stats,
+            record_component=lambda name, elapsed: recorded.__setitem__(name, elapsed),
+            cuda_span=cuda_span,
+        )
+        assert outer.retained_counts()["scan"] == 1
+        outer_banks = next(iter(outer._scan.values()))
+        outer_snapshot = tuple(bank.clone() for bank in outer_banks)
+        with owner.execution() as inner:
+            nested = partitioned_linear_readout(branch, weights, *inputs, **kwargs)
+            assert current_runtime_buffers() is inner and inner is not outer
+        assert current_runtime_buffers() is outer
+        for bank, before in zip(outer_banks, outer_snapshot, strict=True):
+            assert torch.equal(bank, before)
+    assert current_runtime_buffers() is None
+    assert stats == {
+        "native_uniform_calls": 1,
+        **({"native_uniform_fast_requested_calls": 1} if fast_kernels else {}),
+    }
+    assert epilogue_flags == [fast_kernels, fast_kernels]
+    assert bool(compiled_keys) is fast_kernels
+    if fast_kernels:
+        assert any(key[0] == "act_fhsd" for key in compiled_keys)
+        assert any(key[0] == "gather" for key in compiled_keys)
+    assert spans == ["vdn_linear_native_uniform"]
+    assert set(recorded) == {"vdn_linear_native_uniform_host_wall_s", "vdn_linear_api_host_wall_s"}
+    assert all(elapsed >= 0 for elapsed in recorded.values())
+    assert torch.allclose(got, reference, rtol=2e-5, atol=2e-5)
+    assert torch.equal(got, nested)
+    if skip_ends:
+        assert torch.count_nonzero(got[:6]) == torch.count_nonzero(got[-6:]) == 0
+    assert branch._backend is shared_backend and branch._backend_key == shared_key
+    for before, after in zip(originals, (*inputs, text_x, text_k, text_v), strict=True):
+        assert torch.equal(before, after)
+
+
+@pytest.mark.parametrize("fallback", (
+    "same_area_different_axes", "nonunit_measure", "near_unit_measure", "noncontiguous",
+    "q_convolution", "cross_grid_diagnostic", "diagnostic_stats", "destination_carrier",
+    "carrier_stats", "observation",
+))
+def test_uniform_dispatch_keeps_general_path_for_distinct_contracts(monkeypatch, fallback):
+    weights = _weights()
+    branch = _branch(weights)
+    inputs = _inputs(24)
+    kwargs = dict(frame_sizes=((2, 3),) * 4, bounds=((0, 1), (0, 2), (1, 3), (2, 3)), measure_scales=(1.0,) * 4)
+    if fallback == "same_area_different_axes":
+        kwargs["frame_sizes"] = ((2, 3), (2, 3), (3, 2), (3, 2))
+    elif fallback in {"nonunit_measure", "near_unit_measure"}:
+        kwargs["measure_scales"] = (0.5 if fallback == "nonunit_measure" else 1.0 - 1e-12,) + (1.0,) * 3
+    elif fallback == "noncontiguous":
+        inputs = tuple(torch.stack((t, t), dim=-1)[..., 0] for t in inputs)
+    elif fallback == "q_convolution":
+        branch.short_conv = ("q", "k", "v")
+    elif fallback == "cross_grid_diagnostic":
+        kwargs["suppress_cross_grid_temporal_taps"] = True
+    elif fallback == "diagnostic_stats":
+        kwargs["diagnostic_stats"] = {}
+    elif fallback == "destination_carrier":
+        kwargs["temporal_carrier_policy"] = VDN_TEMPORAL_CARRIER_DESTINATION
+    elif fallback == "carrier_stats":
+        kwargs["carrier_stats"] = {}
+    else:
+        kwargs["observation"] = object()
+    sentinel = torch.empty((24, 6))
+    from vdn_h3 import partitioned_linear
+
+    def general(*args, **kw):
+        assert kw.get("observation") is kwargs.get("observation")
+        return sentinel
+
+    def unexpected_native(*args, **kw):
+        pytest.fail("a distinct partitioned contract reached the native uniform readout")
+
+    monkeypatch.setattr(partitioned_linear, "_core_readout", general)
+    monkeypatch.setattr(LinearBranch, "readout", unexpected_native)
+    stats = {}
+    assert partitioned_linear_readout(branch, weights, *inputs, **kwargs, execution_stats=stats) is sentinel
+    assert stats == {}
+
+
+@pytest.mark.parametrize("bad_input, message", (
+    ("measure", "physical measure"), ("bounds", "bound"), ("rows", "hidden rows"),
+    ("anchor_bounds", "bound"),
+    ("even_temporal_kernel", "odd depthwise kernel"),
+))
+def test_uniform_dispatch_preserves_validation(monkeypatch, bad_input, message):
+    weights = _weights()
+    branch = _branch(weights)
+    inputs = _inputs(24)
+    kwargs = dict(frame_sizes=((2, 3),) * 4, bounds=((0, 1), (0, 2), (1, 3), (2, 3)), measure_scales=(1.0,) * 4)
+    if bad_input == "measure":
+        kwargs["measure_scales"] = (1.0, float("nan"), 1.0, 1.0)
+    elif bad_input == "bounds":
+        kwargs["bounds"] = ((2, 1), (0, 2), (1, 3), (2, 3))
+    elif bad_input == "rows":
+        inputs = (inputs[0][:-1], *inputs[1:])
+    elif bad_input == "anchor_bounds":
+        kwargs["skip_ends"] = True
+        kwargs["bounds"] = ((0, 1), (0, 0), (1, 3), (2, 3))
+    else:
+        weights["short_conv.k_tm.weight"] = weights["short_conv.k_tm.weight"][..., :4]
+
+    def unexpected_native(*args, **kw):
+        pytest.fail("malformed input reached the native uniform readout")
+
+    monkeypatch.setattr(LinearBranch, "readout", unexpected_native)
+    with pytest.raises(RuntimeError, match=message):
+        partitioned_linear_readout(branch, weights, *inputs, **kwargs)
+
+
+@pytest.mark.parametrize("general", (False, True))
+@pytest.mark.parametrize("retain", (False, True))
+def test_linear_features_and_statistics_do_not_overlap_later_workspaces(monkeypatch, general, retain):
+    from vdn_h3 import partitioned_linear, retained
+
+    weights = _weights(seed=317)
+    branch = RuntimeLinearBranch(weights, 2, 3, enable_text_state=False)
+    inputs = _inputs(24)
+    bounds = ((0, 1), (0, 2), (1, 3), (2, 3))
+    with torch.no_grad():
+        reference = _branch(weights).readout(weights, *inputs, 4, 6, bounds, frame_size=(2, 3))
+    refs = {}
+    native_features = RuntimeLinearBranch._features
+    variable_features = partitioned_linear._variable_features
+    statistics = B.frame_statistics
+    alpha_gate = B.alpha_gate
+    scans = retained.run_scans_runtime
+    gather = B.gather_linear_state
+    epilogue = B.linear_epilogue
+
+    def track_features(values):
+        refs.update({name: weakref.ref(t) for name, t in zip(("query", "key", "value"), values, strict=True)})
+        return values
+
+    def checked_statistics(*args, **kwargs):
+        values = statistics(*args, **kwargs)
+        refs.update({name: weakref.ref(t) for name, t in zip(("a", "b"), values, strict=True)})
+        return values
+
+    def checked_alpha(*args, **kwargs):
+        assert refs["key"]() is None and refs["value"]() is None
+        return alpha_gate(*args, **kwargs)
+
+    def checked_scans(*args, **kwargs):
+        values = scans(*args, **kwargs)
+        refs.update({name: weakref.ref(t) for name, t in zip(("prefix", "suffix"), values, strict=True)})
+        return values
+
+    def checked_gather(*args, **kwargs):
+        assert refs["a"]() is None and refs["b"]() is None
+        value = gather(*args, **kwargs)
+        refs["state"] = weakref.ref(value)
+        return value
+
+    def checked_epilogue(*args, **kwargs):
+        assert (refs["prefix"]() is not None) is retain
+        assert (refs["suffix"]() is not None) is retain
+        if not general:
+            assert refs["query"]() is None and refs["state"]() is None
+        return epilogue(*args, **kwargs)
+
+    monkeypatch.setattr(RuntimeLinearBranch, "_features", lambda *a, **kw: track_features(native_features(*a, **kw)))
+    monkeypatch.setattr(partitioned_linear, "_variable_features", lambda *a, **kw: track_features(variable_features(*a, **kw)))
+    monkeypatch.setattr(B, "frame_statistics", checked_statistics)
+    monkeypatch.setattr(B, "alpha_gate", checked_alpha)
+    monkeypatch.setattr(retained, "run_scans_runtime", checked_scans)
+    monkeypatch.setattr(partitioned_linear, "run_scans_runtime", checked_scans)
+    monkeypatch.setattr(B, "gather_linear_state", checked_gather)
+    monkeypatch.setattr(B, "linear_epilogue", checked_epilogue)
+    with RuntimeBufferOwner(retain).execution(), torch.no_grad():
+        result = partitioned_linear_readout(
+            branch, weights, *inputs, frame_sizes=((2, 3),) * 4,
+            bounds=bounds, measure_scales=(1.0,) * 4,
+            diagnostic_stats={} if general else None,
+        )
+    assert torch.allclose(result, reference, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize("prefix_t, source_rows", ((0, 4), (4, 4), (2, 0), (2, 5)))
