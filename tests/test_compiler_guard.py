@@ -160,7 +160,7 @@ def _run_core_apply_model(monkeypatch, apply_model_wrappers):
     diffusion_model = SimpleNamespace(_forward=_forward)
 
     def _apply_model(x, t, c_concat=None, c_crossattn=None, control=None,
-                     transformer_options={}, **kwargs):
+                     transformer_options=None, **kwargs):
         # BaseModel._apply_model's call into the native MiniMax-H3 forward.
         return minimax_model.MiniMaxH3Model.forward(
             diffusion_model, x, t, None, transformer_options={})
