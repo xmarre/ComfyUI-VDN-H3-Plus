@@ -16,6 +16,7 @@ from vdn_h3.partitioned_sequence import (
 )
 
 
+@pytest.mark.parametrize("sink_measure", [False, True])
 @pytest.mark.parametrize("same_grid,anchor,sink", [
     (True, "none", 1), (True, "both", 5),
     (False, "none", 5), (False, "both", 1),
@@ -23,7 +24,7 @@ from vdn_h3.partitioned_sequence import (
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("native_carrier", ["source", "target"])
-def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_grid, anchor, sink, dtype, native_carrier):
+def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_grid, anchor, sink, dtype, native_carrier, sink_measure):
     if same_grid and native_carrier == "target":
         pytest.skip("target carrier requires heterogeneous frame grids")
     torch.manual_seed(815)
@@ -93,6 +94,7 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
     package = ModuleType("sol_h3")
     request = ModuleType("sol_h3.partitioned_request")
     request.partitioned_request_attention = attention
+    request.PARTITIONED_SINK_MEASURE_API = 1
     monkeypatch.setitem(sys.modules, "sol_h3", package)
     monkeypatch.setitem(sys.modules, "sol_h3.partitioned_request", request)
     monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", rope)
@@ -108,6 +110,8 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
         PARTITIONED_PREFIX_KEY: plan.canonical_contract(),
         partitioned_runtime.VDN_EXTERNAL_SEQUENCE_KEY: make_vdn_partitioned_external_contract(plan),
     }
+    if sink_measure:
+        options[partitioned_runtime.VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY] = "target_query_sink_measure"
     with state.runtime.execution(), torch.no_grad():
         token = state._layout.set(layout)
         try:
@@ -137,7 +141,10 @@ def test_partitioned_kv_storage_reuse_and_dense_frame_oracle(monkeypatch, same_g
             if anchor in ("columns", "both"):
                 frames.update((0, plan.temporal - 1))
             keys = list(range(sink)) + [row for f in sorted(frames) for row in frame_rows[f]]
-        expected[rows] = dense(expected_q[rows], expected_k[keys], expected_v[keys], full_bias[keys])
+        frame_bias = full_bias.clone()
+        if sink_measure and frame < plan.prefix_t:
+            frame_bias[:sink] = plan.prefix_log_key_measure
+        expected[rows] = dense(expected_q[rows], expected_k[keys], expected_v[keys], frame_bias[keys])
     torch.testing.assert_close(got, expected.reshape(-1, width), rtol=1e-5 if dtype == torch.float32 else 0.01,
                                atol=1e-6 if dtype == torch.float32 else 0.01)
     assert preprocessing_calls == [True]

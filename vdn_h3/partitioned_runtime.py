@@ -56,18 +56,19 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
 )
 
 # Flow-owned discriminator for the remaining exact-prefix boundary defect.
-# It changes only the Sol execution mode of suffix local-query groups. The
-# grouped Q/K/V gather, key ranges, target-prefix measure bias and VDN linear
-# ownership remain identical to the normal path.
+# Modes isolate either suffix dense dispatch or target-query conditioning-key
+# measure. Physical gathers and learned linear ownership remain unchanged.
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_POLICY = "boundary_suffix_local_group_dense_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK = "target_query_sink_measure"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
     VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK,
 )
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
 
@@ -182,6 +183,36 @@ def _partitioned_softmax_diagnostic_mode(options: dict[str, Any]) -> str:
             f"{VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS!r}, got {raw!r}"
         )
     return str(raw)
+
+
+def _partitioned_query_measure_range(prefix_range, *, sink_rows, target_query, mode, log_measure):
+    """Extend only target-query bias over conditioning rows, preserving K/V order."""
+    if mode != VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK or not target_query or log_measure == 0.0:
+        return prefix_range
+    if prefix_range is None or prefix_range[0] != sink_rows:
+        raise RuntimeError("target-query sink measure requires contiguous target keys after conditioning rows")
+    return (0, prefix_range[1])
+
+
+def _partitioned_anchor_domains(grouped, *, split_target):
+    # Baseline keeps its single anchor call. The opt-in path separates target
+    # and source queries so both cannot receive one query-dependent key bias.
+    if not split_target:
+        return ((False, grouped.anchor_slices),)
+    target, source = [], []
+    for frame, rows in enumerate(grouped.frame_ranges):
+        if rows in grouped.anchor_slices:
+            (target if frame < grouped.prefix_t else source).append(rows)
+    return ((True, tuple(target)), (False, tuple(source)))
+
+
+def _record_partitioned_target_sink_measure(options, *, q_rows, kv_rows):
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_target_sink_measure_calls")
+        increment("partitioned_vdn_target_sink_measure_q_rows", int(q_rows))
+        increment("partitioned_vdn_target_sink_measure_kv_rows", int(kv_rows))
 
 
 def _partitioned_local_force_dense(
@@ -560,6 +591,15 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         raise RuntimeError("partitioned exact-prefix VDN requires an active runtime-buffer lease")
     index_identity = ("partitioned_exact_prefix_v1", grouped.plan_digest)
 
+    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
+    target_sink_measure = softmax_diagnostic_mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK
+    if target_sink_measure:
+        if _partitioned_linear_diagnostic_mode(options) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE:
+            raise RuntimeError("target-query sink measure cannot be combined with raw_token_measure")
+        from sol_h3 import partitioned_request as sol_request
+        if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
+            raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
+
     q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
     v = v.view(s, heads, head_dim)
     q_raw = q.view(s, heads, head_dim)
@@ -745,7 +785,6 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         ) from exc
 
     scale = head_dim**-0.5
-    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
     raw_token_measure = (
         linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE
     )
@@ -832,6 +871,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 attention_head_t=attention_head_t,
             )
         )
+        measure_range = _partitioned_query_measure_range(
+            group.prefix_k_range, sink_rows=group.sink_rows,
+            target_query=group.query_prefix_domain, mode=softmax_diagnostic_mode, log_measure=measure,
+        )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[q_index] = partitioned_request_attention(
@@ -843,7 +886,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 kind="local",
                 scale=scale,
                 sink_rows=group.sink_rows,
-                prefix_k_range=group.prefix_k_range,
+                prefix_k_range=measure_range,
                 prefix_log_key_measure=measure,
                 semantic_digest=semantic_digest,
                 query_position_map=wire,
@@ -852,6 +895,8 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 # grouped Q/K/V gather and measure bias have been fixed.
                 force_dense=force_dense,
             )
+        if measure_range != group.prefix_k_range:
+            _record_partitioned_target_sink_measure(options, q_rows=group.q_rows, kv_rows=group.kv_rows)
         if boundary_dense_suffix:
             _record_partitioned_boundary_suffix_dense(
                 options,
@@ -872,17 +917,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if grouped.groups:
         del k_scratch, v_scratch
 
-    if grouped.anchor_slices:
+    for target_anchor, anchor_slices in _partitioned_anchor_domains(grouped, split_target=target_sink_measure):
+        if not anchor_slices:
+            continue
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
             anchor_index = _indices_from_ranges(
-                grouped.anchor_slices,
+                anchor_slices,
                 device=device,
                 resources=resources,
-                identity=(*index_identity, "anchor"),
+                identity=(*index_identity, "anchor", target_anchor) if target_sink_measure else (*index_identity, "anchor"),
             )
             q_anchor = q[anchor_index]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        anchor_measure_range = _partitioned_query_measure_range(
+            grouped.full_prefix_k_range, sink_rows=grouped.video_start,
+            target_query=target_anchor, mode=softmax_diagnostic_mode, log_measure=prefix_log_key_measure,
+        )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[anchor_index] = partitioned_request_attention(
@@ -894,12 +945,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 kind="anchor",
                 scale=scale,
                 sink_rows=0,
-                prefix_k_range=grouped.full_prefix_k_range,
+                prefix_k_range=anchor_measure_range,
                 prefix_log_key_measure=plan.prefix_log_key_measure,
                 semantic_digest=semantic_digest,
                 force_dense=True,
             )
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
+        if anchor_measure_range != grouped.full_prefix_k_range:
+            _record_partitioned_target_sink_measure(options, q_rows=int(anchor_index.numel()), kv_rows=grouped.sequence_rows)
         del q_anchor
         covered_rows += int(anchor_index.numel())
 

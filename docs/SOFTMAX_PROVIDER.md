@@ -109,3 +109,19 @@ The separate PR #8 audio-fidelity experiment is not part of this provider-v4 rel
 The v4 implementation has CPU tests for exact restricted-domain mapping, owner-bound preflight, provider precedence, malformed-v4 native fallback, and suppression of the v2 square-Q payload. Paired Sol-H3 v0.1.5 production validation additionally passed real SM120 same-input validation, controlled first-high replay, the historical-M timing gate, and the representative 2x7-second Target Input trajectory.
 
 The released v3 stack remains historical evidence for direct rectangular routing. v4 changes the numerical routing policy only when a paired provider validates and consumes the explicit map; it does not retroactively change the behavior of older providers.
+
+## Partitioned target-query conditioning measure
+
+Flow's opt-in `target_query_sink_measure` softmax diagnostic extends the
+partitioned target-key measure over non-video rows for target-grid local
+and anchor queries. A local group's K/V order is non-video rows, target-grid
+head keys, then reduced-grid tail keys; `(0, target_end)` is therefore the
+contiguous affected range. Reduced-grid and global queries retain the baseline
+measure. Query maps, temporal windows, dense/sparse routing and learned linear
+statistics are preserved. Anchor rows on different grids use separate dense
+calls. Sol partitioned sink-measure API 1 is required. Normal remains the default.
+
+The head domain includes both exact protected frames and mutable target-band
+frames. This selector changes their attention weighting, not their timestep or
+protection masks. It must not be combined with `raw_token_measure`. It is an
+experimental weighting policy; output quality requires matched rendered runs.

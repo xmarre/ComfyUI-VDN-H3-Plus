@@ -335,3 +335,13 @@ v1.5.2's non-mutating bypass ownership, pruned-AdaLN runtime residual math, `cud
 ---
 
 Previous release notes through v1.5.2 are preserved verbatim in `docs/RELEASE_NOTES_v1.5.2_AND_EARLIER.md`.
+
+## Target-query conditioning measure
+
+Adds Flow's opt-in `target_query_sink_measure` diagnostic to partitioned
+softmax. Target-grid local and row-anchor queries bias conditioning keys
+alongside target-grid video keys. Source-grid and global queries and learned
+linear measure policy are preserved. Requires paired Sol sink-measure API 1.
+Normal is unchanged. Mixed-grid row anchors require separate dense subcalls;
+there are no additional model evaluations. Rendered quality and GPU timing
+are not established by CPU arithmetic and lifetime tests.

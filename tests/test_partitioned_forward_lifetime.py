@@ -19,8 +19,9 @@ from vdn_h3.partitioned_sequence import (
 )
 
 
+@pytest.mark.parametrize("sink_measure", [False, True])
 @pytest.mark.parametrize("gate_enabled,retain", [(False, False), (False, True), (True, True)])
-def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monkeypatch, gate_enabled, retain):
+def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monkeypatch, gate_enabled, retain, sink_measure):
     torch.manual_seed(62)
     plan = PartitionedSequence(
         video_start=7, temporal=5, prefix_t=2,
@@ -76,6 +77,7 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     def linear_readout(_branch, _weights, _xv, q_raw, k_raw, v_raw, **kwargs):
         assert all(ref() is None for ref in references.values())
         events.append("linear")
+        assert kwargs.get("raw_token_measure", False) is False
         for actual, original in zip((q_raw, k_raw, v_raw), (raw_q, raw_k, raw_v)):
             assert torch.equal(actual.reshape(-1, 2), original[plan.video_start:])
         assert torch.equal(kwargs["text_k_raw"].reshape(-1, 2), raw_k[1:3])
@@ -85,6 +87,7 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     sol_package = ModuleType("sol_h3")
     sol_request = ModuleType("sol_h3.partitioned_request")
     sol_request.partitioned_request_attention = attention
+    sol_request.PARTITIONED_SINK_MEASURE_API = 1
     monkeypatch.setitem(sys.modules, "sol_h3", sol_package)
     monkeypatch.setitem(sys.modules, "sol_h3.partitioned_request", sol_request)
     monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", rope)
@@ -98,6 +101,8 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     }
     options = {PARTITIONED_PREFIX_KEY: plan.canonical_contract(),
                partitioned_runtime.VDN_EXTERNAL_SEQUENCE_KEY: make_vdn_partitioned_external_contract(plan)}
+    if sink_measure:
+        options[partitioned_runtime.VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY] = "target_query_sink_measure"
     with state.runtime.execution():
         token = state._layout.set(layout)
         try:
@@ -114,11 +119,12 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     assert events == ["weights", "linear"]
 
 
+@pytest.mark.parametrize("sink_measure", [False, True])
 @pytest.mark.parametrize("fast_kernels", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strength", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("grid_case", [(False, None), (True, None), (False, 3)])
-def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, strength, grid_case):
+def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, strength, grid_case, sink_measure):
     mixed_grid, attention_head_t = grid_case
     torch.manual_seed(774)
     plan = PartitionedSequence(
@@ -175,6 +181,9 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     }
     sol_package = ModuleType("sol_h3")
     sol_request = ModuleType("sol_h3.partitioned_request")
+    sol_request.PARTITIONED_SINK_MEASURE_API = 1
+    if sink_measure:
+        options[partitioned_runtime.VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY] = "target_query_sink_measure"
     def attention(q, _k, _v, **kwargs):
         events.append("softmax")
         force_dense_calls.append(bool(kwargs["force_dense"]))
@@ -221,6 +230,10 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
                 state._layout.reset(token)
 
     native = execute()
+    sink_counters = {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")}
+    assert bool(sink_counters) == bool(sink_measure and mixed_grid)
+    for k in sink_counters:
+        counters.pop(k)
     expected_boundary_counters = {
         "partitioned_vdn_boundary_suffix_dense_calls": 1,
         "partitioned_vdn_boundary_suffix_dense_q_rows": 6,
@@ -252,6 +265,9 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _context: False)
     monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", general)
     reference = execute()
+    assert {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")} == sink_counters
+    for k in sink_counters:
+        counters.pop(k)
     assert counters == expected_boundary_counters
     # One global packed-sequence call is dense, followed by per-frame local groups:
     # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
