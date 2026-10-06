@@ -237,7 +237,7 @@ Newly created nodes still default to `architecture_mode="checkpoint"`.
 - VDN's retained local-window operator uses exact SDPA and deliberately does not inherit model-level `transformer_options` attention overrides such as Sage/Kitchen backends.
 - VDN owns the H3 attention object patch. Another extension that tries to own the same `diffusion_model.blocks.*.attn.forward` target is rejected rather than ambiguously stacked.
 - Runtime LoRA/DoRA providers using Comfy's ordinary `BypassForwardHook` mechanism may coexist with VDN bypass. VDN does not join or rewrite that provider's forward chain.
-- The AIMDO malloc-graph compatibility guard is scoped only around VDN diffusion-model execution and restores the user's compiler setting afterward.
+- The AIMDO malloc-graph compatibility guard is an `APPLY_MODEL` wrapper on the VDN-patched model. It disables Comfy's model compiler for each VDN model evaluation, before the native MiniMax-H3 forward decides whether to record an allocation graph, and restores the setting afterward. A user-supplied `--disable-comfy-compiler` is never changed.
 - Historical benchmark numbers in [Benchmarks.md](Benchmarks.md) predate the current lifecycle work and are not assigned to this runtime without matched measurement.
 
 ## Validation
