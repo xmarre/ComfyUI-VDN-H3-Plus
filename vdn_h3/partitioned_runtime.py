@@ -189,6 +189,7 @@ def _partitioned_local_force_dense(
     mode: str,
     *,
     prefix_t: int,
+    attention_head_t: int | None = None,
 ) -> tuple[bool, bool, bool]:
     """Return dense-routing ownership for one existing local query group.
 
@@ -220,13 +221,20 @@ def _partitioned_local_force_dense(
         not bool(group.query_prefix_domain)
         and prefix_t in query_frames
     )
+    head = prefix_t if attention_head_t is None else attention_head_t
+    if type(head) is not int or head < prefix_t:
+        raise RuntimeError("partitioned VDN dense-query head must cover the protected prefix")
+    # A free target-grid band keeps its low-stage dense policy in high. The
+    # existing physical groups, prefix measure and timestep masks are unchanged.
+    band_dense = any(frame <= head for frame in query_frames)
     diagnostic_suffix = bool(
         mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
         and not bool(group.query_prefix_domain)
         and not boundary_suffix
+        and not band_dense
     )
     return (
-        bool(group.query_prefix_domain or boundary_suffix or diagnostic_suffix),
+        bool(group.query_prefix_domain or boundary_suffix or band_dense or diagnostic_suffix),
         diagnostic_suffix,
         boundary_suffix,
     )
@@ -258,6 +266,7 @@ def _record_partitioned_boundary_suffix_dense(
             policy=VDN_PARTITIONED_BOUNDARY_QUERY_POLICY,
             stage=options.get("h3_flow_stage"),
             prefix_t=int(prefix_t),
+            attention_head_t=int(getattr(runtime, "attention_head_t", None) or prefix_t),
             query_frames=tuple(int(frame) for frame in group.query_frames),
             q_rows=int(group.q_rows),
             kv_rows=int(group.kv_rows),
@@ -502,6 +511,13 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if layout is None:
         raise RuntimeError("partitioned exact-prefix VDN requires an active native low-grid layout")
     plan = validate_partitioned_external_execution(options, layout, int(x.shape[0]), rope_freqs)
+    attention_head_t = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "attention_head_t", None)
+    if attention_head_t is not None and (
+        type(attention_head_t) is not int
+        or not plan.prefix_t <= attention_head_t < plan.temporal
+        or (plan.source_grid_h, plan.source_grid_w) != (plan.target_grid_h, plan.target_grid_w)
+    ):
+        raise RuntimeError("an extended dense-query head requires a uniform target-grid high stage")
     flow_contract = options[PARTITIONED_PREFIX_KEY]
     semantic_digest = str(flow_contract["semantic_digest"])
     grouped = _grouped_plan(plan, layout, semantic_digest=semantic_digest)
@@ -575,11 +591,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     from . import branch as B
     from .boundary_witness import WITNESS_KEY
 
-    uniform_linear = (
+    pre_rope_linear = (
         linear_active
         and not torch.is_grad_enabled()
-        and plan.source_grid_h == plan.target_grid_h
-        and plan.source_grid_w == plan.target_grid_w
         and linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL
         and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_NATIVE
         and options.get(WITNESS_KEY) is None
@@ -592,11 +606,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     precomputed_softmax_gate = None
     q_raw_video = k_raw_video = v_raw_video = None
     text_x = text_k_raw = text_v_raw = None
-    if uniform_linear:
-        # Native VDN already reads strided projection views before in-place
-        # RoPE. Identical physical grids and unit measure have the same readout.
-        # Keep only its projected result through softmax, rather than three
-        # full-size raw video copies. Diagnostic and mixed-grid paths stay late.
+    if pre_rope_linear:
+        # Both readouts consume raw QKV before in-place RoPE. Materialize the
+        # projected complement now instead of retaining three full raw copies
+        # through softmax. Diagnostic feature witnesses keep the late path.
         resources.release_activation_scratch()
         weights_started = time.perf_counter()
         with cuda_span("vdn_weights"):
@@ -610,7 +623,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             text_x = x[text_start:text_end]
             text_k_raw = k_raw[text_start:text_end]
             text_v_raw = v[text_start:text_end]
-        from .partitioned_linear import partitioned_linear_readout
+        from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
+
+        frame_sizes, measure_scales = partitioned_frame_contract(plan)
 
         linear_started = time.perf_counter()
         linear_execution_stats = {}
@@ -618,9 +633,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             base_branch,
             weights, x[grouped.video_start:], q_raw[grouped.video_start:],
             k_raw[grouped.video_start:], v[grouped.video_start:],
-            frame_sizes=((plan.source_grid_h, plan.source_grid_w),) * plan.temporal,
+            frame_sizes=frame_sizes,
             bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
-            measure_scales=(1.0,) * plan.temporal,
+            measure_scales=measure_scales,
             text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
             skip_ends=(cfg["anchor_frames"] == "both"),
             record_component=record_component, cuda_span=cuda_span,
@@ -647,7 +662,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             ):
                 if linear_execution_stats.get(stat):
                     increment(counter, linear_execution_stats[stat])
-            increment("partitioned_vdn_uniform_pre_rope_calls")
+            increment("partitioned_vdn_pre_rope_linear_calls")
+            if plan.source_grid_h == plan.target_grid_h and plan.source_grid_w == plan.target_grid_w:
+                increment("partitioned_vdn_uniform_pre_rope_calls")
         del readout, weights, text_x, text_k_raw, text_v_raw
     elif linear_active:
         video_start = grouped.video_start
@@ -812,6 +829,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 group,
                 softmax_diagnostic_mode,
                 prefix_t=plan.prefix_t,
+                attention_head_t=attention_head_t,
             )
         )
         softmax_started = time.perf_counter()
@@ -894,7 +912,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     weights_started = time.perf_counter()
     with cuda_span("vdn_weights"):
-        if uniform_linear:
+        if pre_rope_linear:
             # Keep streamed lookahead after softmax, matching native VDN.
             state.prefetch_next_weights(block_index, device, dtype)
         else:

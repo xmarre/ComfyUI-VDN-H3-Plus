@@ -212,6 +212,13 @@ VDN supports the external-sequence contracts used by MiniMax-H3 Flow-Aligned Reg
 - API 2 `mixed_grid_low_suffix` for a target-grid protected prefix plus a genuine low-grid generated suffix;
 - API 4 partitioned exact-prefix sequences (`[target-grid head | reduced-grid tail]`). The native carrier is the reduced grid by default; Flow's opt-in target-band continuation declares a target-grid native carrier with `native_carrier_grid="target"`, and VDN validates Core's native layout against that declaration.
 
+Partitioned inference computes the learned linear complement before in-place
+RoPE on both uniform and heterogeneous grids, avoiding retained raw-QKV copies.
+Mixed-grid readout honors the selected fused gather and output epilogue.
+Diagnostic feature witnesses retain the copy path. Flow can retain its free
+target band's dense-query extent in high through `attention_head_t`, without
+changing the physical prefix, key measure, grouped domains or timestep masks.
+
 During an API-2 mixed sequence, VDN keeps the learned dense softmax gate active and disables only geometry-dependent local-window/linear-complement work that cannot be interpreted on the mixed lattice. The fresh target-grid stage returns to normal VDN execution automatically.
 
 See [docs/MIXED_SEQUENCE_API.md](docs/MIXED_SEQUENCE_API.md) for the exact fail-closed contract.

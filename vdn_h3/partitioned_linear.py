@@ -669,6 +669,8 @@ def _batched_output_readout(
     offsets: Sequence[tuple[int, int]],
     norm_weight: torch.Tensor,
     eps: float,
+    *,
+    fuse: bool = False,
 ) -> torch.Tensor:
     """Batch the per-frame linear readout and epilogue by equal-grid domain."""
     heads = int(query.shape[1])
@@ -698,7 +700,7 @@ def _batched_output_readout(
                 norm_weight,
                 gate[row_start:row_stop],
                 eps,
-                fuse=False,
+                fuse=fuse,
             )
         )
     return torch.cat(outputs, dim=0)
@@ -845,7 +847,7 @@ def _core_readout(
             bridge=branch.bridge,
             text_state=text_state,
             out_dtype=gate.dtype,
-            fuse=False,
+            fuse=branch.fuse_epilogue,
         )
         del prefix_states, suffix_states
     if record_component is not None:
@@ -872,6 +874,7 @@ def _core_readout(
             offsets,
             weights["norm.weight"],
             eps,
+            fuse=branch.fuse_epilogue,
         )
     if record_component is not None:
         record_component(

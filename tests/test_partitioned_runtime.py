@@ -440,6 +440,16 @@ def test_partitioned_softmax_diagnostic_rejects_unknown_mode():
         )
 
 
+def test_high_keeps_free_target_band_queries_dense_without_changing_groups():
+    mode = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL
+    for frames, expected in [((12, 13, 14), (True, False, True)),
+                             ((15, 16, 17), (True, False, False)),
+                             ((18, 19, 20), (False, False, False))]:
+        group = SimpleNamespace(query_prefix_domain=False, query_frames=frames)
+        assert _partitioned_local_force_dense(group, mode, prefix_t=12, attention_head_t=16) == expected
+        assert group.query_frames == frames and group.query_prefix_domain is False
+
+
 def test_partitioned_boundary_suffix_dense_records_explicit_flow_metrics_and_receipt():
     class Metrics:
         def __init__(self):
