@@ -26,6 +26,17 @@ VDN_TEMPORAL_CARRIER_POLICIES = (
     VDN_TEMPORAL_CARRIER_DESTINATION,
 )
 VDN_TEMPORAL_CARRIER_MAPPING_POLICY = "h3_physical_bilinear_border_fp32_restore_dtype_v1"
+# Native (pre-partition) video carrier grids this release accepts. "source" is the
+# historical uniform reduced-grid carrier and is implied when the contract omits
+# native_carrier_grid. "target" is Flow's target-band continuation: the native
+# sequence is the uniform target grid, and the partition remains
+# [target-grid head | source-grid tail].
+PARTITIONED_NATIVE_CARRIER_SOURCE = "source"
+PARTITIONED_NATIVE_CARRIER_TARGET = "target"
+PARTITIONED_NATIVE_CARRIER_GRIDS = (
+    PARTITIONED_NATIVE_CARRIER_SOURCE,
+    PARTITIONED_NATIVE_CARRIER_TARGET,
+)
 
 
 def _positive_int(value, name):
@@ -48,6 +59,7 @@ class PartitionedSequence:
     source_grid_w: int
     target_grid_h: int
     target_grid_w: int
+    native_carrier_grid: str = PARTITIONED_NATIVE_CARRIER_SOURCE
 
     def __post_init__(self):
         for name in (
@@ -66,6 +78,19 @@ class PartitionedSequence:
             raise ValueError("partitioned source grid exceeds target grid")
         if self.source_rows > self.target_rows:
             raise ValueError("partitioned source grid must not exceed target grid")
+        if self.native_carrier_grid not in PARTITIONED_NATIVE_CARRIER_GRIDS:
+            raise ValueError(f"unsupported partitioned native carrier grid {self.native_carrier_grid!r}")
+        if (
+            self.native_carrier_grid == PARTITIONED_NATIVE_CARRIER_TARGET
+            and self.source_rows == self.target_rows
+        ):
+            raise ValueError("a target native carrier requires heterogeneous spatial domains")
+
+    @property
+    def native_rows_per_frame(self):
+        if self.native_carrier_grid == PARTITIONED_NATIVE_CARRIER_TARGET:
+            return self.target_rows
+        return self.source_rows
 
     @property
     def source_rows(self):
@@ -122,6 +147,11 @@ class PartitionedSequence:
             "generated_suffix_queries_preserved": True,
             "heterogeneous_spatial_domains": self.source_rows != self.target_rows,
         }
+        if self.native_carrier_grid != PARTITIONED_NATIVE_CARRIER_SOURCE:
+            # Published only for the target carrier so historical contracts and
+            # their semantic digests remain byte-identical.
+            payload["native_carrier_grid"] = self.native_carrier_grid
+            payload["native_carrier_rows_per_frame"] = self.native_rows_per_frame
         payload["semantic_digest"] = _digest(payload)
         return payload
 
@@ -198,7 +228,20 @@ def validate_flow_partition_contract(contract, *, sequence_rows):
     )
     if any(type(contract.get(name)) is not int for name in geometry_names):
         raise ValueError("partitioned exact-prefix geometry must use integer fields")
-    parsed = PartitionedSequence(**{name: contract[name] for name in geometry_names})
+    if "native_carrier_grid" in contract:
+        carrier = contract["native_carrier_grid"]
+        if carrier != PARTITIONED_NATIVE_CARRIER_TARGET:
+            raise ValueError("partitioned exact-prefix publishes native_carrier_grid only for the target carrier")
+        if type(contract.get("native_carrier_rows_per_frame")) is not int:
+            raise ValueError("partitioned exact-prefix native_carrier_rows_per_frame must be an integer")
+    else:
+        if "native_carrier_rows_per_frame" in contract:
+            raise ValueError("partitioned exact-prefix native_carrier_rows_per_frame requires native_carrier_grid")
+        carrier = PARTITIONED_NATIVE_CARRIER_SOURCE
+    parsed = PartitionedSequence(
+        **{name: contract[name] for name in geometry_names},
+        native_carrier_grid=carrier,
+    )
     canonical = parsed.canonical_contract()
     for name, expected in canonical.items():
         if contract.get(name) != expected:
@@ -223,10 +266,18 @@ def make_vdn_partitioned_external_contract(plan: PartitionedSequence):
         "source_rows_per_frame": plan.source_rows,
         "target_rows_per_frame": plan.target_rows,
         "flow_semantic_digest": plan.canonical_contract()["semantic_digest"],
+        **(
+            {"native_carrier_rows_per_frame": plan.native_rows_per_frame}
+            if plan.native_carrier_grid != PARTITIONED_NATIVE_CARRIER_SOURCE
+            else {}
+        ),
     }
 
 
 __all__ = [
+    "PARTITIONED_NATIVE_CARRIER_GRIDS",
+    "PARTITIONED_NATIVE_CARRIER_SOURCE",
+    "PARTITIONED_NATIVE_CARRIER_TARGET",
     "PARTITIONED_PREFIX_API",
     "PARTITIONED_PREFIX_KEY",
     "PARTITIONED_PREFIX_TOPOLOGY",

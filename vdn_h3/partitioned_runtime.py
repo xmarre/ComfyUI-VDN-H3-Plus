@@ -23,6 +23,8 @@ from typing import Any
 
 from .partitioned_grouped import PartitionedGroupedPlan, build_partitioned_grouped_plan
 from .partitioned_sequence import (
+    PARTITIONED_NATIVE_CARRIER_GRIDS,
+    PARTITIONED_NATIVE_CARRIER_TARGET,
     PARTITIONED_PREFIX_KEY,
     PARTITIONED_PREFIX_TOPOLOGY,
     VDN_PARTITIONED_SEQUENCE_API,
@@ -389,6 +391,11 @@ def validate_partitioned_external_execution(
     expected = make_vdn_partitioned_external_contract(plan)
     if not isinstance(external, dict):
         raise RuntimeError("VDN partitioned execution is missing its external-sequence contract")
+    if (
+        plan.native_carrier_grid == PARTITIONED_NATIVE_CARRIER_TARGET
+        and type(external.get("native_carrier_rows_per_frame")) is not int
+    ):
+        raise RuntimeError("VDN partitioned external native_carrier_rows_per_frame must be an integer")
     if external != expected:
         raise RuntimeError("VDN partitioned external-sequence contract does not match Flow geometry")
     if (
@@ -398,15 +405,15 @@ def validate_partitioned_external_execution(
     ):
         raise RuntimeError("VDN partitioned external-sequence mode is unsupported")
 
-    native_rows = plan.video_start + plan.temporal * plan.source_rows
+    native_rows = plan.video_start + plan.temporal * plan.native_rows_per_frame
     if (
         int(getattr(layout, "seq_len", -1)) != native_rows
         or int(getattr(layout, "video_start", -1)) != plan.video_start
         or int(getattr(layout, "video_end", -1)) != native_rows
         or int(getattr(layout, "num_frames", -1)) != plan.temporal
-        or int(getattr(layout, "tokens_per_frame", -1)) != plan.source_rows
+        or int(getattr(layout, "tokens_per_frame", -1)) != plan.native_rows_per_frame
     ):
-        raise RuntimeError("VDN native low-grid layout does not match partitioned Flow geometry")
+        raise RuntimeError("VDN native carrier layout does not match partitioned Flow geometry")
     if rope_freqs is None or getattr(rope_freqs, "ndim", 0) < 2:
         raise RuntimeError("VDN partitioned execution requires explicit mixed-domain RoPE rows")
     if int(rope_freqs.shape[1]) != int(sequence_rows):
@@ -1157,6 +1164,7 @@ def _wrap_vdn_forward(current):
     )
     partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
+    partitioned_aware._vdn_partitioned_native_carrier_grids = PARTITIONED_NATIVE_CARRIER_GRIDS
     try:
         carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
     except (AttributeError, RuntimeError, TypeError, ValueError):
