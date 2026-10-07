@@ -38,6 +38,29 @@ def full_coverage(bounds, num_frames):
     return all(lo <= 0 and hi >= num_frames - 1 for lo, hi in bounds)
 
 
+class VDNLayout:
+    __slots__ = (
+        "video_start", "video_end", "num_frames", "tokens_per_frame",
+        "frame_size", "text_start", "text_len", "bounds", "full_cover",
+        "seq_len", "anchor_frames",
+    )
+
+    def __init__(self, video_start, video_end, num_frames, tokens_per_frame,
+                 frame_size, text_start, text_len, seq_len, radius, chunk,
+                 anchor_frames):
+        self.video_start = video_start
+        self.video_end = video_end
+        self.num_frames = num_frames
+        self.tokens_per_frame = tokens_per_frame
+        self.frame_size = frame_size
+        self.text_start = text_start
+        self.text_len = text_len
+        self.seq_len = seq_len
+        self.bounds = window_bounds(num_frames, radius, chunk)
+        self.full_cover = full_coverage(self.bounds, num_frames)
+        self.anchor_frames = anchor_frames
+
+
 def window_softmax_grouped(query, key, value, video_start, video_end,
                            num_frames, tokens_per_frame, bounds, scale,
                            anchor_frames="none", transformer_options=None):

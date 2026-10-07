@@ -24,6 +24,7 @@ from typing import Any
 from .partitioned_grouped import PartitionedGroupedPlan, build_partitioned_grouped_plan
 from .partitioned_sequence import (
     PARTITIONED_NATIVE_CARRIER_GRIDS,
+    PARTITIONED_NATIVE_CARRIER_SOURCE,
     PARTITIONED_NATIVE_CARRIER_TARGET,
     PARTITIONED_PREFIX_KEY,
     PARTITIONED_PREFIX_TOPOLOGY,
@@ -71,6 +72,15 @@ VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK,
 )
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
+
+# Flow target-band domain-uniform execution evaluates two uniform-grid hidden
+# streams per model call. Each stream publishes an ordinary equal-grid Flow
+# contract plus this leaf; VDN then derives the stream's window layout from that
+# contract instead of from the call's native carrier layout.
+FLOW_DOMAIN_STREAM_KEY = "h3_flow_partitioned_domain_stream_v1"
+FLOW_DOMAIN_STREAM_API = 1
+FLOW_DOMAIN_STREAM_POLICY = "domain_uniform_v1"
+FLOW_DOMAIN_STREAMS = ("target", "source")
 
 
 def _temporal_carrier_short_conv_spec(branch) -> str:
@@ -461,6 +471,72 @@ def validate_partitioned_external_execution(
     return plan
 
 
+def resolve_domain_stream_layout(options, native_layout, cfg, sequence_rows: int):
+    """Return the stream-local VDN layout for a Flow domain stream, or the native layout.
+
+    Absence of the leaf keeps the released behavior byte-for-byte. A present leaf
+    must describe one canonical equal-grid Flow contract for the current hidden
+    rows, and the call's native carrier layout must match the leaf's native
+    geometry. Text rows are shared by construction: each stream begins with the
+    same conditioning prefix as the native layout.
+    """
+    leaf = options.get(FLOW_DOMAIN_STREAM_KEY)
+    if leaf is None:
+        return native_layout, None
+    if not isinstance(leaf, dict):
+        raise RuntimeError("Flow domain-stream contract must be a dictionary")
+    flow_contract = options.get(PARTITIONED_PREFIX_KEY)
+    try:
+        plan = validate_flow_partition_contract(flow_contract, sequence_rows=int(sequence_rows))
+    except ValueError as exc:
+        raise RuntimeError(f"Flow domain stream has an invalid partition contract: {exc}") from exc
+    names = ("native_sequence_rows", "native_video_start")
+    if (
+        leaf.get("api") != FLOW_DOMAIN_STREAM_API
+        or leaf.get("policy") != FLOW_DOMAIN_STREAM_POLICY
+        or leaf.get("stream") not in FLOW_DOMAIN_STREAMS
+        or leaf.get("flow_semantic_digest") != plan.canonical_contract()["semantic_digest"]
+        or any(type(leaf.get(name)) is not int for name in names)
+        or set(leaf) != {"api", "policy", "stream", "flow_semantic_digest", *names}
+    ):
+        raise RuntimeError("Flow domain-stream contract is malformed or does not match its partition contract")
+    if plan.source_rows != plan.target_rows or plan.native_carrier_grid != PARTITIONED_NATIVE_CARRIER_SOURCE:
+        raise RuntimeError("Flow domain streams must publish an equal-grid partition contract")
+    if native_layout is None:
+        raise RuntimeError("Flow domain stream requires an active native carrier layout")
+    text_start = int(native_layout.text_start)
+    text_len = int(native_layout.text_len)
+    if (
+        int(native_layout.seq_len) != leaf["native_sequence_rows"]
+        or int(native_layout.video_start) != leaf["native_video_start"]
+        or not 0 <= text_start <= text_start + text_len <= plan.video_start
+    ):
+        raise RuntimeError("Flow domain stream does not match the active native carrier layout")
+    from .window import VDNLayout
+
+    layout = VDNLayout(
+        plan.video_start,
+        plan.sequence_rows,
+        plan.temporal,
+        plan.target_rows,
+        (plan.target_grid_h, plan.target_grid_w),
+        text_start,
+        text_len,
+        plan.sequence_rows,
+        cfg["radius"],
+        cfg["chunk"],
+        cfg["anchor_frames"],
+    )
+    return layout, str(leaf["stream"])
+
+
+def _record_domain_stream(options, stream: str) -> None:
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment(f"partitioned_vdn_domain_stream_{stream}_calls")
+
+
 def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPlan:
     return build_partitioned_grouped_plan(
         plan,
@@ -541,7 +617,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     layout = state.layout
     if layout is None:
         raise RuntimeError("partitioned exact-prefix VDN requires an active native low-grid layout")
+    layout, domain_stream = resolve_domain_stream_layout(options, layout, values["cfg"], int(x.shape[0]))
     plan = validate_partitioned_external_execution(options, layout, int(x.shape[0]), rope_freqs)
+    if domain_stream is not None:
+        _record_domain_stream(options, domain_stream)
     attention_head_t = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "attention_head_t", None)
     if attention_head_t is not None and (
         type(attention_head_t) is not int
@@ -1236,6 +1315,7 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
     partitioned_aware._vdn_partitioned_native_carrier_grids = PARTITIONED_NATIVE_CARRIER_GRIDS
+    partitioned_aware._vdn_partitioned_domain_stream_api = FLOW_DOMAIN_STREAM_API
     try:
         carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
     except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -1271,6 +1351,9 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 
 
 __all__ = [
+    "FLOW_DOMAIN_STREAM_API",
+    "FLOW_DOMAIN_STREAM_KEY",
+    "FLOW_DOMAIN_STREAM_POLICY",
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
     "VDN_PARTITIONED_BOUNDARY_QUERY_API",
@@ -1293,5 +1376,6 @@ __all__ = [
     "VDN_TEMPORAL_CARRIER_NATIVE",
     "VDN_TEMPORAL_CARRIER_POLICIES",
     "install_partitioned_external_sequence_bridge",
+    "resolve_domain_stream_layout",
     "validate_partitioned_external_execution",
 ]

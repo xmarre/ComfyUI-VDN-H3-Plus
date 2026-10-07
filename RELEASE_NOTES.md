@@ -1,3 +1,24 @@
+## Unreleased: Flow domain-uniform streams
+
+Accept Flow's opt-in target-band `target_band_context=domain_uniform_v1`, which
+evaluates two uniform-grid hidden streams per model call.
+
+- A stream publishes an ordinary equal-grid partition contract plus the
+  `h3_flow_partitioned_domain_stream_v1` leaf. VDN then derives the stream's
+  window layout (frames, rows per frame, window bounds, coverage) from that
+  contract instead of from the call's native carrier layout. Text rows and the
+  native carrier geometry are checked against the active native layout.
+- Grouped softmax, global and anchor queries, the dense-query head and the
+  learned linear complement operate on the stream's own rows only.
+- Malformed leaves, non-uniform contracts, digest or row mismatches fail before
+  attention. Calls without the leaf are unchanged.
+- The bridged forward advertises `_vdn_partitioned_domain_stream_api = 1`.
+  `VDNLayout` moves to `vdn_h3.window` and remains importable from
+  `vdn_h3.hybrid`.
+
+CPU tests cover layout derivation, fail-closed validation and grouped routing on
+stream rows. GPU arithmetic, performance and rendered quality are unvalidated.
+
 # ComfyUI-VDN-H3-Plus v1.5.8
 
 Accept a target-grid native carrier for Flow's opt-in target-band continuation.
