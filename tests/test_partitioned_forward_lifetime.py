@@ -234,12 +234,18 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     assert bool(sink_counters) == bool(sink_measure and mixed_grid)
     for k in sink_counters:
         counters.pop(k)
+    # Mixed grids keep the dense prefix/boundary policy. A uniform grid routes
+    # every local group natively, like a non-partitioned call.
     expected_boundary_counters = {
         "partitioned_vdn_boundary_suffix_dense_calls": 1,
         "partitioned_vdn_boundary_suffix_dense_q_rows": 6,
-        "partitioned_vdn_boundary_suffix_dense_kv_rows": 31 if mixed_grid else 25,
+        "partitioned_vdn_boundary_suffix_dense_kv_rows": 31,
         "partitioned_vdn_boundary_suffix_dense_query_frames": 1,
+    } if mixed_grid else {
+        "partitioned_vdn_uniform_native_local_calls": 5,
+        "partitioned_vdn_uniform_native_local_q_rows": 30,
     }
+    expected_force_dense = [True, True, True, True, False, False] if mixed_grid else [True, False, False, False, False, False]
     assert counters == {
         "partitioned_vdn_pre_rope_linear_calls": 1,
         **({"partitioned_vdn_uniform_linear_calls": 1, "partitioned_vdn_uniform_pre_rope_calls": 1}
@@ -248,9 +254,9 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
         **expected_boundary_counters,
     }
     assert weights_calls == [False]
-    # One global packed-sequence call is dense, followed by per-frame local groups:
-    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
-    assert force_dense_calls == [True, True, True, True, attention_head_t is not None, False]
+    # One global packed-sequence call is dense, followed by per-frame local groups.
+    # Mixed grid: prefix frames 0/1 and first generated frame 2 dense, 3/4 sparse.
+    assert force_dense_calls == expected_force_dense
     assert events.index("linear") < events.index("rope") < events.index("softmax") < events.index("prefetch")
     counters.clear()
     force_dense_calls.clear()
@@ -269,9 +275,9 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     for k in sink_counters:
         counters.pop(k)
     assert counters == expected_boundary_counters
-    # One global packed-sequence call is dense, followed by per-frame local groups:
-    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
-    assert force_dense_calls == [True, True, True, True, attention_head_t is not None, False]
+    # One global packed-sequence call is dense, followed by per-frame local groups.
+    # Mixed grid: prefix frames 0/1 and first generated frame 2 dense, 3/4 sparse.
+    assert force_dense_calls == expected_force_dense
     assert weights_calls == [True]
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     assert torch.allclose(native.float(), reference.float(), rtol=tolerance, atol=tolerance)

@@ -63,6 +63,12 @@ VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_POLICY = "boundary_suffix_local_group_dense_v1"
+# Equal-grid partitions (the target-grid high stage and Flow domain streams) are
+# ordinary uniform clips with unit key measure. Their local query groups use the
+# selected backend's native routing and native conditioning sink, exactly like a
+# non-partitioned call; only mixed-grid partitions keep the dense prefix/boundary
+# policy above.
+VDN_PARTITIONED_UNIFORM_QUERY_POLICY = "uniform_grid_native_backend_local_routing_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK = "target_query_sink_measure"
@@ -231,6 +237,7 @@ def _partitioned_local_force_dense(
     *,
     prefix_t: int,
     attention_head_t: int | None = None,
+    uniform: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Return dense-routing ownership for one existing local query group.
 
@@ -245,6 +252,11 @@ def _partitioned_local_force_dense(
     this policy changes only the Sol execution mode. The all-suffix diagnostic
     remains available and reports only additional later suffix groups that it
     forces dense beyond the production boundary subgroup.
+
+    An equal-grid partition has no operator boundary to bridge: every frame is
+    on one grid with unit key measure, as in a native clip. Its local groups use
+    the selected backend's own routing, so protected, band and generated frames
+    are attended exactly as a non-partitioned call would attend them.
     """
 
     if mode not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
@@ -265,6 +277,11 @@ def _partitioned_local_force_dense(
     head = prefix_t if attention_head_t is None else attention_head_t
     if type(head) is not int or head < prefix_t:
         raise RuntimeError("partitioned VDN dense-query head must cover the protected prefix")
+    if uniform:
+        diagnostic_suffix = bool(
+            mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX and not bool(group.query_prefix_domain)
+        )
+        return diagnostic_suffix, diagnostic_suffix, False
     # A free target-grid band keeps its low-stage dense policy in high. The
     # existing physical groups, prefix measure and timestep masks are unchanged.
     band_dense = any(frame <= head for frame in query_frames)
@@ -279,6 +296,14 @@ def _partitioned_local_force_dense(
         diagnostic_suffix,
         boundary_suffix,
     )
+
+
+def _record_partitioned_uniform_native_local(options: dict[str, Any], *, q_rows: int) -> None:
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_uniform_native_local_calls")
+        increment("partitioned_vdn_uniform_native_local_q_rows", int(q_rows))
 
 
 def _record_partitioned_boundary_suffix_dense(
@@ -633,6 +658,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     grouped = _grouped_plan(plan, layout, semantic_digest=semantic_digest)
     if grouped.sequence_rows != int(x.shape[0]):
         raise RuntimeError("partitioned VDN grouped plan does not match hidden-state rows")
+    uniform_grid = (plan.source_grid_h, plan.source_grid_w) == (plan.target_grid_h, plan.target_grid_w)
 
     qkv_proj = values["qkv_proj"]
     out_proj = values["out_proj"]
@@ -945,12 +971,18 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 softmax_diagnostic_mode,
                 prefix_t=plan.prefix_t,
                 attention_head_t=attention_head_t,
+                uniform=uniform_grid,
             )
         )
-        measure_range = _partitioned_query_measure_range(
-            group.prefix_k_range, sink_rows=group.sink_rows,
-            target_query=group.query_prefix_domain, mode=softmax_diagnostic_mode, log_measure=measure,
-        )
+        if uniform_grid and not force_dense:
+            # Unit measure needs no key range. Without one, sparse routing keeps
+            # the native conditioning sink instead of pinning protected keys.
+            measure_range = None
+        else:
+            measure_range = _partitioned_query_measure_range(
+                group.prefix_k_range, sink_rows=group.sink_rows,
+                target_query=group.query_prefix_domain, mode=softmax_diagnostic_mode, log_measure=measure,
+            )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[q_index] = partitioned_request_attention(
@@ -971,7 +1003,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 # grouped Q/K/V gather and measure bias have been fixed.
                 force_dense=force_dense,
             )
-        if measure_range != group.prefix_k_range:
+        if uniform_grid and not force_dense:
+            _record_partitioned_uniform_native_local(options, q_rows=group.q_rows)
+        elif measure_range != group.prefix_k_range:
             _record_partitioned_target_sink_measure(options, q_rows=group.q_rows, kv_rows=group.kv_rows)
         if boundary_dense_suffix:
             _record_partitioned_boundary_suffix_dense(
@@ -1304,6 +1338,7 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
+    partitioned_aware._vdn_partitioned_uniform_query_policy = VDN_PARTITIONED_UNIFORM_QUERY_POLICY
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_softmax_diagnostic_api = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_query_api = VDN_PARTITIONED_BOUNDARY_QUERY_API
@@ -1356,6 +1391,7 @@ __all__ = [
     "VDN_EXTERNAL_SEQUENCE_KEY",
     "VDN_PARTITIONED_BOUNDARY_QUERY_API",
     "VDN_PARTITIONED_BOUNDARY_QUERY_POLICY",
+    "VDN_PARTITIONED_UNIFORM_QUERY_POLICY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",

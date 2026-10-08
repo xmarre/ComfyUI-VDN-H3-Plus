@@ -215,9 +215,11 @@ VDN supports the external-sequence contracts used by MiniMax-H3 Flow-Aligned Reg
 Partitioned inference computes the learned linear complement before in-place
 RoPE on both uniform and heterogeneous grids, avoiding retained raw-QKV copies.
 Mixed-grid readout honors the selected fused gather and output epilogue.
-Diagnostic feature witnesses retain the copy path. Flow can retain its free
-target band's dense-query extent in high through `attention_head_t`, without
-changing the physical prefix, key measure, grouped domains or timestep masks.
+Diagnostic feature witnesses retain the copy path. Equal-grid partitions (the
+target-grid high stage and Flow domain streams) route every local query group
+through the selected backend's native selection, as a non-partitioned call
+does; only mixed-grid partitions force the protected-prefix and first generated
+groups dense.
 
 During an API-2 mixed sequence, VDN keeps the learned dense softmax gate active and disables only geometry-dependent local-window/linear-complement work that cannot be interpreted on the mixed lattice. The fresh target-grid stage returns to normal VDN execution automatically.
 

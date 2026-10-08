@@ -1,3 +1,16 @@
+## Unreleased: native routing on equal-grid partitions
+
+Equal-grid partitions (Flow's target-grid high stage, domain-uniform streams and
+same-grid control) are ordinary uniform clips with unit key measure. Their local
+query groups now use the selected backend's native routing for every frame,
+including protected-prefix and target-band frames, and keep only the native
+conditioning sink. Sol therefore applies its sparse selection there exactly as
+in a non-partitioned call, instead of dense attention for the prefix/band frames
+and pinned protected keys. Mixed-grid partitions keep the dense prefix and
+boundary-group policy. Global and anchor queries stay dense, as in native VDN.
+The bridge advertises `_vdn_partitioned_uniform_query_policy`. GPU time and
+rendered effect are unvalidated.
+
 ## Unreleased: Flow domain-uniform streams
 
 Accept Flow's opt-in target-band `target_band_context=domain_uniform_v1`, which
