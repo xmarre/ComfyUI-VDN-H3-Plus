@@ -1301,6 +1301,7 @@ def _wrap_vdn_forward(current):
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
+    partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS

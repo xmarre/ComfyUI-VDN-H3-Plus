@@ -6,6 +6,35 @@ VDN keeps ownership of its trained window/global/anchor geometry, learned softma
 
 The provider contract is implemented in grouped retained attention. Full-domain preprocessing still occurs before VDN gathers local domains, and VDN remains responsible for the gather/scatter topology.
 
+## Physical partitioned attention provider
+
+`PARTITIONED_PROVIDER_API_VERSION = 1` and the bridged forward's
+`_vdn_partitioned_attention_provider_api = 1` advertise backend-neutral dispatch
+for Flow's physical partitioned sequences. These calls use the optional
+`transformer_options["vdn_partitioned_attention_provider_v1"]` hook:
+
+```python
+provider(q, k, v, *, transformer_options, block_index, kind, scale,
+         sink_rows, prefix_k_range, prefix_log_key_measure, semantic_digest,
+         query_position_map=None, force_dense=False)
+```
+
+Q is `[requested_rows, heads, head_dim]`; K/V contain only the already-gathered
+union. Preprocessing has already run once over the complete post-RoPE domain.
+The provider must preserve that union, apply the additive log key measure to
+`prefix_k_range`, respect exact-query requests and return Q's shape, dtype and
+device. Mapped queries carry the same VDN-owned position descriptor as v4.
+There is no square-Q compatibility allocation. VDN retains its learned linear
+branch, gates, projection and scatter ownership. Invalid provider presence or
+results raise an error without switching backend.
+
+Clients without this hook retain the legacy request-owned Sol dispatch. Ordinary
+non-partitioned VDN uses the existing v1-v4 dispatch below. Flow's native provider
+uses the selected ComfyUI backend with additive key masks; sparse backends that
+cannot consume weighted or mapped rectangular domains use their native dense
+fallback. This can increase time and memory. CPU equivalence does not establish
+GPU performance or rendered quality.
+
 ## v1
 
 `transformer_options["vdn_softmax_provider_v1"]` remains supported:
