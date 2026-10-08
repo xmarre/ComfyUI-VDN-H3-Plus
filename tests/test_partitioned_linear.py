@@ -949,6 +949,35 @@ def test_cross_grid_temporal_map_identity_returns_original_tensor():
     assert _map_temporal_neighbor(source, (4, 5)) is source
 
 
+def test_variable_grid_readout_honors_selected_fused_gather_and_epilogue(monkeypatch):
+    weights = _weights()
+    branch = _branch(weights)
+    grids = ((4, 5),) * 3 + ((3, 4),) * 4
+    rows = sum(h * w for h, w in grids)
+    inputs = _inputs(rows)
+    kwargs = dict(frame_sizes=grids, bounds=tuple((0, 6) for _ in grids),
+                  measure_scales=(0.6,) * 3 + (1.0,) * 4)
+    reference = partitioned_linear_readout(branch, weights, *inputs, **kwargs)
+    gathers, epilogues = [], []
+    gather, epilogue = B.gather_linear_state, B.linear_epilogue
+
+    def observed_gather(*args, fuse=False, **kwargs):
+        gathers.append(fuse)
+        return gather(*args, fuse=False, **kwargs)
+
+    def observed_epilogue(*args, fuse=False):
+        epilogues.append(fuse)
+        return epilogue(*args, fuse=False)
+
+    monkeypatch.setattr(B, "gather_linear_state", observed_gather)
+    monkeypatch.setattr(B, "linear_epilogue", observed_epilogue)
+    branch.fuse_epilogue = True
+    result = partitioned_linear_readout(branch, weights, *inputs, **kwargs)
+    assert gathers == [True]
+    assert epilogues == [True, True]
+    torch.testing.assert_close(result, reference)
+
+
 def test_h3_axis_coordinates_match_pinned_comfy_physical_rope_grid():
     from comfy.ldm.minimax.model import _axis_from_sqrt_area
 

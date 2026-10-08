@@ -24,6 +24,7 @@ from typing import Any
 from .partitioned_grouped import PartitionedGroupedPlan, build_partitioned_grouped_plan
 from .partitioned_sequence import (
     PARTITIONED_NATIVE_CARRIER_GRIDS,
+    PARTITIONED_NATIVE_CARRIER_SOURCE,
     PARTITIONED_NATIVE_CARRIER_TARGET,
     PARTITIONED_PREFIX_KEY,
     PARTITIONED_PREFIX_TOPOLOGY,
@@ -56,20 +57,36 @@ VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS = (
 )
 
 # Flow-owned discriminator for the remaining exact-prefix boundary defect.
-# It changes only the Sol execution mode of suffix local-query groups. The
-# grouped Q/K/V gather, key ranges, target-prefix measure bias and VDN linear
-# ownership remain identical to the normal path.
+# Modes isolate either suffix dense dispatch or target-query conditioning-key
+# measure. Physical gathers and learned linear ownership remain unchanged.
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY = "h3_flow_partitioned_softmax_diagnostic_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_API = 1
 VDN_PARTITIONED_BOUNDARY_QUERY_POLICY = "boundary_suffix_local_group_dense_v1"
+# Equal-grid partitions (the target-grid high stage and Flow domain streams) are
+# ordinary uniform clips with unit key measure. Their local query groups use the
+# selected backend's native routing and native conditioning sink, exactly like a
+# non-partitioned call; only mixed-grid partitions keep the dense prefix/boundary
+# policy above.
+VDN_PARTITIONED_UNIFORM_QUERY_POLICY = "uniform_grid_native_backend_local_routing_v1"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL = "normal"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX = "dense_suffix_same_domain"
+VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK = "target_query_sink_measure"
 VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS = (
     VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_NORMAL,
     VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX,
+    VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK,
 )
 _BRIDGE_MARKER = "_vdn_partitioned_exact_prefix_bridge_v3"
+
+# Flow target-band domain-uniform execution evaluates two uniform-grid hidden
+# streams per model call. Each stream publishes an ordinary equal-grid Flow
+# contract plus this leaf; VDN then derives the stream's window layout from that
+# contract instead of from the call's native carrier layout.
+FLOW_DOMAIN_STREAM_KEY = "h3_flow_partitioned_domain_stream_v1"
+FLOW_DOMAIN_STREAM_API = 1
+FLOW_DOMAIN_STREAM_POLICY = "domain_uniform_v1"
+FLOW_DOMAIN_STREAMS = ("target", "source")
 
 
 def _temporal_carrier_short_conv_spec(branch) -> str:
@@ -184,11 +201,43 @@ def _partitioned_softmax_diagnostic_mode(options: dict[str, Any]) -> str:
     return str(raw)
 
 
+def _partitioned_query_measure_range(prefix_range, *, sink_rows, target_query, mode, log_measure):
+    """Extend only target-query bias over conditioning rows, preserving K/V order."""
+    if mode != VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK or not target_query or log_measure == 0.0:
+        return prefix_range
+    if prefix_range is None or prefix_range[0] != sink_rows:
+        raise RuntimeError("target-query sink measure requires contiguous target keys after conditioning rows")
+    return (0, prefix_range[1])
+
+
+def _partitioned_anchor_domains(grouped, *, split_target):
+    # Baseline keeps its single anchor call. The opt-in path separates target
+    # and source queries so both cannot receive one query-dependent key bias.
+    if not split_target:
+        return ((False, grouped.anchor_slices),)
+    target, source = [], []
+    for frame, rows in enumerate(grouped.frame_ranges):
+        if rows in grouped.anchor_slices:
+            (target if frame < grouped.prefix_t else source).append(rows)
+    return ((True, tuple(target)), (False, tuple(source)))
+
+
+def _record_partitioned_target_sink_measure(options, *, q_rows, kv_rows):
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_target_sink_measure_calls")
+        increment("partitioned_vdn_target_sink_measure_q_rows", int(q_rows))
+        increment("partitioned_vdn_target_sink_measure_kv_rows", int(kv_rows))
+
+
 def _partitioned_local_force_dense(
     group,
     mode: str,
     *,
     prefix_t: int,
+    attention_head_t: int | None = None,
+    uniform: bool = False,
 ) -> tuple[bool, bool, bool]:
     """Return dense-routing ownership for one existing local query group.
 
@@ -203,6 +252,11 @@ def _partitioned_local_force_dense(
     this policy changes only the Sol execution mode. The all-suffix diagnostic
     remains available and reports only additional later suffix groups that it
     forces dense beyond the production boundary subgroup.
+
+    An equal-grid partition has no operator boundary to bridge: every frame is
+    on one grid with unit key measure, as in a native clip. Its local groups use
+    the selected backend's own routing, so protected, band and generated frames
+    are attended exactly as a non-partitioned call would attend them.
     """
 
     if mode not in VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS:
@@ -220,16 +274,36 @@ def _partitioned_local_force_dense(
         not bool(group.query_prefix_domain)
         and prefix_t in query_frames
     )
+    head = prefix_t if attention_head_t is None else attention_head_t
+    if type(head) is not int or head < prefix_t:
+        raise RuntimeError("partitioned VDN dense-query head must cover the protected prefix")
+    if uniform:
+        diagnostic_suffix = bool(
+            mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX and not bool(group.query_prefix_domain)
+        )
+        return diagnostic_suffix, diagnostic_suffix, False
+    # A free target-grid band keeps its low-stage dense policy in high. The
+    # existing physical groups, prefix measure and timestep masks are unchanged.
+    band_dense = any(frame <= head for frame in query_frames)
     diagnostic_suffix = bool(
         mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_DENSE_SUFFIX
         and not bool(group.query_prefix_domain)
         and not boundary_suffix
+        and not band_dense
     )
     return (
-        bool(group.query_prefix_domain or boundary_suffix or diagnostic_suffix),
+        bool(group.query_prefix_domain or boundary_suffix or band_dense or diagnostic_suffix),
         diagnostic_suffix,
         boundary_suffix,
     )
+
+
+def _record_partitioned_uniform_native_local(options: dict[str, Any], *, q_rows: int) -> None:
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment("partitioned_vdn_uniform_native_local_calls")
+        increment("partitioned_vdn_uniform_native_local_q_rows", int(q_rows))
 
 
 def _record_partitioned_boundary_suffix_dense(
@@ -258,6 +332,7 @@ def _record_partitioned_boundary_suffix_dense(
             policy=VDN_PARTITIONED_BOUNDARY_QUERY_POLICY,
             stage=options.get("h3_flow_stage"),
             prefix_t=int(prefix_t),
+            attention_head_t=int(getattr(runtime, "attention_head_t", None) or prefix_t),
             query_frames=tuple(int(frame) for frame in group.query_frames),
             q_rows=int(group.q_rows),
             kv_rows=int(group.kv_rows),
@@ -421,6 +496,72 @@ def validate_partitioned_external_execution(
     return plan
 
 
+def resolve_domain_stream_layout(options, native_layout, cfg, sequence_rows: int):
+    """Return the stream-local VDN layout for a Flow domain stream, or the native layout.
+
+    Absence of the leaf keeps the released behavior byte-for-byte. A present leaf
+    must describe one canonical equal-grid Flow contract for the current hidden
+    rows, and the call's native carrier layout must match the leaf's native
+    geometry. Text rows are shared by construction: each stream begins with the
+    same conditioning prefix as the native layout.
+    """
+    leaf = options.get(FLOW_DOMAIN_STREAM_KEY)
+    if leaf is None:
+        return native_layout, None
+    if not isinstance(leaf, dict):
+        raise RuntimeError("Flow domain-stream contract must be a dictionary")
+    flow_contract = options.get(PARTITIONED_PREFIX_KEY)
+    try:
+        plan = validate_flow_partition_contract(flow_contract, sequence_rows=int(sequence_rows))
+    except ValueError as exc:
+        raise RuntimeError(f"Flow domain stream has an invalid partition contract: {exc}") from exc
+    names = ("native_sequence_rows", "native_video_start")
+    if (
+        leaf.get("api") != FLOW_DOMAIN_STREAM_API
+        or leaf.get("policy") != FLOW_DOMAIN_STREAM_POLICY
+        or leaf.get("stream") not in FLOW_DOMAIN_STREAMS
+        or leaf.get("flow_semantic_digest") != plan.canonical_contract()["semantic_digest"]
+        or any(type(leaf.get(name)) is not int for name in names)
+        or set(leaf) != {"api", "policy", "stream", "flow_semantic_digest", *names}
+    ):
+        raise RuntimeError("Flow domain-stream contract is malformed or does not match its partition contract")
+    if plan.source_rows != plan.target_rows or plan.native_carrier_grid != PARTITIONED_NATIVE_CARRIER_SOURCE:
+        raise RuntimeError("Flow domain streams must publish an equal-grid partition contract")
+    if native_layout is None:
+        raise RuntimeError("Flow domain stream requires an active native carrier layout")
+    text_start = int(native_layout.text_start)
+    text_len = int(native_layout.text_len)
+    if (
+        int(native_layout.seq_len) != leaf["native_sequence_rows"]
+        or int(native_layout.video_start) != leaf["native_video_start"]
+        or not 0 <= text_start <= text_start + text_len <= plan.video_start
+    ):
+        raise RuntimeError("Flow domain stream does not match the active native carrier layout")
+    from .window import VDNLayout
+
+    layout = VDNLayout(
+        plan.video_start,
+        plan.sequence_rows,
+        plan.temporal,
+        plan.target_rows,
+        (plan.target_grid_h, plan.target_grid_w),
+        text_start,
+        text_len,
+        plan.sequence_rows,
+        cfg["radius"],
+        cfg["chunk"],
+        cfg["anchor_frames"],
+    )
+    return layout, str(leaf["stream"])
+
+
+def _record_domain_stream(options, stream: str) -> None:
+    metrics = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "metrics", None)
+    increment = getattr(metrics, "increment", None)
+    if callable(increment):
+        increment(f"partitioned_vdn_domain_stream_{stream}_calls")
+
+
 def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPlan:
     return build_partitioned_grouped_plan(
         plan,
@@ -501,12 +642,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     layout = state.layout
     if layout is None:
         raise RuntimeError("partitioned exact-prefix VDN requires an active native low-grid layout")
+    layout, domain_stream = resolve_domain_stream_layout(options, layout, values["cfg"], int(x.shape[0]))
     plan = validate_partitioned_external_execution(options, layout, int(x.shape[0]), rope_freqs)
+    if domain_stream is not None:
+        _record_domain_stream(options, domain_stream)
+    attention_head_t = getattr(options.get(FLOW_PARTITIONED_STAGE_KEY), "attention_head_t", None)
+    if attention_head_t is not None and (
+        type(attention_head_t) is not int
+        or not plan.prefix_t <= attention_head_t < plan.temporal
+        or (plan.source_grid_h, plan.source_grid_w) != (plan.target_grid_h, plan.target_grid_w)
+    ):
+        raise RuntimeError("an extended dense-query head requires a uniform target-grid high stage")
     flow_contract = options[PARTITIONED_PREFIX_KEY]
     semantic_digest = str(flow_contract["semantic_digest"])
     grouped = _grouped_plan(plan, layout, semantic_digest=semantic_digest)
     if grouped.sequence_rows != int(x.shape[0]):
         raise RuntimeError("partitioned VDN grouped plan does not match hidden-state rows")
+    uniform_grid = (plan.source_grid_h, plan.source_grid_w) == (plan.target_grid_h, plan.target_grid_w)
 
     qkv_proj = values["qkv_proj"]
     out_proj = values["out_proj"]
@@ -544,6 +696,17 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         raise RuntimeError("partitioned exact-prefix VDN requires an active runtime-buffer lease")
     index_identity = ("partitioned_exact_prefix_v1", grouped.plan_digest)
 
+    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
+    target_sink_measure = softmax_diagnostic_mode == VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_TARGET_SINK
+    if target_sink_measure:
+        if _partitioned_linear_diagnostic_mode(options) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE:
+            raise RuntimeError("target-query sink measure cannot be combined with raw_token_measure")
+        from .softmax_provider import PARTITIONED_PROVIDER_KEY
+        if PARTITIONED_PROVIDER_KEY not in options:
+            from sol_h3 import partitioned_request as sol_request
+            if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
+                raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
+
     q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
     v = v.view(s, heads, head_dim)
     q_raw = q.view(s, heads, head_dim)
@@ -575,11 +738,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     from . import branch as B
     from .boundary_witness import WITNESS_KEY
 
-    uniform_linear = (
+    pre_rope_linear = (
         linear_active
         and not torch.is_grad_enabled()
-        and plan.source_grid_h == plan.target_grid_h
-        and plan.source_grid_w == plan.target_grid_w
         and linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_NORMAL
         and temporal_carrier_policy == VDN_TEMPORAL_CARRIER_NATIVE
         and options.get(WITNESS_KEY) is None
@@ -592,11 +753,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     precomputed_softmax_gate = None
     q_raw_video = k_raw_video = v_raw_video = None
     text_x = text_k_raw = text_v_raw = None
-    if uniform_linear:
-        # Native VDN already reads strided projection views before in-place
-        # RoPE. Identical physical grids and unit measure have the same readout.
-        # Keep only its projected result through softmax, rather than three
-        # full-size raw video copies. Diagnostic and mixed-grid paths stay late.
+    if pre_rope_linear:
+        # Both readouts consume raw QKV before in-place RoPE. Materialize the
+        # projected complement now instead of retaining three full raw copies
+        # through softmax. Diagnostic feature witnesses keep the late path.
         resources.release_activation_scratch()
         weights_started = time.perf_counter()
         with cuda_span("vdn_weights"):
@@ -610,7 +770,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             text_x = x[text_start:text_end]
             text_k_raw = k_raw[text_start:text_end]
             text_v_raw = v[text_start:text_end]
-        from .partitioned_linear import partitioned_linear_readout
+        from .partitioned_linear import partitioned_frame_contract, partitioned_linear_readout
+
+        frame_sizes, measure_scales = partitioned_frame_contract(plan)
 
         linear_started = time.perf_counter()
         linear_execution_stats = {}
@@ -618,9 +780,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             base_branch,
             weights, x[grouped.video_start:], q_raw[grouped.video_start:],
             k_raw[grouped.video_start:], v[grouped.video_start:],
-            frame_sizes=((plan.source_grid_h, plan.source_grid_w),) * plan.temporal,
+            frame_sizes=frame_sizes,
             bounds=tuple(tuple(int(value) for value in pair) for pair in layout.bounds),
-            measure_scales=(1.0,) * plan.temporal,
+            measure_scales=measure_scales,
             text_x=text_x, text_k_raw=text_k_raw, text_v_raw=text_v_raw,
             skip_ends=(cfg["anchor_frames"] == "both"),
             record_component=record_component, cuda_span=cuda_span,
@@ -647,7 +809,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             ):
                 if linear_execution_stats.get(stat):
                     increment(counter, linear_execution_stats[stat])
-            increment("partitioned_vdn_uniform_pre_rope_calls")
+            increment("partitioned_vdn_pre_rope_linear_calls")
+            if plan.source_grid_h == plan.target_grid_h and plan.source_grid_w == plan.target_grid_w:
+                increment("partitioned_vdn_uniform_pre_rope_calls")
         del readout, weights, text_x, text_k_raw, text_v_raw
     elif linear_active:
         video_start = grouped.video_start
@@ -720,15 +884,9 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         q, k, v = preprocess(options, q, k, v, heads)
     _record_component(record_component, "vdn_preprocess_host_wall_s", preprocess_started)
 
-    try:
-        from sol_h3.partitioned_request import partitioned_request_attention
-    except ImportError as exc:
-        raise RuntimeError(
-            "partitioned exact-prefix VDN requires the matching Sol-H3 partitioned backend branch"
-        ) from exc
+    from .softmax_provider import partitioned_attention as partitioned_request_attention
 
     scale = head_dim**-0.5
-    softmax_diagnostic_mode = _partitioned_softmax_diagnostic_mode(options)
     raw_token_measure = (
         linear_diagnostic_mode == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE
     )
@@ -812,8 +970,19 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 group,
                 softmax_diagnostic_mode,
                 prefix_t=plan.prefix_t,
+                attention_head_t=attention_head_t,
+                uniform=uniform_grid,
             )
         )
+        if uniform_grid and not force_dense:
+            # Unit measure needs no key range. Without one, sparse routing keeps
+            # the native conditioning sink instead of pinning protected keys.
+            measure_range = None
+        else:
+            measure_range = _partitioned_query_measure_range(
+                group.prefix_k_range, sink_rows=group.sink_rows,
+                target_query=group.query_prefix_domain, mode=softmax_diagnostic_mode, log_measure=measure,
+            )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[q_index] = partitioned_request_attention(
@@ -825,7 +994,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 kind="local",
                 scale=scale,
                 sink_rows=group.sink_rows,
-                prefix_k_range=group.prefix_k_range,
+                prefix_k_range=measure_range,
                 prefix_log_key_measure=measure,
                 semantic_digest=semantic_digest,
                 query_position_map=wire,
@@ -834,6 +1003,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 # grouped Q/K/V gather and measure bias have been fixed.
                 force_dense=force_dense,
             )
+        if uniform_grid and not force_dense:
+            _record_partitioned_uniform_native_local(options, q_rows=group.q_rows)
+        elif measure_range != group.prefix_k_range:
+            _record_partitioned_target_sink_measure(options, q_rows=group.q_rows, kv_rows=group.kv_rows)
         if boundary_dense_suffix:
             _record_partitioned_boundary_suffix_dense(
                 options,
@@ -854,17 +1027,23 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if grouped.groups:
         del k_scratch, v_scratch
 
-    if grouped.anchor_slices:
+    for target_anchor, anchor_slices in _partitioned_anchor_domains(grouped, split_target=target_sink_measure):
+        if not anchor_slices:
+            continue
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
             anchor_index = _indices_from_ranges(
-                grouped.anchor_slices,
+                anchor_slices,
                 device=device,
                 resources=resources,
-                identity=(*index_identity, "anchor"),
+                identity=(*index_identity, "anchor", target_anchor) if target_sink_measure else (*index_identity, "anchor"),
             )
             q_anchor = q[anchor_index]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
+        anchor_measure_range = _partitioned_query_measure_range(
+            grouped.full_prefix_k_range, sink_rows=grouped.video_start,
+            target_query=target_anchor, mode=softmax_diagnostic_mode, log_measure=prefix_log_key_measure,
+        )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
             softmax_out[anchor_index] = partitioned_request_attention(
@@ -876,12 +1055,14 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 kind="anchor",
                 scale=scale,
                 sink_rows=0,
-                prefix_k_range=grouped.full_prefix_k_range,
+                prefix_k_range=anchor_measure_range,
                 prefix_log_key_measure=plan.prefix_log_key_measure,
                 semantic_digest=semantic_digest,
                 force_dense=True,
             )
         _record_component(record_component, "vdn_softmax_host_wall_s", softmax_started)
+        if anchor_measure_range != grouped.full_prefix_k_range:
+            _record_partitioned_target_sink_measure(options, q_rows=int(anchor_index.numel()), kv_rows=grouped.sequence_rows)
         del q_anchor
         covered_rows += int(anchor_index.numel())
 
@@ -894,7 +1075,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
 
     weights_started = time.perf_counter()
     with cuda_span("vdn_weights"):
-        if uniform_linear:
+        if pre_rope_linear:
             # Keep streamed lookahead after softmax, matching native VDN.
             state.prefetch_next_weights(block_index, device, dtype)
         else:
@@ -1154,8 +1335,10 @@ def _wrap_vdn_forward(current):
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
+    partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
+    partitioned_aware._vdn_partitioned_uniform_query_policy = VDN_PARTITIONED_UNIFORM_QUERY_POLICY
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_softmax_diagnostic_api = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_query_api = VDN_PARTITIONED_BOUNDARY_QUERY_API
@@ -1165,6 +1348,7 @@ def _wrap_vdn_forward(current):
     partitioned_aware._vdn_partitioned_softmax_diagnostic_modes = VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_OPTIONS
     partitioned_aware._vdn_partitioned_temporal_carrier_api = VDN_TEMPORAL_CARRIER_API
     partitioned_aware._vdn_partitioned_native_carrier_grids = PARTITIONED_NATIVE_CARRIER_GRIDS
+    partitioned_aware._vdn_partitioned_domain_stream_api = FLOW_DOMAIN_STREAM_API
     try:
         carrier_spec = _temporal_carrier_short_conv_spec(values["base_branch"])
     except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -1200,10 +1384,14 @@ def install_partitioned_external_sequence_bridge(model) -> None:
 
 
 __all__ = [
+    "FLOW_DOMAIN_STREAM_API",
+    "FLOW_DOMAIN_STREAM_KEY",
+    "FLOW_DOMAIN_STREAM_POLICY",
     "PartitionedQueryPositionSummary",
     "VDN_EXTERNAL_SEQUENCE_KEY",
     "VDN_PARTITIONED_BOUNDARY_QUERY_API",
     "VDN_PARTITIONED_BOUNDARY_QUERY_POLICY",
+    "VDN_PARTITIONED_UNIFORM_QUERY_POLICY",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_BYPASS",
     "VDN_PARTITIONED_LINEAR_DIAGNOSTIC_KEY",
@@ -1222,5 +1410,6 @@ __all__ = [
     "VDN_TEMPORAL_CARRIER_NATIVE",
     "VDN_TEMPORAL_CARRIER_POLICIES",
     "install_partitioned_external_sequence_bridge",
+    "resolve_domain_stream_layout",
     "validate_partitioned_external_execution",
 ]

@@ -6,6 +6,35 @@ VDN keeps ownership of its trained window/global/anchor geometry, learned softma
 
 The provider contract is implemented in grouped retained attention. Full-domain preprocessing still occurs before VDN gathers local domains, and VDN remains responsible for the gather/scatter topology.
 
+## Physical partitioned attention provider
+
+`PARTITIONED_PROVIDER_API_VERSION = 1` and the bridged forward's
+`_vdn_partitioned_attention_provider_api = 1` advertise backend-neutral dispatch
+for Flow's physical partitioned sequences. These calls use the optional
+`transformer_options["vdn_partitioned_attention_provider_v1"]` hook:
+
+```python
+provider(q, k, v, *, transformer_options, block_index, kind, scale,
+         sink_rows, prefix_k_range, prefix_log_key_measure, semantic_digest,
+         query_position_map=None, force_dense=False)
+```
+
+Q is `[requested_rows, heads, head_dim]`; K/V contain only the already-gathered
+union. Preprocessing has already run once over the complete post-RoPE domain.
+The provider must preserve that union, apply the additive log key measure to
+`prefix_k_range`, respect exact-query requests and return Q's shape, dtype and
+device. Mapped queries carry the same VDN-owned position descriptor as v4.
+There is no square-Q compatibility allocation. VDN retains its learned linear
+branch, gates, projection and scatter ownership. Invalid provider presence or
+results raise an error without switching backend.
+
+Clients without this hook retain the legacy request-owned Sol dispatch. Ordinary
+non-partitioned VDN uses the existing v1-v4 dispatch below. Flow's native provider
+uses the selected ComfyUI backend with additive key masks; sparse backends that
+cannot consume weighted or mapped rectangular domains use their native dense
+fallback. This can increase time and memory. CPU equivalence does not establish
+GPU performance or rendered quality.
+
 ## v1
 
 `transformer_options["vdn_softmax_provider_v1"]` remains supported:
@@ -109,3 +138,19 @@ The separate PR #8 audio-fidelity experiment is not part of this provider-v4 rel
 The v4 implementation has CPU tests for exact restricted-domain mapping, owner-bound preflight, provider precedence, malformed-v4 native fallback, and suppression of the v2 square-Q payload. Paired Sol-H3 v0.1.5 production validation additionally passed real SM120 same-input validation, controlled first-high replay, the historical-M timing gate, and the representative 2x7-second Target Input trajectory.
 
 The released v3 stack remains historical evidence for direct rectangular routing. v4 changes the numerical routing policy only when a paired provider validates and consumes the explicit map; it does not retroactively change the behavior of older providers.
+
+## Partitioned target-query conditioning measure
+
+Flow's opt-in `target_query_sink_measure` softmax diagnostic extends the
+partitioned target-key measure over non-video rows for target-grid local
+and anchor queries. A local group's K/V order is non-video rows, target-grid
+head keys, then reduced-grid tail keys; `(0, target_end)` is therefore the
+contiguous affected range. Reduced-grid and global queries retain the baseline
+measure. Query maps, temporal windows, dense/sparse routing and learned linear
+statistics are preserved. Anchor rows on different grids use separate dense
+calls. Sol partitioned sink-measure API 1 is required. Normal remains the default.
+
+The head domain includes both exact protected frames and mutable target-band
+frames. This selector changes their attention weighting, not their timestep or
+protection masks. It must not be combined with `raw_token_measure`. It is an
+experimental weighting policy; output quality requires matched rendered runs.

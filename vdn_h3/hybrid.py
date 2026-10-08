@@ -24,7 +24,7 @@ from vdn_h3.policy import RETAINED_SAMPLING_HEADROOM_BYTES
 from vdn_h3 import compiler_guard
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
-from vdn_h3.window import full_coverage, window_bounds
+from vdn_h3.window import VDNLayout, full_coverage, window_bounds
 
 _log = logging.getLogger("comfy.vdn")
 _seen = collections.OrderedDict()
@@ -47,29 +47,6 @@ def _once(key, message):
     while len(_seen) > _MAX_SEEN:
         _seen.popitem(last=False)
     _log.info("[vdn] %s", message)
-
-
-class VDNLayout:
-    __slots__ = (
-        "video_start", "video_end", "num_frames", "tokens_per_frame",
-        "frame_size", "text_start", "text_len", "bounds", "full_cover",
-        "seq_len", "anchor_frames",
-    )
-
-    def __init__(self, video_start, video_end, num_frames, tokens_per_frame,
-                 frame_size, text_start, text_len, seq_len, radius, chunk,
-                 anchor_frames):
-        self.video_start = video_start
-        self.video_end = video_end
-        self.num_frames = num_frames
-        self.tokens_per_frame = tokens_per_frame
-        self.frame_size = frame_size
-        self.text_start = text_start
-        self.text_len = text_len
-        self.seq_len = seq_len
-        self.bounds = window_bounds(num_frames, radius, chunk)
-        self.full_cover = full_coverage(self.bounds, num_frames)
-        self.anchor_frames = anchor_frames
 
 
 class VDNState:

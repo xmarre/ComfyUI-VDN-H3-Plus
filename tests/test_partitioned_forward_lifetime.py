@@ -19,8 +19,9 @@ from vdn_h3.partitioned_sequence import (
 )
 
 
+@pytest.mark.parametrize("sink_measure", [False, True])
 @pytest.mark.parametrize("gate_enabled,retain", [(False, False), (False, True), (True, True)])
-def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monkeypatch, gate_enabled, retain):
+def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monkeypatch, gate_enabled, retain, sink_measure):
     torch.manual_seed(62)
     plan = PartitionedSequence(
         video_start=7, temporal=5, prefix_t=2,
@@ -76,6 +77,7 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     def linear_readout(_branch, _weights, _xv, q_raw, k_raw, v_raw, **kwargs):
         assert all(ref() is None for ref in references.values())
         events.append("linear")
+        assert kwargs.get("raw_token_measure", False) is False
         for actual, original in zip((q_raw, k_raw, v_raw), (raw_q, raw_k, raw_v)):
             assert torch.equal(actual.reshape(-1, 2), original[plan.video_start:])
         assert torch.equal(kwargs["text_k_raw"].reshape(-1, 2), raw_k[1:3])
@@ -85,6 +87,7 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     sol_package = ModuleType("sol_h3")
     sol_request = ModuleType("sol_h3.partitioned_request")
     sol_request.partitioned_request_attention = attention
+    sol_request.PARTITIONED_SINK_MEASURE_API = 1
     monkeypatch.setitem(sys.modules, "sol_h3", sol_package)
     monkeypatch.setitem(sys.modules, "sol_h3.partitioned_request", sol_request)
     monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", rope)
@@ -98,6 +101,8 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     }
     options = {PARTITIONED_PREFIX_KEY: plan.canonical_contract(),
                partitioned_runtime.VDN_EXTERNAL_SEQUENCE_KEY: make_vdn_partitioned_external_contract(plan)}
+    if sink_measure:
+        options[partitioned_runtime.VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY] = "target_query_sink_measure"
     with state.runtime.execution():
         token = state._layout.set(layout)
         try:
@@ -114,14 +119,18 @@ def test_partitioned_linear_keeps_raw_copies_without_attention_temporaries(monke
     assert events == ["weights", "linear"]
 
 
+@pytest.mark.parametrize("sink_measure", [False, True])
 @pytest.mark.parametrize("fast_kernels", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("strength", [0.0, 0.5, 1.0])
-def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeypatch, fast_kernels, dtype, strength):
+@pytest.mark.parametrize("grid_case", [(False, None), (True, None), (False, 3)])
+def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, strength, grid_case, sink_measure):
+    mixed_grid, attention_head_t = grid_case
     torch.manual_seed(774)
     plan = PartitionedSequence(
         video_start=7, temporal=5, prefix_t=2,
-        source_grid_h=2, source_grid_w=3, target_grid_h=2, target_grid_w=3,
+        source_grid_h=2, source_grid_w=3,
+        target_grid_h=3 if mixed_grid else 2, target_grid_w=4 if mixed_grid else 3,
     )
     cfg = {"radius": 1, "chunk": 1, "anchor_frames": "none",
            "enable_softmax_gate": True, "linear_enabled": True}
@@ -166,10 +175,15 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     options = {
         PARTITIONED_PREFIX_KEY: plan.canonical_contract(),
         partitioned_runtime.VDN_EXTERNAL_SEQUENCE_KEY: make_vdn_partitioned_external_contract(plan),
-        partitioned_runtime.FLOW_PARTITIONED_STAGE_KEY: SimpleNamespace(metrics=SimpleNamespace(increment=increment)),
+        partitioned_runtime.FLOW_PARTITIONED_STAGE_KEY: SimpleNamespace(
+            metrics=SimpleNamespace(increment=increment), attention_head_t=attention_head_t,
+        ),
     }
     sol_package = ModuleType("sol_h3")
     sol_request = ModuleType("sol_h3.partitioned_request")
+    sol_request.PARTITIONED_SINK_MEASURE_API = 1
+    if sink_measure:
+        options[partitioned_runtime.VDN_PARTITIONED_SOFTMAX_DIAGNOSTIC_KEY] = "target_query_sink_measure"
     def attention(q, _k, _v, **kwargs):
         events.append("softmax")
         force_dense_calls.append(bool(kwargs["force_dense"]))
@@ -216,22 +230,33 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
                 state._layout.reset(token)
 
     native = execute()
+    sink_counters = {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")}
+    assert bool(sink_counters) == bool(sink_measure and mixed_grid)
+    for k in sink_counters:
+        counters.pop(k)
+    # Mixed grids keep the dense prefix/boundary policy. A uniform grid routes
+    # every local group natively, like a non-partitioned call.
     expected_boundary_counters = {
         "partitioned_vdn_boundary_suffix_dense_calls": 1,
         "partitioned_vdn_boundary_suffix_dense_q_rows": 6,
-        "partitioned_vdn_boundary_suffix_dense_kv_rows": 25,
+        "partitioned_vdn_boundary_suffix_dense_kv_rows": 31,
         "partitioned_vdn_boundary_suffix_dense_query_frames": 1,
+    } if mixed_grid else {
+        "partitioned_vdn_uniform_native_local_calls": 5,
+        "partitioned_vdn_uniform_native_local_q_rows": 30,
     }
+    expected_force_dense = [True, True, True, True, False, False] if mixed_grid else [True, False, False, False, False, False]
     assert counters == {
-        "partitioned_vdn_uniform_linear_calls": 1,
-        "partitioned_vdn_uniform_pre_rope_calls": 1,
-        **({"partitioned_vdn_uniform_fast_requested_calls": 1} if fast_kernels else {}),
+        "partitioned_vdn_pre_rope_linear_calls": 1,
+        **({"partitioned_vdn_uniform_linear_calls": 1, "partitioned_vdn_uniform_pre_rope_calls": 1}
+           if not mixed_grid else {}),
+        **({"partitioned_vdn_uniform_fast_requested_calls": 1} if fast_kernels and not mixed_grid else {}),
         **expected_boundary_counters,
     }
     assert weights_calls == [False]
-    # One global packed-sequence call is dense, followed by per-frame local groups:
-    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
-    assert force_dense_calls == [True, True, True, True, False, False]
+    # One global packed-sequence call is dense, followed by per-frame local groups.
+    # Mixed grid: prefix frames 0/1 and first generated frame 2 dense, 3/4 sparse.
+    assert force_dense_calls == expected_force_dense
     assert events.index("linear") < events.index("rope") < events.index("softmax") < events.index("prefetch")
     counters.clear()
     force_dense_calls.clear()
@@ -246,10 +271,13 @@ def test_same_grid_forward_executes_uniform_linear_and_publishes_receipt(monkeyp
     options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _context: False)
     monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", general)
     reference = execute()
+    assert {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")} == sink_counters
+    for k in sink_counters:
+        counters.pop(k)
     assert counters == expected_boundary_counters
-    # One global packed-sequence call is dense, followed by per-frame local groups:
-    # prefix frames 0/1 dense, first generated frame 2 dense, later frames 3/4 sparse.
-    assert force_dense_calls == [True, True, True, True, False, False]
+    # One global packed-sequence call is dense, followed by per-frame local groups.
+    # Mixed grid: prefix frames 0/1 and first generated frame 2 dense, 3/4 sparse.
+    assert force_dense_calls == expected_force_dense
     assert weights_calls == [True]
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     assert torch.allclose(native.float(), reference.float(), rtol=tolerance, atol=tolerance)

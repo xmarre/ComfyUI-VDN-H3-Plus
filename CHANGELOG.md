@@ -1,7 +1,21 @@
 # Changelog
 
-## Unreleased
+## v1.5.9 — 2026-10-08
 
+- Equal-grid partitions route every local query group through the selected
+  backend's native selection and keep only the native conditioning sink.
+  Mixed-grid partitions keep the dense prefix and boundary-group policy. The
+  bridge advertises `_vdn_partitioned_uniform_query_policy`.
+- Physical partitioned sequences can dispatch through the optional
+  `vdn_partitioned_attention_provider_v1` hook (provider API 1), independently
+  of Sol ownership. Clients without the hook retain Sol dispatch.
+- Flow's domain-uniform hidden streams derive their window layout from the
+  stream's equal-grid contract (`_vdn_partitioned_domain_stream_api = 1`).
+  `VDNLayout` moves to `vdn_h3.window` and remains importable from
+  `vdn_h3.hybrid`.
+- The partitioned softmax diagnostic accepts `target_query_sink_measure`.
+- Mixed-grid partitions read the learned linear complement before in-place
+  RoPE instead of retaining raw video Q/K/V through softmax.
 - The AIMDO model-compiler guard now takes effect. It was a DIFFUSION_MODEL
   wrapper, but the native MiniMax-H3 forward decides whether to record a malloc
   graph, and opens it, before its DIFFUSION_MODEL wrappers run, and nothing in
