@@ -22,11 +22,34 @@ transforms whose metadata uses original packed-row coordinates compose without
 remapping those coordinates inside each local window.
 """
 PROVIDER_API_VERSION = 4
+PARTITIONED_PROVIDER_API_VERSION = 1
+PARTITIONED_PROVIDER_KEY = "vdn_partitioned_attention_provider_v1"
 KEY = "vdn_softmax_provider_v1"
 KEY_V2 = "vdn_softmax_provider_v2"
 KEY_V3 = "vdn_softmax_provider_v3"
 KEY_V4 = "vdn_softmax_provider_v4"
 PREPROCESS_KEY = "vdn_attention_preprocess_v1"
+
+
+def partitioned_attention(q, k, v, **kwargs):
+    """Dispatch physical partitioned requests without imposing a backend owner.
+
+    The provider receives the complete measure and gathered-domain metadata.
+    Legacy Flow clients without this hook retain their Sol request dispatch.
+    """
+    options = kwargs["transformer_options"]
+    if PARTITIONED_PROVIDER_KEY in options:
+        provider = options[PARTITIONED_PROVIDER_KEY]
+        if not callable(provider):
+            raise RuntimeError("VDN partitioned attention provider must be callable")
+    else:
+        from sol_h3.partitioned_request import partitioned_request_attention
+
+        provider = partitioned_request_attention
+    result = provider(q, k, v, **kwargs)
+    if result.shape != q.shape or result.dtype != q.dtype or result.device != q.device:
+        raise RuntimeError("VDN partitioned attention provider returned incompatible shape/dtype/device")
+    return result
 
 
 def has_v2(options):
