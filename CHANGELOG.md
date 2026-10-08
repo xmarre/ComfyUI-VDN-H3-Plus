@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- The AIMDO model-compiler guard now takes effect. It was a DIFFUSION_MODEL
+  wrapper, but the native MiniMax-H3 forward decides whether to record a malloc
+  graph, and opens it, before its DIFFUSION_MODEL wrappers run, and nothing in
+  the forward reads the setting again. The guard therefore never prevented
+  recording. It is now an APPLY_MODEL wrapper registered by Apply on the
+  patched model, so the compiler is off when the forward makes that decision
+  and is restored after each model evaluation. On builds with dynamic VRAM and
+  the compiler enabled, VDN forwards now run without a recorded allocation
+  graph. A user-supplied `--disable-comfy-compiler` is never changed.
+- The import-time wrapper around `vdn_h3.hybrid.make_layout_wrapper` is removed.
+
 ## v1.5.8 — 2026-10-06
 
 - The partitioned exact-prefix contract may declare `native_carrier_grid="target"`

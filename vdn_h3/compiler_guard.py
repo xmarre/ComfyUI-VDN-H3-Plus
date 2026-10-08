@@ -12,14 +12,19 @@ possible:
   wrappers and restored in ``finally``;
 * no Comfy function is monkey-patched and no unload hook is installed.
 
-The guard is installed around VDN's own DIFFUSION_MODEL wrapper, so the switch is
-active before the native MiniMax-H3 forward asks ``model_prefetch`` whether to
-start a malloc graph and is restored immediately after that wrapped forward.
+The guard is an APPLY_MODEL wrapper registered by ``vdn_h3.hybrid.apply_vdn`` on
+the VDN-patched model only.  Placement matters: the native MiniMax-H3
+``forward`` calls ``model_prefetch.malloc_graph_enabled`` and, when it returns
+True, ``malloc_graph_begin`` *before* it runs its DIFFUSION_MODEL wrappers.  A
+DIFFUSION_MODEL wrapper therefore flips the switch after the graph is already
+open, and nothing inside the forward reads the switch again, so it cannot
+prevent recording.  ``BaseModel.apply_model`` runs APPLY_MODEL wrappers around
+``_apply_model``, which is what calls the diffusion model, so the switch is
+active when ``forward`` asks and is restored after that one model evaluation.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
-import functools
 import logging
 import threading
 
@@ -86,30 +91,11 @@ def disabled_for_vdn():
                     args.disable_comfy_compiler = False
 
 
-def install_layout_guard() -> bool:
-    """Wrap VDN's own layout-wrapper factory exactly once.
+def make_apply_model_wrapper():
+    """Return the APPLY_MODEL wrapper that owns the switch for one evaluation."""
 
-    ``vdn_h3.hybrid.apply_vdn`` resolves ``make_layout_wrapper`` from its module
-    globals when Apply executes, so installing after node imports is sufficient and
-    avoids modifying or wrapping any ComfyUI core callable.
-    """
-    from vdn_h3 import hybrid
+    def guarded(executor, *args, **kwargs):
+        with disabled_for_vdn():
+            return executor(*args, **kwargs)
 
-    current = hybrid.make_layout_wrapper
-    if getattr(current, "_vdn_compiler_guard_installed", False):
-        return False
-
-    @functools.wraps(current)
-    def guarded_factory(state):
-        inner = current(state)
-
-        @functools.wraps(inner)
-        def guarded(executor, *args, **kwargs):
-            with disabled_for_vdn():
-                return inner(executor, *args, **kwargs)
-
-        return guarded
-
-    guarded_factory._vdn_compiler_guard_installed = True
-    hybrid.make_layout_wrapper = guarded_factory
-    return True
+    return guarded

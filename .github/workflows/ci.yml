@@ -128,3 +128,8 @@ jobs:
 
           print('node registration + current compiler guard: ok')
           PY
+      - name: Compiler guard against current Core ordering
+        env:
+          COMFYUI_ROOT: ${{ github.workspace }}/_deps/ComfyUI
+          PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/_deps/ComfyUI
+        run: python -m pytest -q tests/test_compiler_guard.py
