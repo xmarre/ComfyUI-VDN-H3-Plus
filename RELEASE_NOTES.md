@@ -11,6 +11,17 @@ boundary-group policy. Global and anchor queries stay dense, as in native VDN.
 The bridge advertises `_vdn_partitioned_uniform_query_policy`. GPU time and
 rendered effect are unvalidated.
 
+## Unreleased: backend-neutral partitioned attention
+
+Physical partitioned sequences can dispatch through the optional
+`vdn_partitioned_attention_provider_v1` hook. It transports the complete
+gathered Q/K/V domain, key measure, mapped-query descriptor and exact-query
+requirement independently of Sol ownership. Bridged forwards advertise provider
+API 1. Existing clients without the hook retain Sol dispatch; ordinary VDN v1-v4
+providers and learned branch arithmetic are unchanged. Results must retain Q's
+shape, dtype and device. Native dense fallback may increase attention time and
+memory; GPU validation remains necessary.
+
 ## Unreleased: Flow domain-uniform streams
 
 Accept Flow's opt-in target-band `target_band_context=domain_uniform_v1`, which
