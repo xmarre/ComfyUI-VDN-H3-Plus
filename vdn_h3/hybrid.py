@@ -21,6 +21,7 @@ from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.query_positions import native_plan_summary
 from vdn_h3.policy import RETAINED_SAMPLING_HEADROOM_BYTES
+from vdn_h3 import compiler_guard
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import VDNLayout, full_coverage, window_bounds
@@ -701,6 +702,11 @@ def apply_vdn(new_model, state):
         new_model.add_object_patch(key, make_vdn_forward(block.attn, state, index))
     new_model.add_wrapper_with_key(
         WrappersMP.DIFFUSION_MODEL, "vdn_h3", make_layout_wrapper(state))
+    # APPLY_MODEL, not DIFFUSION_MODEL: the native forward decides whether to open
+    # an AIMDO malloc graph before its DIFFUSION_MODEL wrappers run.
+    new_model.add_wrapper_with_key(
+        WrappersMP.APPLY_MODEL, "vdn_h3_compiler_guard",
+        compiler_guard.make_apply_model_wrapper())
     new_model.add_wrapper_with_key(
         WrappersMP.PREPARE_SAMPLING,
         "vdn_h3_memory_admission",
