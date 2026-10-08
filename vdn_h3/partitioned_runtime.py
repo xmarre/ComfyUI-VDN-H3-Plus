@@ -675,9 +675,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     if target_sink_measure:
         if _partitioned_linear_diagnostic_mode(options) == VDN_PARTITIONED_LINEAR_DIAGNOSTIC_RAW_TOKEN_MEASURE:
             raise RuntimeError("target-query sink measure cannot be combined with raw_token_measure")
-        from sol_h3 import partitioned_request as sol_request
-        if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
-            raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
+        from .softmax_provider import PARTITIONED_PROVIDER_KEY
+        if PARTITIONED_PROVIDER_KEY not in options:
+            from sol_h3 import partitioned_request as sol_request
+            if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
+                raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
 
     q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
     v = v.view(s, heads, head_dim)
@@ -856,12 +858,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         q, k, v = preprocess(options, q, k, v, heads)
     _record_component(record_component, "vdn_preprocess_host_wall_s", preprocess_started)
 
-    try:
-        from sol_h3.partitioned_request import partitioned_request_attention
-    except ImportError as exc:
-        raise RuntimeError(
-            "partitioned exact-prefix VDN requires the matching Sol-H3 partitioned backend branch"
-        ) from exc
+    from .softmax_provider import partitioned_attention as partitioned_request_attention
 
     scale = head_dim**-0.5
     raw_token_measure = (
@@ -1304,6 +1301,7 @@ def _wrap_vdn_forward(current):
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
+    partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
     partitioned_aware._vdn_partitioned_boundary_witness_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_modes = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_OPTIONS
