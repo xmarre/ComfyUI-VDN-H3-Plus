@@ -215,11 +215,18 @@ VDN supports the external-sequence contracts used by MiniMax-H3 Flow-Aligned Reg
 Partitioned inference computes the learned linear complement before in-place
 RoPE on both uniform and heterogeneous grids, avoiding retained raw-QKV copies.
 Mixed-grid readout honors the selected fused gather and output epilogue.
-Diagnostic feature witnesses retain the copy path. Equal-grid partitions (the
-target-grid high stage and Flow domain streams) route every local query group
-through the selected backend's native selection, as a non-partitioned call
-does; only mixed-grid partitions force the protected-prefix and first generated
-groups dense.
+Diagnostic feature witnesses retain the copy path. Equal-grid partitions route
+every local query group through the selected backend's native selection, as a
+non-partitioned call does; only mixed-grid partitions force the protected-prefix
+and first generated groups dense. Flow's recommended continuation
+(`spatial_stage_control=progressive_uniform_source`, the default from Flow
+v0.3.11) runs its reduced-grid low/probe clip and its target-grid high stage as
+equal-grid partitions, as do Flow's domain streams.
+
+Partitioned attention dispatches through Sol when Sol attention is selected and
+otherwise through the optional `vdn_partitioned_attention_provider_v1` hook
+(provider API 1), which Flow uses to run the selected ComfyUI attention backend.
+Sol-H3 is therefore not required for partitioned continuation.
 
 During an API-2 mixed sequence, VDN keeps the learned dense softmax gate active and disables only geometry-dependent local-window/linear-complement work that cannot be interpreted on the mixed lattice. The fresh target-grid stage returns to normal VDN execution automatically.
 
@@ -275,10 +282,10 @@ details are in [RELEASE_NOTES.md](RELEASE_NOTES.md) and [CHANGELOG.md](CHANGELOG
 
 | Component | Release | Included PRs |
 | --- | --- | --- |
-| Flow-Aligned Regenerate | [v0.3.10](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.10) | [#96](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/96) |
-| Sol-H3 | [v0.1.9](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.9) | [#39](https://github.com/xmarre/ComfyUI-Sol-H3/pull/39) |
-| VDN-H3-Plus | [v1.5.8](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.8) | [#38](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/38) |
-| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | [#39](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/pull/40) |
+| Flow-Aligned Regenerate | [v0.3.11](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.11) | [#97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97) |
+| Sol-H3 | [v0.1.10](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.10) | [#40](https://github.com/xmarre/ComfyUI-Sol-H3/pull/40) |
+| VDN-H3-Plus | [v1.5.9](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.9) | [#39](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | unchanged |
 | Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
 
 [Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)

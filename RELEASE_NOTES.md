@@ -1,4 +1,10 @@
-## Unreleased: native routing on equal-grid partitions
+# ComfyUI-VDN-H3-Plus v1.5.9
+
+Support Flow-Aligned Regenerate v0.3.11: native routing on equal-grid
+partitions, backend-neutral partitioned attention and Flow's domain-uniform
+streams. The AIMDO compiler guard now takes effect.
+
+## Native routing on equal-grid partitions
 
 Equal-grid partitions (Flow's target-grid high stage, domain-uniform streams and
 same-grid control) are ordinary uniform clips with unit key measure. Their local
@@ -11,7 +17,10 @@ boundary-group policy. Global and anchor queries stay dense, as in native VDN.
 The bridge advertises `_vdn_partitioned_uniform_query_policy`. GPU time and
 rendered effect are unvalidated.
 
-## Unreleased: backend-neutral partitioned attention
+Flow v0.3.11's default `progressive_uniform_source` continuation runs low/probe
+and high as equal-grid partitions, so it uses this routing in every stage.
+
+## Backend-neutral partitioned attention
 
 Physical partitioned sequences can dispatch through the optional
 `vdn_partitioned_attention_provider_v1` hook. It transports the complete
@@ -22,7 +31,7 @@ providers and learned branch arithmetic are unchanged. Results must retain Q's
 shape, dtype and device. Native dense fallback may increase attention time and
 memory; GPU validation remains necessary.
 
-## Unreleased: Flow domain-uniform streams
+## Flow domain-uniform streams
 
 Accept Flow's opt-in target-band `target_band_context=domain_uniform_v1`, which
 evaluates two uniform-grid hidden streams per model call.
@@ -42,6 +51,60 @@ evaluates two uniform-grid hidden streams per model call.
 
 CPU tests cover layout derivation, fail-closed validation and grouped routing on
 stream rows. GPU arithmetic, performance and rendered quality are unvalidated.
+
+## Target-query non-video key measure
+
+The partitioned softmax diagnostic accepts `target_query_sink_measure`. It
+extends the target-key bias over non-video keys only for target-grid local and
+row-anchor queries; row-anchor calls are split by query domain. Global and
+source-grid queries keep their measures, gathers and routing. Learned linear
+measure policy and default execution are unchanged. The mode requires paired
+Sol capability before projection and records completed biased calls.
+
+## Partitioned memory
+
+Mixed-grid partitions now compute the learned linear complement from the raw
+Q/K/V projections before in-place RoPE, as equal-grid partitions already did,
+instead of retaining three full-size raw video copies through softmax. Each
+frame's grid and key measure are passed to the readout. Feature-witness and
+diagnostic paths keep the late readout.
+
+## AIMDO compiler guard
+
+The model-compiler guard was a `DIFFUSION_MODEL` wrapper, but the native
+MiniMax-H3 forward decides whether to record a malloc graph, and opens it,
+before its `DIFFUSION_MODEL` wrappers run. The guard therefore never prevented
+recording. It is now an `APPLY_MODEL` wrapper registered by Apply on the patched
+model: the compiler is off when the forward makes that decision and is restored
+after each model evaluation. On builds with dynamic VRAM and the compiler
+enabled, VDN forwards now run without a recorded allocation graph. A
+user-supplied `--disable-comfy-compiler` is never changed. The import-time
+wrapper around `vdn_h3.hybrid.make_layout_wrapper` is removed.
+
+## Coordinated release set
+
+Update the coordinated components together. Every release links this same
+version set and identifies its implementation PRs.
+
+| Component | Release | Included PRs |
+| --- | --- | --- |
+| Flow-Aligned Regenerate | [v0.3.11](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/releases/tag/v0.3.11) | [#97](https://github.com/xmarre/MiniMax-H3-Flow-Aligned-Regenerate/pull/97) |
+| Sol-H3 | [v0.1.10](https://github.com/xmarre/ComfyUI-Sol-H3/releases/tag/v0.1.10) | [#40](https://github.com/xmarre/ComfyUI-Sol-H3/pull/40) |
+| VDN-H3-Plus | [v1.5.9](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/releases/tag/v1.5.9) | [#39](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/39), [#40](https://github.com/xmarre/ComfyUI-VDN-H3-Plus/pull/40) |
+| H3 Continuum-Plus | [v3.4.6](https://github.com/xmarre/ComfyUI-H3-Continuum-Plus/releases/tag/v3.4.6) | unchanged |
+| Latent Upscaler-Plus | [v0.2.2](https://github.com/xmarre/Comfyui_Minimax_h3_latent_Upscaler-Plus/releases/tag/v0.2.2) | unchanged |
+
+[Spectrum MiniMax H3 v0.2.28](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/releases/tag/v0.2.28)
+is the unchanged companion. Separate Keyless, audio-training and rejected
+decoded-geometry experiments are outside this release set.
+
+The tested Core adapter repair is
+[ComfyUI #16783](https://github.com/Comfy-Org/ComfyUI/pull/16783).
+For INT8 fused MLP runtime adapters, retain that ComfyUI Patcher PR overlay until
+the repair is available upstream. The independent Core #16720 optimization is
+not included in this release set.
+
+---
 
 # ComfyUI-VDN-H3-Plus v1.5.8
 
