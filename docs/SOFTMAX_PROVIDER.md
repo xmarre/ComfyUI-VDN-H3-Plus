@@ -9,7 +9,10 @@ The provider contract is implemented in grouped retained attention. Full-domain 
 ## Optional bounded raw-QKV projection
 
 The native VDN attention forward advertises
-`_vdn_bounded_projection_api = 1` and accepts an optional
+`_vdn_bounded_projection_api = 1`. The Flow partitioned VDN wrapper advertises
+API 2 when it wraps an API-1 forward, supporting the identical raw projection
+contract in both native and physical mixed/equal-grid domain execution.
+Both forwards accept an optional
 `transformer_options["sol_h3_vdn_qkv_projection_v1"]` callable:
 
 ```python
@@ -35,10 +38,12 @@ not GPU peak-memory measurements.
 The interface is opt-in. Older Sol/VDN pairings, absent producer keys and
 unsupported projection owners continue through the existing packed-QKV path.
 Sol-H3 PR #41 offers a checked implementation and request telemetry for the
-compatible VDN native forward, while physical Flow partitioned producers retain
-their original Q/K/V ownership. VDN does not cache producer activations or
-modify attention dispatch. CPU equivalence does not demonstrate CUDA bitwise
-identity, VRAM savings, sampler speed or decoded quality. Release acceptance
+compatible VDN forward, including Flow's VDN-owned physical partitioned
+producer when API 2 is present. Flow retains its physical query/key domains,
+prefix key weighting, grouped softmax and learned linear behavior. VDN does
+not cache producer activations or modify attention dispatch. CPU equivalence
+does not demonstrate CUDA bitwise identity, VRAM savings, sampler speed or
+decoded quality. Release acceptance
 requires measured full-workflow A/B comparisons.
 
 ## Physical partitioned attention provider

@@ -281,3 +281,79 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     assert weights_calls == [True]
     tolerance = 2e-5 if dtype == torch.float32 else 2e-2
     assert torch.allclose(native.float(), reference.float(), rtol=tolerance, atol=tolerance)
+
+
+def test_partitioned_bounded_qkv_producer_matches_unbounded_with_raw_linear(monkeypatch):
+    """Physical mixed-grid QKV retains its original softmax and late linear semantics."""
+    torch.manual_seed(1438)
+    plan = PartitionedSequence(
+        video_start=7, temporal=5, prefix_t=2,
+        source_grid_h=2, source_grid_w=3, target_grid_h=3, target_grid_w=4,
+    )
+    cfg = {"radius": 1, "chunk": 1, "anchor_frames": "none",
+           "enable_softmax_gate": False, "linear_enabled": True}
+    branch = SimpleNamespace(enable_text_state=True)
+    state = VDNState("bounded-partitioned", cfg, [branch], 1, 2, retain_buffers=False)
+    layout = VDNLayout(7, 37, 5, 6, (2, 3), 1, 2, 37, 1, 1, "none")
+    qkv = nn.Linear(2, 6, bias=False).requires_grad_(False)
+    values = {
+        "state": state, "base_branch": branch, "qkv_proj": qkv,
+        "out_proj": lambda out: out.clone(), "q_norm": nn.RMSNorm(2),
+        "k_norm": nn.RMSNorm(2), "heads": 1, "head_dim": 2,
+        "block_index": 0, "cfg": cfg,
+    }
+    x = torch.randn(plan.sequence_rows, 2)
+    options = {
+        PARTITIONED_PREFIX_KEY: plan.canonical_contract(),
+        partitioned_runtime.VDN_EXTERNAL_SEQUENCE_KEY: make_vdn_partitioned_external_contract(plan),
+    }
+    # The witness path deliberately uses late raw QKV copies, testing the
+    # hardest raw-input lifetime case without requiring checkpoint weights.
+    options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _: False)
+    from vdn_h3.softmax_provider import QKV_PROJECTION_KEY
+
+    def projection(module, inputs, heads, dim):
+        result = tuple(inputs.new_empty((len(inputs), heads, dim)) for _ in range(3))
+        for start in range(0, len(inputs), 4):
+            stop = min(len(inputs), start + 4)
+            packed = module(inputs[start:stop])
+            for dst, src in zip(result, packed.split(heads * dim, dim=-1)):
+                dst[start:stop].copy_(src.reshape(stop - start, heads, dim))
+        return result
+
+    def readout(_branch, weights, _xv, q, k, v, **kwargs):
+        del _branch, weights, kwargs
+        return q.reshape(q.shape[0], 2) + k.reshape(k.shape[0], 2) + v.reshape(v.shape[0], 2)
+
+    def attention(q, _k, _v, **kwargs):
+        del _k, _v, kwargs
+        return q.clone()
+
+    request = ModuleType("sol_h3.partitioned_request")
+    request.partitioned_request_attention = attention
+    package = ModuleType("sol_h3")
+    package.partitioned_request = request
+    monkeypatch.setitem(sys.modules, "sol_h3", package)
+    monkeypatch.setitem(sys.modules, "sol_h3.partitioned_request", request)
+    monkeypatch.setattr("vdn_h3.softmax_provider.preprocess", lambda _opts, q, k, v, _h: (q, k, v))
+    monkeypatch.setattr("vdn_h3.partitioned_linear.partitioned_linear_readout", readout)
+    monkeypatch.setattr(comfy.quant_ops.ck, "rms_rope_split_half_", lambda *_a, **_kw: None)
+    state.weights_on = lambda *_a, **_kw: {"to_out_linear.weight": torch.eye(2)}
+
+    def execute():
+        with state.runtime.execution(), torch.no_grad():
+            token = state._layout.set(layout)
+            try:
+                return partitioned_runtime._partitioned_vdn_forward(
+                    None, values, x, torch.zeros(1, plan.sequence_rows, 1, 1), options
+                )
+            finally:
+                state._layout.reset(token)
+
+    baseline = execute()
+    options[QKV_PROJECTION_KEY] = projection
+    bounded = execute()
+    torch.testing.assert_close(bounded, baseline, rtol=0, atol=0)
+    options[QKV_PROJECTION_KEY] = lambda _module, _x, _h, _d: (x, x, x)
+    with pytest.raises(RuntimeError, match="independent BF16 carrier"):
+        execute()
