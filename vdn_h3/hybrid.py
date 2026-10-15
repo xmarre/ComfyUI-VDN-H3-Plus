@@ -36,7 +36,7 @@ VDN_EXTERNAL_SEQUENCE_MODE = "dense_gate_no_linear"
 
 FLOW_STAGE_KEY = "h3_flow_stage"
 FLOW_PARTITIONED_PROGRESSIVE_KEY = "h3_flow_partitioned_progressive_v1"
-SAMPLING_ADMISSION_POLICY = "bounded_headroom_v2"
+SAMPLING_ADMISSION_POLICY = "bounded_headroom_v3"
 
 
 def _once(key, message):
@@ -456,7 +456,7 @@ def _cuda_allocator_snapshot():
         return None
 
 
-def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_models, device, stage):
+def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_models, device, stage, *, runtime=None):
     # Core has now reconciled clones/patches and loaded conditioning, nested
     # and hook-provided models. Reserve scratch without evicting that set.
     memory_required, _minimum = comfy.sampler_helpers.estimate_memory(
@@ -485,13 +485,26 @@ def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_mode
 
     before_allocator = _cuda_allocator_snapshot()
     free_before = comfy.model_management.get_free_memory(device)
+    free_after = free_before
+    reclaimed_scratch = None
+    reclaim_elapsed_ms = 0.0
+    if free_after < required and runtime is not None:
+        # A prior sampler can leave disposable scan/window buffers in this
+        # model's idle pool. Reclaim those before evicting TE/VAE residency or
+        # reporting OOM. Never clear an actively leased execution pool.
+        started = time.perf_counter()
+        reclaimed_scratch = runtime.try_release_retained()
+        if reclaimed_scratch is not None and any(reclaimed_scratch.values()):
+            comfy.model_management.soft_empty_cache()
+            free_after = comfy.model_management.get_free_memory(device)
+        reclaim_elapsed_ms = (time.perf_counter() - started) * 1000.0
+
     eviction_started = time.perf_counter()
     # Core's disable-smart-memory option ignores finite free_memory targets.
     # Avoid calling it at all when the requested headroom already fits.
     unloaded = []
-    free_after = free_before
     eviction_passes = 0
-    if free_before < required:
+    if free_after < required:
         # A partial unload's reported bytes can exceed the allocator's observed
         # recovery. Reconcile one remaining shortfall only after real progress;
         # never loop indefinitely or evict a prepared model to satisfy it.
@@ -512,6 +525,7 @@ def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_mode
         "kept_resident_h3=%d kept_required=%d eviction_elapsed_ms=%.3f "
         "required_mib=%.3f free_before_mib=%.3f free_after_mib=%.3f "
         "eviction_requested=%s eviction_passes=%d target_met=%s unloaded_models=%s "
+        "scratch_reclaim=%s reclaim_elapsed_ms=%.3f "
         "allocator_before=%s allocator_after=%s",
         SAMPLING_ADMISSION_POLICY,
         stage,
@@ -522,10 +536,12 @@ def _reserve_prepared_sampling_memory(model, noise_shape, conds, additional_mode
         required / (1 << 20),
         free_before / (1 << 20),
         free_after / (1 << 20),
-        free_before < required,
+        eviction_passes > 0,
         eviction_passes,
         free_after >= required,
         tuple(type(item.model.model).__name__ for item in unloaded if item.model is not None),
+        reclaimed_scratch,
+        reclaim_elapsed_ms,
         before_allocator,
         after_allocator,
     )
@@ -598,6 +614,7 @@ def make_prepare_sampling_memory_wrapper(state):
         try:
             _reserve_prepared_sampling_memory(
                 model, noise_shape, prepared_conds, additional_models, device, stage,
+                runtime=getattr(state, "runtime", None),
             )
         except BaseException:
             # Core has not returned this prepared set to the sampler's cleanup

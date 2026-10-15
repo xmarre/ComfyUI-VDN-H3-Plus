@@ -58,7 +58,7 @@ def test_sufficient_headroom_preserves_unrelated_models(monkeypatch, caplog, bud
     assert wrapped(executor, model, (1, 1, 1), conds) is prepared
     assert len(calls) == 1
     assert management.current_loaded_models is loaded
-    assert "policy=bounded_headroom_v2" in caplog.text
+    assert "policy=bounded_headroom_v3" in caplog.text
     assert "eviction_requested=False" in caplog.text
     assert caplog.text.index("sampling preparation") < caplog.text.index("sampling admission")
 
@@ -159,6 +159,68 @@ def test_core_partial_eviction_stops_at_finite_shortfall(monkeypatch, caplog, bu
     assert management.current_loaded_models == loaded
     assert "eviction_requested=True" in caplog.text
     assert "unloaded=0" in caplog.text
+
+
+def test_reclaims_idle_scratch_before_evicting_unrelated_models(monkeypatch, caplog, budget):
+    model, unrelated = _model(), _model()
+    loaded = [management.LoadedModel(item) for item in (model, unrelated)]
+    monkeypatch.setattr(management, "current_loaded_models", loaded)
+    memory = {"free": budget - GIB // 4}
+    events = []
+
+    class IdlePool:
+        def try_release_retained(self):
+            events.append("release")
+            return {"scan": 1, "kv": 1}
+
+    def trim():
+        assert events == ["release"]
+        events.append("trim")
+        memory["free"] = budget
+
+    monkeypatch.setattr(management, "get_free_memory", lambda _device: memory["free"])
+    monkeypatch.setattr(management, "soft_empty_cache", trim)
+    monkeypatch.setattr(management, "free_memory", lambda *_args, **_kwargs:
+                        pytest.fail("Idle VDN scratch suffices; no model eviction"))
+    caplog.set_level("INFO", logger="comfy.vdn")
+    prepared = (model.model, {}, [])
+    wrapped = hybrid.make_prepare_sampling_memory_wrapper(
+        SimpleNamespace(retain_buffers=True, runtime=IdlePool()))
+    assert wrapped(lambda *_args, **_kwargs: prepared, model, (1, 2, 3), {}) is prepared
+    assert events == ["release", "trim"]
+    assert management.current_loaded_models is loaded
+    assert "scratch_reclaim={'scan': 1, 'kv': 1}" in caplog.text
+    assert "eviction_requested=False eviction_passes=0 target_met=True" in caplog.text
+
+
+def test_busy_scratch_pool_is_not_dropped_and_core_handles_pressure(monkeypatch, budget):
+    model, unrelated = _model(), _model()
+    loaded = [management.LoadedModel(item) for item in (model, unrelated)]
+    monkeypatch.setattr(management, "current_loaded_models", loaded)
+    memory = {"free": budget - GIB}
+    calls = []
+
+    class BusyPool:
+        def try_release_retained(self):
+            calls.append("busy")
+            return None
+
+    monkeypatch.setattr(management, "get_free_memory", lambda _device: memory["free"])
+    monkeypatch.setattr(management, "soft_empty_cache", lambda:
+                        pytest.fail("Do not trim a leased pool"))
+
+    def free_memory(required, device, keep_loaded):
+        assert required == budget and keep_loaded == loaded[:1]
+        calls.append("core")
+        memory["free"] = budget
+        return []
+
+    monkeypatch.setattr(management, "free_memory", free_memory)
+    prepared = (model.model, {}, [])
+    wrapped = hybrid.make_prepare_sampling_memory_wrapper(
+        SimpleNamespace(retain_buffers=True, runtime=BusyPool()))
+    assert wrapped(lambda *_args, **_kwargs: prepared, model, (1, 2, 3), {}) is prepared
+    assert calls == ["busy", "core"]
 
 
 def test_core_minimum_inference_floor_is_retained(monkeypatch, budget):
