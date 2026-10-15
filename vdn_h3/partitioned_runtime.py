@@ -707,7 +707,21 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
                 raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
 
-    q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
+    from .softmax_provider import QKV_PROJECTION_KEY
+    projection = options.get(QKV_PROJECTION_KEY)
+    if projection is None:
+        q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
+    else:
+        if not callable(projection):
+            raise RuntimeError("partitioned VDN bounded QKV producer must be callable")
+        q, k, v = projection(qkv_proj, x, heads, head_dim)
+        if (
+            any(not isinstance(t, torch.Tensor) or t.shape != (s, heads, head_dim)
+                or t.dtype != dtype or t.device != device or not t.is_contiguous()
+                for t in (q, k, v))
+            or len({t.untyped_storage().data_ptr() for t in (q, k, v)}) != 3
+        ):
+            raise RuntimeError("partitioned VDN bounded QKV producer violated the independent BF16 carrier contract")
     v = v.view(s, heads, head_dim)
     q_raw = q.view(s, heads, head_dim)
     k_raw = k.view(s, heads, head_dim)
@@ -872,7 +886,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     else:
         q = q_norm(q_raw)
         k = k_norm(k_raw)
-    v = v.clone()
+    # Native packed QKV owns V's backing allocation; clone before the
+    # original packed projection leaves scope. Independent carriers supplied
+    # by a checked bounded producer already own V storage.
+    if projection is None:
+        v = v.clone()
 
     # Apply the inherited key/QKV preprocessing once on the complete physical
     # sequence before any VDN gather. This preserves transformations whose
@@ -1334,6 +1352,11 @@ def _wrap_vdn_forward(current):
 
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
+    # Unlike the native forward (API 1), this wrapper handles both native and
+    # physical partitioned Flow projection using the same owned-carrier ABI.
+    partitioned_aware._vdn_bounded_projection_api = (
+        2 if getattr(current, "_vdn_bounded_projection_api", None) == 1 else None
+    )
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
     partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
