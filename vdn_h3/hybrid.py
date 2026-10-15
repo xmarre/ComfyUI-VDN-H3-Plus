@@ -454,6 +454,7 @@ def make_vdn_forward(attn, state, block_index):
             return None
 
     vdn_forward._vdn_forward = True
+    vdn_forward._vdn_bounded_projection_api = 1
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     vdn_forward.vdn_query_position_plan_v1 = query_position_plan
     return vdn_forward
