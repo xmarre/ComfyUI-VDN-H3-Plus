@@ -6,6 +6,41 @@ VDN keeps ownership of its trained window/global/anchor geometry, learned softma
 
 The provider contract is implemented in grouped retained attention. Full-domain preprocessing still occurs before VDN gathers local domains, and VDN remains responsible for the gather/scatter topology.
 
+## Optional bounded raw-QKV projection
+
+The native VDN attention forward advertises
+`_vdn_bounded_projection_api = 1` and accepts an optional
+`transformer_options["sol_h3_vdn_qkv_projection_v1"]` callable:
+
+```python
+q, k, v = projection(qkv_proj, x, heads, head_dim)
+```
+
+This is a producer interface, not a softmax provider. The producer must invoke
+the original projection module and return three separately allocated contiguous
+tensors of shape `[packed_rows, heads, head_dim]`, with the same dtype and device
+as `x`. Invalid carriers fail immediately. VDN then computes its learned linear
+branch from the original raw Q/K/V, applies the existing Q/K RMSNorm and RoPE,
+and executes its original grouped-window or dense softmax, learned gate,
+projection and linear addition.
+
+Native packed QKV shares a backing allocation, so VDN clones V to avoid
+carrying that packed buffer beyond its useful lifetime. Independently allocated
+V already owns its storage and does not require this clone. With a BF16
+56-head H3 model at 100,000 rows, the standalone QKV+V-clone source allocations
+are about 5.34 GiB. Three independent carriers and a 4096-row packed
+projection temporary use about 4.17 GiB. These figures are storage estimates,
+not GPU peak-memory measurements.
+
+The interface is opt-in. Older Sol/VDN pairings, absent producer keys and
+unsupported projection owners continue through the existing packed-QKV path.
+Sol-H3 PR #41 offers a checked implementation and request telemetry for the
+compatible VDN native forward, while physical Flow partitioned producers retain
+their original Q/K/V ownership. VDN does not cache producer activations or
+modify attention dispatch. CPU equivalence does not demonstrate CUDA bitwise
+identity, VRAM savings, sampler speed or decoded quality. Release acceptance
+requires measured full-workflow A/B comparisons.
+
 ## Physical partitioned attention provider
 
 `PARTITIONED_PROVIDER_API_VERSION = 1` and the bridged forward's
