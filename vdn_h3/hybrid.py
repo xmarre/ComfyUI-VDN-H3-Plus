@@ -20,6 +20,7 @@ from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_atte
 from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.query_positions import native_plan_summary
+from vdn_h3.softmax_provider import QKV_PROJECTION_KEY
 from vdn_h3.policy import RETAINED_SAMPLING_HEADROOM_BYTES
 from vdn_h3 import compiler_guard
 from vdn_h3.runtime import RuntimeBufferOwner
@@ -292,7 +293,20 @@ def make_vdn_forward(attn, state, block_index):
             )
 
         device, dtype = x.device, x.dtype
-        q, k, v = qkv_proj(x).split(inner, dim=-1)
+        projection = transformer_options.get(QKV_PROJECTION_KEY)
+        if projection is None:
+            q, k, v = qkv_proj(x).split(inner, dim=-1)
+        else:
+            if not callable(projection):
+                raise RuntimeError("VDN bounded QKV producer must be callable")
+            q, k, v = projection(qkv_proj, x, heads, head_dim)
+            if (
+                any(not isinstance(t, torch.Tensor) or t.shape != (s, heads, head_dim)
+                    or t.dtype != dtype or t.device != device or not t.is_contiguous()
+                    for t in (q, k, v))
+                or len({t.untyped_storage().data_ptr() for t in (q, k, v)}) != 3
+            ):
+                raise RuntimeError("VDN bounded QKV producer violated the independent BF16 carrier contract")
         v = v.view(s, heads, head_dim)
         q_raw = q.view(s, heads, head_dim)
         k_raw = k.view(s, heads, head_dim)
@@ -360,7 +374,11 @@ def make_vdn_forward(attn, state, block_index):
         else:
             q = q_norm(q_raw)
             k = k_norm(k_raw)
-        v = v.clone()
+        # Native packed QKV shares one backing allocation: clone V to prevent
+        # its lifetime/transformations from keeping that packed storage alive.
+        # The bounded producer returns an independently owned V allocation.
+        if projection is None:
+            v = v.clone()
 
         if window_active:
             backend = state.softmax_backend
@@ -436,6 +454,7 @@ def make_vdn_forward(attn, state, block_index):
             return None
 
     vdn_forward._vdn_forward = True
+    vdn_forward._vdn_bounded_projection_api = 1
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     vdn_forward.vdn_query_position_plan_v1 = query_position_plan
     return vdn_forward

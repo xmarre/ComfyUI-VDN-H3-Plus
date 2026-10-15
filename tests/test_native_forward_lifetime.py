@@ -134,3 +134,69 @@ def test_native_linear_complement_consumes_raw_views_without_activation_scratch(
 
     assert torch.equal(got, expected_q)
     assert events == ["weights", "softmax", "prefetch"]
+
+
+def test_bounded_projection_preserves_native_vdn_softmax_and_linear_outputs(monkeypatch):
+    from vdn_h3.softmax_provider import QKV_PROJECTION_KEY
+
+    torch.manual_seed(2026)
+    attn = _TinyAttention().requires_grad_(False)
+    cfg = {
+        "radius": 0, "chunk": 1, "anchor_frames": "none",
+        "enable_softmax_gate": False, "linear_enabled": True,
+    }
+    state = VDNState("bounded-projection-contract", cfg, [_RawQReadoutBranch()], 1, 2)
+    layout = VDNLayout(0, 4, 4, 1, (1, 1), 0, 0, 4, 0, 1, "none")
+    state.weights_on = lambda *_a, **_kw: {"to_out_linear.weight": torch.eye(2)}
+    state.prefetch_next_weights = lambda *_a, **_kw: None
+    from vdn_h3.retained import window_softmax_grouped_runtime
+    monkeypatch.setattr("vdn_h3.retained.window_softmax_grouped_runtime",
+                        lambda *a, **kw: window_softmax_grouped_runtime(*a, **kw))
+    calls = []
+
+    def projection(linear, x, heads, dim):
+        assert heads == 1 and dim == 2
+        carriers = tuple(torch.empty((len(x), heads, dim), dtype=x.dtype) for _ in range(3))
+        for start in range(0, len(x), 2):
+            stop = min(start + 2, len(x))
+            packed = linear(x[start:stop])
+            for carrier, piece in zip(carriers, packed.split(heads * dim, dim=-1)):
+                carrier[start:stop].copy_(piece.view(stop - start, heads, dim))
+            calls.append((start, stop))
+        return carriers
+
+    x = torch.randn(4, 2)
+    token = state._layout.set(layout)
+    try:
+        with torch.no_grad(), state.runtime.execution():
+            reference = make_vdn_forward(attn, state, 0)(x, transformer_options={})
+            candidate = make_vdn_forward(attn, state, 0)(
+                x, transformer_options={QKV_PROJECTION_KEY: projection})
+    finally:
+        state._layout.reset(token)
+    assert calls == [(0, 2), (2, 4)]
+    torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
+
+
+def test_bounded_projection_rejects_shared_or_malformed_carriers():
+    import pytest
+    from vdn_h3.softmax_provider import QKV_PROJECTION_KEY
+
+    attn = _TinyAttention().requires_grad_(False)
+    cfg = {"radius": 0, "chunk": 1, "anchor_frames": "none",
+           "enable_softmax_gate": False, "linear_enabled": False}
+    state = VDNState("carrier-validation", cfg, [_RawQReadoutBranch()], 1, 2)
+    layout = VDNLayout(0, 4, 4, 1, (1, 1), 0, 0, 4, 0, 1, "none")
+    forward = make_vdn_forward(attn, state, 0)
+    token = state._layout.set(layout)
+    x = torch.randn(4, 2)
+    try:
+        with torch.no_grad(), state.runtime.execution():
+            for malformed in (
+                lambda *_: (x, x, x),
+                lambda *_: tuple(torch.empty(4, 1, 3) for _ in range(3)),
+            ):
+                with pytest.raises(RuntimeError, match="independent BF16 carrier"):
+                    forward(x, transformer_options={QKV_PROJECTION_KEY: malformed})
+    finally:
+        state._layout.reset(token)
