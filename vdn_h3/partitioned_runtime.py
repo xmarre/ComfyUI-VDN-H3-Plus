@@ -571,6 +571,25 @@ def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPl
     )
 
 
+def _contiguous_q_span(query, ranges, expected_rows: int, *, readonly: bool = True):
+    """Return zero-copy Q row interval only for a validated contiguous span.
+
+    The CPU partition plan already owns group membership and ordering.
+    A single contiguous run is equivalent to advanced indexing for Q,
+    but avoids its H×D materialization and indexed output scatter.
+    """
+    if not readonly or not query.is_contiguous() or len(ranges) != 1:
+        return None
+    first, last = ranges[0]
+    if (
+        type(first) is not int or type(last) is not int
+        or first < 0 or last > query.shape[0]
+        or last <= first or last - first != expected_rows
+    ):
+        raise RuntimeError("partitioned VDN contiguous Q range violates CPU geometry")
+    return first, last
+
+
 def _indices_from_ranges(ranges, *, device, resources, identity):
     if resources is None:
         raise RuntimeError("partitioned exact-prefix VDN requires active runtime buffers")
@@ -707,7 +726,21 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             if getattr(sol_request, "PARTITIONED_SINK_MEASURE_API", 0) != 1:
                 raise RuntimeError("target-query sink measure requires Sol partitioned sink-measure API 1")
 
-    q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
+    from .softmax_provider import QKV_PROJECTION_KEY
+    projection = options.get(QKV_PROJECTION_KEY)
+    if projection is None:
+        q, k, v = qkv_proj(x).split(heads * head_dim, dim=-1)
+    else:
+        if not callable(projection):
+            raise RuntimeError("partitioned VDN bounded QKV producer must be callable")
+        q, k, v = projection(qkv_proj, x, heads, head_dim)
+        if (
+            any(not isinstance(t, torch.Tensor) or t.shape != (s, heads, head_dim)
+                or t.dtype != dtype or t.device != device or not t.is_contiguous()
+                for t in (q, k, v))
+            or len({t.untyped_storage().data_ptr() for t in (q, k, v)}) != 3
+        ):
+            raise RuntimeError("partitioned VDN bounded QKV producer violated the independent BF16 carrier contract")
     v = v.view(s, heads, head_dim)
     q_raw = q.view(s, heads, head_dim)
     k_raw = k.view(s, heads, head_dim)
@@ -872,7 +905,11 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     else:
         q = q_norm(q_raw)
         k = k_norm(k_raw)
-    v = v.clone()
+    # Native packed QKV owns V's backing allocation; clone before the
+    # original packed projection leaves scope. Independent carriers supplied
+    # by a checked bounded producer already own V storage.
+    if projection is None:
+        v = v.clone()
 
     # Apply the inherited key/QKV preprocessing once on the complete physical
     # sequence before any VDN gather. This preserves transformations whose
@@ -884,7 +921,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         q, k, v = preprocess(options, q, k, v, heads)
     _record_component(record_component, "vdn_preprocess_host_wall_s", preprocess_started)
 
-    from .softmax_provider import partitioned_attention as partitioned_request_attention
+    from .softmax_provider import execute_grouped_kv, partitioned_attention as partitioned_request_attention
 
     scale = head_dim**-0.5
     raw_token_measure = (
@@ -941,27 +978,34 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
-            q_index = _indices_from_ranges(
-                group.q_ranges,
-                device=device,
-                resources=resources,
-                identity=(*index_identity, "q", group.group_index),
+            from .softmax_provider import PARTITIONED_PROVIDER_KEY
+            partitioned_provider = options.get(PARTITIONED_PROVIDER_KEY)
+            readonly_q = (
+                PARTITIONED_PROVIDER_KEY not in options
+                or bool(getattr(partitioned_provider, "_vdn_readonly_query_contract_v1", False))
             )
+            q_span = _contiguous_q_span(q, group.q_ranges, group.q_rows, readonly=readonly_q)
+            q_index = None
+            if q_span is None:
+                q_index = _indices_from_ranges(
+                    group.q_ranges,
+                    device=device,
+                    resources=resources,
+                    identity=(*index_identity, "q", group.group_index),
+                )
             k_index = _indices_from_ranges(
                 group.key_ranges,
                 device=device,
                 resources=resources,
                 identity=(*index_identity, "k_window", group.group_index),
             )
-            if q_index.numel() != group.q_rows or grouped.video_start + k_index.numel() != group.kv_rows:
+            if (q_index is not None and q_index.numel() != group.q_rows) or grouped.video_start + k_index.numel() != group.kv_rows:
                 raise RuntimeError(
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
-            q_group = q[q_index]
-            torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
-            torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
+            q_group = q[q_span[0]:q_span[1]] if q_span is not None else q[q_index]
             k_group = k_scratch[:group.kv_rows]
             v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
@@ -985,24 +1029,35 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
-            softmax_out[q_index] = partitioned_request_attention(
-                q_group,
-                k_group,
-                v_group,
-                transformer_options=options,
-                block_index=block_index,
-                kind="local",
-                scale=scale,
-                sink_rows=group.sink_rows,
-                prefix_k_range=measure_range,
-                prefix_log_key_measure=measure,
-                semantic_digest=semantic_digest,
-                query_position_map=wire,
-                # Target-prefix hidden rows are always exact. The diagnostic arm
-                # forces only suffix local-query groups dense after the same
-                # grouped Q/K/V gather and measure bias have been fixed.
+            if PARTITIONED_PROVIDER_KEY not in options:
+                from sol_h3.partitioned_request import partitioned_request_attention as partitioned_provider
+            def consume_group(kg, vg, q_local=q_group):
+                return partitioned_request_attention(
+                    q_local, kg, vg,
+                    transformer_options=options,
+                    block_index=block_index,
+                    kind="local",
+                    scale=scale,
+                    sink_rows=group.sink_rows,
+                    prefix_k_range=measure_range,
+                    prefix_log_key_measure=measure,
+                    semantic_digest=semantic_digest,
+                    query_position_map=wire,
+                    # Target-prefix hidden rows are always exact. The diagnostic arm
+                    # forces only suffix local-query groups dense after the same
+                    # grouped Q/K/V gather and measure bias have been fixed.
+                    force_dense=force_dense,
+                )
+            local_result = execute_grouped_kv(
+                partitioned_provider, k, v, k_group, v_group, k_index,
+                grouped.video_start, consume_group, transformer_options=options,
                 force_dense=force_dense,
             )
+            del consume_group
+            if q_span is not None:
+                softmax_out[q_span[0]:q_span[1]] = local_result
+            else:
+                softmax_out[q_index] = local_result
         if uniform_grid and not force_dense:
             _record_partitioned_uniform_native_local(options, q_rows=group.q_rows)
         elif measure_range != group.prefix_k_range:
@@ -1334,6 +1389,11 @@ def _wrap_vdn_forward(current):
 
     setattr(partitioned_aware, _BRIDGE_MARKER, True)
     partitioned_aware._vdn_forward = True
+    # Unlike the native forward (API 1), this wrapper handles both native and
+    # physical partitioned Flow projection using the same owned-carrier ABI.
+    partitioned_aware._vdn_bounded_projection_api = (
+        2 if getattr(current, "_vdn_bounded_projection_api", None) == 1 else None
+    )
     partitioned_aware._vdn_external_sequence_api = VDN_PARTITIONED_SEQUENCE_API
     partitioned_aware._vdn_partitioned_attention_provider_api = 1
     partitioned_aware._vdn_partitioned_linear_diagnostic_api = VDN_PARTITIONED_LINEAR_DIAGNOSTIC_API
