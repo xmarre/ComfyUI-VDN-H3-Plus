@@ -141,7 +141,23 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
     global_idx = torch.tensor(geometry.global_rows, dtype=torch.long, device=device)
     groups = []
     square_aligned = []
+    contiguous_query_spans = []
     for group in geometry.groups:
+        # Grouping by identical window bounds usually yields contiguous
+        # query frames (especially clipped edge windows). Detect this from
+        # immutable CPU geometry so the runtime may alias Q without a gather
+        # allocation or indexed output scatter. Noncontiguous groups preserve
+        # the original gather path and its index order.
+        frames = group.query_frames
+        contiguous = bool(frames) and all(
+            right == left + 1 for left, right in zip(frames, frames[1:])
+        )
+        if contiguous:
+            start = geometry.video_start + frames[0] * geometry.tokens_per_frame
+            stop = geometry.video_start + (frames[-1] + 1) * geometry.tokens_per_frame
+            contiguous_query_spans.append((start, stop))
+        else:
+            contiguous_query_spans.append(None)
         q_parts = []
         for frame in group.query_frames:
             start = geometry.video_start + frame * geometry.tokens_per_frame
@@ -162,6 +178,7 @@ def _build_window_plan(video_start, video_end, num_frames, tokens_per_frame,
         "global_idx": global_idx,
         "groups": groups,
         "square_aligned": square_aligned,
+        "contiguous_query_spans": contiguous_query_spans,
         "anchor_slices": list(geometry.anchor_slices),
         "max_kv_rows": geometry.max_kv_rows,
     }
@@ -228,6 +245,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         v3 = not v4 and has_v3(transformer_options)
         v2 = not v4 and not v3 and has_v2(transformer_options)
         for group_index, (q_idx, win_idx) in enumerate(groups):
+            q_span = plan["contiguous_query_spans"][group_index] if query.is_contiguous() else None
             window_rows = win_idx.numel()
             domain_rows = global_count + window_rows
             torch.index_select(
@@ -236,7 +254,10 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
             torch.index_select(
                 value, 0, win_idx,
                 out=v_scratch[global_count:domain_rows])
-            q_rows = query.index_select(0, q_idx)
+            q_rows = (
+                query[q_span[0]:q_span[1]]
+                if q_span is not None else query.index_select(0, q_idx)
+            )
             contract = {"sink_rows": int(global_count)}
             if v4:
                 query_position_map = None
@@ -252,7 +273,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                     square_q=query.index_select(0, domain_idx),
                     query_positions=query_positions,
                 )
-            out[q_idx] = attend(
+            result = attend(
                 q_rows,
                 k_scratch[:domain_rows],
                 v_scratch[:domain_rows],
@@ -260,6 +281,10 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                 plan["square_aligned"][group_index],
                 **contract,
             )
+            if q_span is not None:
+                out[q_span[0]:q_span[1]] = result
+            else:
+                out[q_idx] = result
 
     for start, stop in plan["anchor_slices"]:
         out[start:stop] = attend(query[start:stop], key, value, "anchor")

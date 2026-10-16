@@ -571,6 +571,25 @@ def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPl
     )
 
 
+def _contiguous_q_span(query: torch.Tensor, ranges, expected_rows: int):
+    """Return zero-copy Q row interval only for a validated contiguous span.
+
+    The CPU partition plan already owns group membership and ordering.
+    A single contiguous run is equivalent to advanced indexing for Q,
+    but avoids its H×D materialization and indexed output scatter.
+    """
+    if not query.is_contiguous() or len(ranges) != 1:
+        return None
+    first, last = ranges[0]
+    if (
+        type(first) is not int or type(last) is not int
+        or first < 0 or last > query.shape[0]
+        or last <= first or last - first != expected_rows
+    ):
+        raise RuntimeError("partitioned VDN contiguous Q range violates CPU geometry")
+    return first, last
+
+
 def _indices_from_ranges(ranges, *, device, resources, identity):
     if resources is None:
         raise RuntimeError("partitioned exact-prefix VDN requires active runtime buffers")
@@ -959,25 +978,28 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
-            q_index = _indices_from_ranges(
-                group.q_ranges,
-                device=device,
-                resources=resources,
-                identity=(*index_identity, "q", group.group_index),
-            )
+            q_span = _contiguous_q_span(q, group.q_ranges, group.q_rows)
+            q_index = None
+            if q_span is None:
+                q_index = _indices_from_ranges(
+                    group.q_ranges,
+                    device=device,
+                    resources=resources,
+                    identity=(*index_identity, "q", group.group_index),
+                )
             k_index = _indices_from_ranges(
                 group.key_ranges,
                 device=device,
                 resources=resources,
                 identity=(*index_identity, "k_window", group.group_index),
             )
-            if q_index.numel() != group.q_rows or grouped.video_start + k_index.numel() != group.kv_rows:
+            if (q_index is not None and q_index.numel() != group.q_rows) or grouped.video_start + k_index.numel() != group.kv_rows:
                 raise RuntimeError(
                     "partitioned VDN runtime gather does not match the CPU geometry plan"
                 )
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
-            q_group = q[q_index]
+            q_group = q[q_span[0]:q_span[1]] if q_span is not None else q[q_index]
             torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
             torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
             k_group = k_scratch[:group.kv_rows]
@@ -1003,7 +1025,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
-            softmax_out[q_index] = partitioned_request_attention(
+            local_result = partitioned_request_attention(
                 q_group,
                 k_group,
                 v_group,
@@ -1021,6 +1043,10 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
                 # grouped Q/K/V gather and measure bias have been fixed.
                 force_dense=force_dense,
             )
+            if q_span is not None:
+                softmax_out[q_span[0]:q_span[1]] = local_result
+            else:
+                softmax_out[q_index] = local_result
         if uniform_grid and not force_dense:
             _record_partitioned_uniform_native_local(options, q_rows=group.q_rows)
         elif measure_range != group.prefix_k_range:

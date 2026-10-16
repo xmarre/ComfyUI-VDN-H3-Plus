@@ -305,3 +305,16 @@ not included in this release set.
 - This maintained fork: https://github.com/xmarre/ComfyUI-VDN-H3-Plus
 
 Repository code is distributed under [Apache-2.0](LICENSE). Third-party model weights and repositories retain their own licenses. See [NOTICE](NOTICE) for attribution details.
+
+### Zero-copy grouped query intervals (draft GPU qualification)
+
+Both native retained grouped VDN attention and Flow physical partitioned VDN
+now use a Q tensor slice instead of `index_select` **only** when CPU-owned
+query geometry describes a single contiguous interval and the input Q tensor
+is contiguous. This avoids an extra Q activation allocation, device gather,
+and indexed output scatter per eligible attention group. Noncontiguous groups,
+noncontiguous Q layouts, all key/value gather orders, query-position maps,
+feature recurrence, and the grouped softmax implementation are unchanged.
+The fast path is checked against the unchanged reference on CPU, and requires
+RTX PRO 6000 measurements (peak allocated and stage latency) before any
+full-stack speed/VRAM claim or release.

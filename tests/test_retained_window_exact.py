@@ -57,3 +57,39 @@ def test_retained_windows_do_not_forward_transformer_options(monkeypatch):
         transformer_options=None,
     )
     assert torch.allclose(got, want, atol=1e-6, rtol=1e-6)
+
+
+def test_grouped_contiguous_query_views_and_noncontiguous_fallback_match_reference():
+    from vdn_h3.query_positions import describe_window_geometry
+
+    torch.manual_seed(419)
+    frames, tokens, heads, dim, start = 6, 4, 2, 8, 3
+    end = start + frames * tokens
+    seq = end + 2
+    # Frames 0,1,3 share bounds: that group is NOT consecutive.
+    # Frames 4,5 form separate contiguous spans.
+    bounds = ((0, 2), (0, 2), (1, 3), (0, 2), (3, 5), (3, 5))
+    plan = retained._build_window_plan(
+        start, end, frames, tokens, bounds, "none", seq, torch.device("cpu"),
+    )
+    geom = describe_window_geometry(start, end, frames, tokens, bounds, "none", seq)
+    assert geom.groups[0].query_frames == (0, 1, 3)
+    assert plan["contiguous_query_spans"][0] is None
+    assert plan["contiguous_query_spans"][-1] == (start + 4*tokens, end)
+    for noncontiguous in (False, True):
+        if noncontiguous:
+            q = torch.randn(seq, heads, dim * 2)[..., ::2]
+            assert not q.is_contiguous()
+        else:
+            q = torch.randn(seq, heads, dim)
+        k = torch.randn(seq, heads, dim)
+        v = torch.randn(seq, heads, dim)
+        got = retained.window_softmax_grouped_runtime(
+            q, k, v, start, end, frames, tokens, bounds, dim ** -0.5,
+            anchor_frames="none",
+        )
+        want = window.window_softmax_grouped(
+            q, k, v, start, end, frames, tokens, bounds, dim ** -0.5,
+            anchor_frames="none",
+        )
+        torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
