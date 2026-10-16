@@ -13,6 +13,7 @@ from vdn_h3.managed import make_managed_branch_patcher
 from vdn_h3.retained import RuntimeLinearBranch
 import vdn_h3.policy as policy
 import vdn_h3.spec as spec
+import vdn_h3.temporal_shift as temporal_kernel
 
 _log = logging.getLogger("comfy.vdn")
 
@@ -96,7 +97,10 @@ def _effective_free_vram(model):
 
 def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
                attention_backend, verbose, apply_turbo_adapter=True,
-               cfg_overrides=None, fast_kernels=False, retain_buffers="auto"):
+               cfg_overrides=None, fast_kernels=False, retain_buffers="auto",
+               fused_temporal="auto"):
+    if fused_temporal not in ("auto", "on", "off"):
+        raise ValueError(f"invalid fused_temporal setting {fused_temporal!r}")
     if lora_mode not in ("merge", "bypass"):
         raise ValueError(f"lora_mode must be merge or bypass, got {lora_mode!r}")
     if branch_weights == "cache_gpu":
@@ -179,6 +183,7 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
     ]
     for branch in branches:
         branch.fuse_epilogue = fast_kernels
+        branch.fused_temporal = fused_temporal
 
     managed_weights = None
     managed_patcher = None
@@ -196,6 +201,14 @@ def _apply_vdn(model, vdn_checkpoint, strength, lora_mode, branch_weights,
         retain_buffers=retain,
     )
     state.softmax_backend = attention_backend
+    env_value = os.environ.get(temporal_kernel.ENV_FUSED_TEMPORAL, "1")
+    env_allows = env_value.strip().lower() not in {"0", "false", "no", "off"}
+    requested = fused_temporal == "on" or (fused_temporal == "auto" and env_allows)
+    _log.info(
+        "[vdn] fused temporal mode=%s env=%r requested=%s triton_available=%s; "
+        "effective CUDA BF16 activation confirmed by first-use canary receipt",
+        fused_temporal, env_value, requested, temporal_kernel.triton is not None,
+    )
 
     new_model = model.clone()
     if managed_patcher is not None:
@@ -292,6 +305,12 @@ class ApplyVDNH3:
                 "default": "grouped",
                 "tooltip": "grouped is the portable exact-window path; flex uses "
                            "PyTorch FlexAttention and falls back to grouped on failure."}),
+        }, "optional": {
+            "fused_temporal": (["auto", "on", "off"], {
+                "default": "auto",
+                "tooltip": "auto (default) enables bitwise-verified Triton BF16 temporal short-conv "
+                           "unless VDN_H3_FUSED_TEMPORAL=0; on overrides that environment opt-out; "
+                           "off uses eager PyTorch. Ineligible inputs always use eager."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -302,12 +321,14 @@ class ApplyVDNH3:
         "native MiniMax-H3 MODEL using checkpoint-bound architecture settings.")
 
     def apply(self, model, vdn_checkpoint, apply_turbo_adapter, strength, lora_mode,
-              branch_weights, retain_buffers, attention_backend, verbose):
+              branch_weights, retain_buffers, attention_backend, verbose,
+              fused_temporal="auto"):
         return _apply_vdn(
             model, vdn_checkpoint, strength, lora_mode, branch_weights,
             attention_backend, verbose,
             apply_turbo_adapter=apply_turbo_adapter,
-            retain_buffers=retain_buffers)
+            retain_buffers=retain_buffers,
+            fused_temporal=fused_temporal)
 
 
 class ApplyVDNH3Advanced:
@@ -357,6 +378,11 @@ class ApplyVDNH3Advanced:
                 "default": False,
                 "tooltip": "Compile selected mathematically equivalent branch helpers; "
                            "first run includes compile cost and eager remains fallback."}),
+            "fused_temporal": (["auto", "on", "off"], {
+                "default": "auto",
+                "tooltip": "auto (default) enables bitwise-verified Triton BF16 temporal short-conv "
+                           "unless VDN_H3_FUSED_TEMPORAL=0; on overrides that environment opt-out; "
+                           "off uses eager PyTorch. Separate from fast_kernels."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -370,7 +396,7 @@ class ApplyVDNH3Advanced:
               turbo_strength, lora_mode, branch_weights, retain_buffers,
               attention_backend, verbose, architecture_mode="checkpoint",
               window_radius=1, window_chunk=5, anchor_frames="both", text_state=True,
-              linear_branch=True, fast_kernels=False):
+              linear_branch=True, fast_kernels=False, fused_temporal="auto"):
         if architecture_mode not in ("checkpoint", "override"):
             raise ValueError(f"invalid architecture_mode {architecture_mode!r}")
         overrides = None
@@ -389,7 +415,8 @@ class ApplyVDNH3Advanced:
             apply_turbo_adapter=apply_turbo_adapter,
             cfg_overrides=overrides,
             fast_kernels=fast_kernels,
-            retain_buffers=retain_buffers)
+            retain_buffers=retain_buffers,
+            fused_temporal=fused_temporal)
 
 
 NODE_CLASS_MAPPINGS = {
