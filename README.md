@@ -305,3 +305,28 @@ not included in this release set.
 - This maintained fork: https://github.com/xmarre/ComfyUI-VDN-H3-Plus
 
 Repository code is distributed under [Apache-2.0](LICENSE). Third-party model weights and repositories retain their own licenses. See [NOTICE](NOTICE) for attribution details.
+
+
+### Opt-in CUDA component timing (performance diagnostics)
+
+For a repeatable 2-chunk MiniMax-H3 Continuum/Flow comparison, set
+`VDN_H3_PERF_PROFILE=1` in the ComfyUI launch environment and restart.
+This **does not change attention, QKV chunking, quantization, VDN weights,
+generation settings or the model's output**. It is **disabled by default**.
+The profiler records CUDA events at actual VDN QKV projection, learned linear
+readout, Q/K norm + RoPE, grouped softmax/Sol attention, and final output
+projection boundaries. The last interval includes the existing VDN finalization.
+Each sample prints `[vdn] CUDA component audit` with the call count and
+aggregated milliseconds for these phases (and the current Flow stage where
+available). The cumulative stream durations are not interchangeable with the
+end-to-end sampler wall clock, particularly when work overlaps on multiple
+streams. A single CUDA synchronization occurs **after** the sampling scope,
+never at every block, and CUDA events retain no QKV tensors. Turn off the
+environment variable for final timing/quality qualification.
+
+Compare the same hot, fixed-seed run with Sol `qkv_chunk_size=0` and
+`4096` before changing the default. Record the Sol
+`streamed_vdn_projection_calls` counters alongside the VDN phase totals;
+the bounded projection's VRAM benefit does not itself prove a speedup.
+The component breakdown distinguishes projection launch/copy overhead from
+VDN readout, Q/K preparation and grouped attention kernel/gather cost.
