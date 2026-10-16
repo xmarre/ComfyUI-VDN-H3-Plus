@@ -64,7 +64,7 @@ def test_progressive_release_is_order_independent(monkeypatch, stage_marker, sta
     wrapped = make_outer_release_wrapper(state)
     assert wrapped(_Executor(_options(stage_marker, stage))) == "ok"
     assert state.runtime.releases == expected
-    assert len(trims) == expected
+    assert len(trims) == (0 if stage == "probe" else expected)
 
 
 def test_probe_release_allows_fresh_high_stage_pool(monkeypatch):
@@ -77,10 +77,10 @@ def test_probe_release_allows_fresh_high_stage_pool(monkeypatch):
     wrapped = make_outer_release_wrapper(state)
     assert wrapped(_Executor(_options(True, "probe"))) == "ok"
     assert state.runtime.releases == 1
-    assert trims == [True]
+    assert trims == []  # Intermediate transition reuses the allocator cache.
     assert wrapped(_Executor(_options(True, "high"))) == "ok"
     assert state.runtime.releases == 2
-    assert trims == [True, True]
+    assert trims == [True]  # Terminal VAE boundary still trims.
 
 
 def test_failed_progressive_substage_releases_immediately(monkeypatch):

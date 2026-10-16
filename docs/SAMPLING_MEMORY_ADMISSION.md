@@ -27,6 +27,17 @@ shared with that policy. It is added to Core's geometry-dependent estimate;
 it is not a strict peak-memory bound. Weight loading has already completed, so
 resident model bytes are not added again to the free-memory target.
 
+If memory is short, VDN first attempts to release **its own idle retained
+scan/window/activation buffers** and rechecks Core's free/reclaimable-memory
+estimate, which already includes reusable CUDA allocator blocks. It does not
+globally synchronize and empty the cache when this release meets the target.
+If the target remains unmet, VDN retains the existing allocator trim and
+finite Core model-eviction fallback. A currently leased buffer pool is never
+cleared or waited on by memory admission. This check runs
+after Core's preparation and before the new sampler's model evaluation. It
+avoids evicting reusable text encoders and VAEs merely to preserve scratch
+left over from a completed VDN stage.
+
 If available memory meets that target, VDN does not call `free_memory`.
 This matters because Core's disable-smart-memory option can ignore finite
 targets and unload all eligible models. Under pressure, VDN delegates the finite
@@ -49,7 +60,7 @@ buffers use the original delegate path.
 
 ## Receipts
 
-At custom-node import, `sampling admission source policy=bounded_headroom_v2`
+At custom-node import, `sampling admission source policy=bounded_headroom_v3`
 reports the loaded `vdn_h3.hybrid` module path and the importing package path.
 These are loaded-module paths, not a Git revision or a hash of files on disk.
 If another package imported an older `vdn_h3` first, `policy=unversioned` and
@@ -61,9 +72,10 @@ the installation and sampling receipts provide that separate evidence.
 
 The `sampling preparation` receipt reports `prepare_elapsed_ms` and `success`
 for delegated Core/wrapper preparation. Successful retained CUDA preparation
-then emits `sampling admission policy=bounded_headroom_v2`, including the stage,
+then emits `sampling admission policy=bounded_headroom_v3`, including the stage,
 requested and available MiB, whether eviction was requested, protected counts,
-full-unload names/count, `eviction_passes`, `target_met` and `eviction_elapsed_ms`.
+full-unload names/count, `eviction_passes`, `target_met`, `scratch_reclaim`,
+`reclaim_elapsed_ms` and `eviction_elapsed_ms`.
 
 The two host wall-time intervals do not overlap and add no explicit CUDA
 synchronization. They exclude earlier text encoding and later model evaluation.
@@ -79,8 +91,9 @@ Structural tests cover sufficient headroom, finite pressure, actual Core partial
 eviction, bounded shortfall reconciliation and cleanup on an unmet target,
 changed patch UUIDs, required additional/backing models, device/dead
 reference exclusion, original argument/result identity and failure propagation.
-Runtime timings and output comparison are required to qualify a speed or
-generated-quality change.
+Tests cover idle-pool reclaim before model eviction and safe fallback when the
+pool is actively leased. Runtime timings and output comparison are still
+required to qualify a speed or generated-quality change.
 
 ## Adapter activation workspace
 
@@ -109,4 +122,4 @@ The startup source receipt can be checked before queuing a generation. If it is
 missing or unversioned, or points at another package, keep the Patcher Update
 operation log and startup log for source diagnosis. A full sampling run is not
 needed merely to establish import provenance. Successful retained CUDA sampling
-must still publish `sampling admission policy=bounded_headroom_v2`.
+must still publish `sampling admission policy=bounded_headroom_v3`.
