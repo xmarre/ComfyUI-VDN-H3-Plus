@@ -59,7 +59,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision torchaudio
           python -m pip install -r _deps/ComfyUI/requirements.txt
-          python -m pip install pytest pytest-timeout ruff safetensors
+          python -m pip install pytest pytest-timeout ruff safetensors triton
       - name: Static checks and compile Python sources
         run: |
           python -m ruff check --select E9,F,B006 --ignore F401,F841 vdn_h3 tests tools
