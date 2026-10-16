@@ -1,3 +1,5 @@
+import pytest
+import torch
 from vdn_h3.partitioned_grouped import build_partitioned_grouped_plan
 from vdn_h3.partitioned_sequence import PartitionedSequence
 from vdn_h3.query_positions import WIRE_SCHEMA, WIRE_TAG
@@ -157,3 +159,23 @@ def test_chunk_aligned_boundary_splits_one_native_window_into_prefix_and_suffix_
     assert prefix_sibling.query_prefix_domain is True
     assert boundary_suffix.query_prefix_domain is False
     assert prefix_sibling.key_frames == boundary_suffix.key_frames
+
+
+def test_partitioned_q_span_view_matches_index_gather_and_rejects_malformed():
+    from vdn_h3.partitioned_runtime import _contiguous_q_span
+
+    q = torch.arange(14 * 2 * 4, dtype=torch.float32).reshape(14, 2, 4)
+    span = _contiguous_q_span(q, ((3, 12),), 9)
+    assert span == (3, 12)
+    gathered = q[torch.arange(3, 12)]
+    assert torch.equal(q[span[0]:span[1]], gathered)
+    assert q[span[0]:span[1]].untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
+
+    # Disjoint rows and transformed non-contiguous Q deliberately use the
+    # original indexed gather / scatter path.
+    assert _contiguous_q_span(q, ((1, 3), (7, 9)), 4) is None
+    assert _contiguous_q_span(q, ((3, 12),), 9, readonly=False) is None
+    assert _contiguous_q_span(q.transpose(0, 1), ((0, 1),), 1) is None
+    for ranges, rows in ((((-1, 3),), 4), (((3, 15),), 12), (((3, 12),), 8), (((5, 5),), 0)):
+        with pytest.raises(RuntimeError, match="contiguous Q range"):
+            _contiguous_q_span(q, ranges, rows)
