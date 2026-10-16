@@ -305,3 +305,17 @@ not included in this release set.
 - This maintained fork: https://github.com/xmarre/ComfyUI-VDN-H3-Plus
 
 Repository code is distributed under [Apache-2.0](LICENSE). Third-party model weights and repositories retain their own licenses. See [NOTICE](NOTICE) for attribution details.
+
+### Internal Flow probe-to-high CUDA allocator reuse (draft)
+
+VDN now releases **live** VDN-owned scratch at the probe→high boundary without
+calling Core's globally synchronizing `soft_empty_cache()` in the middle of
+a single progressive GPU generation. Cached inactive PyTorch allocations count
+as free in Core's memory accounting and can be reused by the target-grid high
+stage. The existing scratch-reclaim-first post-preparation admission policy
+(`bounded_headroom_v3`) remains unchanged: it still reclaims VDN-owned
+inactive scratch, trims when under genuine admission pressure, reconciles the
+real free-memory deficit and fails closed rather than silently risking OOM.
+Completion before VAE, outer completion, and error unwinding **still trim**.
+This preserves live memory lifetime and numerical semantics. Runtime speed and
+peak VRAM must still be established by matched RTX PRO 6000 A/B runs.
