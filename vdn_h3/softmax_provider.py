@@ -29,6 +29,8 @@ KEY_V2 = "vdn_softmax_provider_v2"
 KEY_V3 = "vdn_softmax_provider_v3"
 KEY_V4 = "vdn_softmax_provider_v4"
 PREPROCESS_KEY = "vdn_attention_preprocess_v1"
+# Internal full-sequence projection ownership; this does not replace softmax providers.
+QKV_PROJECTION_KEY = "sol_h3_vdn_qkv_projection_v1"
 
 
 def partitioned_attention(q, k, v, **kwargs):

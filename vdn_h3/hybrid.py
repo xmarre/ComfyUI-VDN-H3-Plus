@@ -20,8 +20,10 @@ from comfy.ldm.modules.attention import AttentionTensorContainer, optimized_atte
 from comfy.patcher_extension import WrappersMP
 
 from vdn_h3.query_positions import native_plan_summary
+from vdn_h3.softmax_provider import QKV_PROJECTION_KEY
 from vdn_h3.policy import RETAINED_SAMPLING_HEADROOM_BYTES
 from vdn_h3 import compiler_guard
+from vdn_h3 import perf as _perf
 from vdn_h3.runtime import RuntimeBufferOwner
 from vdn_h3.spec import resolve_branch_weights
 from vdn_h3.window import VDNLayout, full_coverage, window_bounds
@@ -292,10 +294,29 @@ def make_vdn_forward(attn, state, block_index):
             )
 
         device, dtype = x.device, x.dtype
-        q, k, v = qkv_proj(x).split(inner, dim=-1)
+        audit = _perf.forward(transformer_options.get(FLOW_STAGE_KEY), block_index, device)
+        if audit is not None:
+            audit.mark("qkv_projection")
+        projection = transformer_options.get(QKV_PROJECTION_KEY)
+        if projection is None:
+            q, k, v = qkv_proj(x).split(inner, dim=-1)
+        else:
+            if not callable(projection):
+                raise RuntimeError("VDN bounded QKV producer must be callable")
+            q, k, v = projection(qkv_proj, x, heads, head_dim)
+            if (
+                any(not isinstance(t, torch.Tensor) or t.shape != (s, heads, head_dim)
+                    or t.dtype != dtype or t.device != device or not t.is_contiguous()
+                    for t in (q, k, v))
+                or len({t.untyped_storage().data_ptr() for t in (q, k, v)}) != 3
+            ):
+                raise RuntimeError("VDN bounded QKV producer violated the independent BF16 carrier contract")
         v = v.view(s, heads, head_dim)
         q_raw = q.view(s, heads, head_dim)
         k_raw = k.view(s, heads, head_dim)
+
+        if audit is not None:
+            audit.mark("linear_readout")
 
         window_active = not layout.full_cover and not external_reduced
         linear_active = window_active and cfg.get("linear_enabled", True)
@@ -348,6 +369,9 @@ def make_vdn_forward(attn, state, block_index):
                 ))
             del readout, weights, text_x, text_k_raw, text_v_raw
 
+        if audit is not None:
+            audit.mark("qk_norm_rope")
+
         if rope_freqs is not None:
             q4 = q.view(1, s, heads, head_dim)
             k4 = k.view(1, s, heads, head_dim)
@@ -360,7 +384,14 @@ def make_vdn_forward(attn, state, block_index):
         else:
             q = q_norm(q_raw)
             k = k_norm(k_raw)
-        v = v.clone()
+        # Native packed QKV shares one backing allocation: clone V to prevent
+        # its lifetime/transformations from keeping that packed storage alive.
+        # The bounded producer returns an independently owned V allocation.
+        if projection is None:
+            v = v.clone()
+
+        if audit is not None:
+            audit.mark("grouped_softmax")
 
         if window_active:
             backend = state.softmax_backend
@@ -392,6 +423,9 @@ def make_vdn_forward(attn, state, block_index):
                 qc, kc, vc, heads, mask=None, skip_reshape=True,
                 transformer_options=transformer_options).squeeze(0).reshape(s, heads, head_dim)
 
+        if audit is not None:
+            audit.mark("output_projection")
+
         del q, k, v, q_raw, k_raw
 
         if linear_active:
@@ -420,6 +454,8 @@ def make_vdn_forward(attn, state, block_index):
         if linear_projection is not None:
             out[layout.video_start:layout.video_end] += linear_projection
         state.finish_attention_factorizations()
+        if audit is not None:
+            audit.mark()
         return out
 
     def query_position_plan(options, layout):
@@ -436,6 +472,7 @@ def make_vdn_forward(attn, state, block_index):
             return None
 
     vdn_forward._vdn_forward = True
+    vdn_forward._vdn_bounded_projection_api = 1
     vdn_forward._vdn_external_sequence_api = VDN_EXTERNAL_SEQUENCE_API_VERSION
     vdn_forward.vdn_query_position_plan_v1 = query_position_plan
     return vdn_forward
@@ -625,6 +662,7 @@ def make_outer_release_wrapper(state):
     """
 
     def wrap(executor, *args, **kwargs):
+        entered = _perf.enter()
         guider = getattr(executor, "class_obj", None)
         model_options = getattr(guider, "model_options", None)
         progressive = (
@@ -644,42 +682,45 @@ def make_outer_release_wrapper(state):
             error = exc
             raise
         finally:
-            release = bool(
-                state.retain_buffers
-                and progressive
-                and (
-                    error is not None
-                    or stage is None
-                    or stage in ("probe", "high")
+            try:
+                release = bool(
+                    state.retain_buffers
+                    and progressive
+                    and (
+                        error is not None
+                        or stage is None
+                        or stage in ("probe", "high")
+                    )
                 )
-            )
-            if release:
-                if error is not None:
-                    reason = "error"
-                elif stage == "probe":
-                    reason = "probe_to_high"
-                elif stage == "high":
-                    reason = "terminal_high"
-                else:
-                    reason = "outer_complete"
-                before_allocator = _cuda_allocator_snapshot()
-                retained = state.runtime.release_retained()
-                # Dropping references alone leaves cudaMallocAsync's reserved pool high.
-                # At this quiescent OUTER_SAMPLE boundary Comfy's own cache trim is safe
-                # and returns unused blocks before VAE decode.
-                comfy.model_management.soft_empty_cache()
-                after_allocator = _cuda_allocator_snapshot()
-                _log.info(
-                    "[vdn] progressive runtime release stage=%s reason=%s error=%s "
-                    "retained=%s allocator_before=%s allocator_after=%s",
-                    stage,
-                    reason,
-                    type(error).__name__ if error is not None else None,
-                    retained,
-                    before_allocator,
-                    after_allocator,
-                )
+                if release:
+                    if error is not None:
+                        reason = "error"
+                    elif stage == "probe":
+                        reason = "probe_to_high"
+                    elif stage == "high":
+                        reason = "terminal_high"
+                    else:
+                        reason = "outer_complete"
+                    before_allocator = _cuda_allocator_snapshot()
+                    retained = state.runtime.release_retained()
+                    # Dropping references alone leaves cudaMallocAsync's reserved pool high.
+                    # At this quiescent OUTER_SAMPLE boundary Comfy's own cache trim is safe
+                    # and returns unused blocks before VAE decode.
+                    comfy.model_management.soft_empty_cache()
+                    after_allocator = _cuda_allocator_snapshot()
+                    _log.info(
+                        "[vdn] progressive runtime release stage=%s reason=%s error=%s "
+                        "retained=%s allocator_before=%s allocator_after=%s",
+                        stage,
+                        reason,
+                        type(error).__name__ if error is not None else None,
+                        retained,
+                        before_allocator,
+                        after_allocator,
+                    )
 
+            finally:
+                _perf.exit_scope(entered)
     return wrap
 
 def apply_vdn(new_model, state):
