@@ -176,6 +176,6 @@ def test_partitioned_q_span_view_matches_index_gather_and_rejects_malformed():
     assert _contiguous_q_span(q, ((1, 3), (7, 9)), 4) is None
     assert _contiguous_q_span(q, ((3, 12),), 9, readonly=False) is None
     assert _contiguous_q_span(q.transpose(0, 1), ((0, 1),), 1) is None
-    for ranges, rows in (((-1, 3), 4), ((3, 15), 12), ((3, 12), 8), ((5, 5), 0)):
+    for ranges, rows in ((((-1, 3),), 4), (((3, 15),), 12), (((3, 12),), 8), (((5, 5),), 0)):
         with pytest.raises(RuntimeError, match="contiguous Q range"):
             _contiguous_q_span(q, ranges, rows)

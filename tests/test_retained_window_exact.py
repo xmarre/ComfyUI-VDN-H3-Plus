@@ -68,7 +68,7 @@ def test_grouped_contiguous_query_views_and_noncontiguous_fallback_match_referen
     seq = end + 2
     # Frames 0,1,3 share bounds: that group is NOT consecutive.
     # Frames 4,5 form separate contiguous spans.
-    bounds = ((0, 2), (0, 2), (1, 3), (0, 2), (3, 5), (3, 5))
+    bounds = ((0, 3), (0, 3), (1, 4), (0, 3), (3, 5), (3, 5))
     plan = retained._build_window_plan(
         start, end, frames, tokens, bounds, "none", seq, torch.device("cpu"),
     )
@@ -105,7 +105,7 @@ def test_untrusted_v4_provider_receives_isolated_query_copy():
     original = q.clone()
     k = torch.randn_like(q)
     v = torch.randn_like(q)
-    bounds = ((0, 2), (0, 2), (1, 3), (0, 2), (3, 5), (3, 5))
+    bounds = ((0, 3), (0, 3), (1, 4), (0, 3), (3, 5), (3, 5))
     mutated_groups = []
 
     def mutating_provider(native, local_q, local_k, local_v, **kwargs):
