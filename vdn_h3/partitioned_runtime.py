@@ -571,14 +571,14 @@ def _grouped_plan(plan, layout, *, semantic_digest: str) -> PartitionedGroupedPl
     )
 
 
-def _contiguous_q_span(query: torch.Tensor, ranges, expected_rows: int):
+def _contiguous_q_span(query, ranges, expected_rows: int, *, readonly: bool = True):
     """Return zero-copy Q row interval only for a validated contiguous span.
 
     The CPU partition plan already owns group membership and ordering.
     A single contiguous run is equivalent to advanced indexing for Q,
     but avoids its H×D materialization and indexed output scatter.
     """
-    if not query.is_contiguous() or len(ranges) != 1:
+    if not readonly or not query.is_contiguous() or len(ranges) != 1:
         return None
     first, last = ranges[0]
     if (
@@ -978,7 +978,13 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
     for group in grouped.groups:
         gather_started = time.perf_counter()
         with cuda_span("vdn_gather"):
-            q_span = _contiguous_q_span(q, group.q_ranges, group.q_rows)
+            from .softmax_provider import PARTITIONED_PROVIDER_KEY
+            partitioned_provider = options.get(PARTITIONED_PROVIDER_KEY)
+            readonly_q = (
+                PARTITIONED_PROVIDER_KEY not in options
+                or bool(getattr(partitioned_provider, "_vdn_readonly_query_contract_v1", False))
+            )
+            q_span = _contiguous_q_span(q, group.q_ranges, group.q_rows, readonly=readonly_q)
             q_index = None
             if q_span is None:
                 q_index = _indices_from_ranges(

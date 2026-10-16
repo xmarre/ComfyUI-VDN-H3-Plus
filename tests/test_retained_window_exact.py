@@ -93,3 +93,33 @@ def test_grouped_contiguous_query_views_and_noncontiguous_fallback_match_referen
             anchor_frames="none",
         )
         torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
+
+
+def test_untrusted_v4_provider_receives_isolated_query_copy():
+    from vdn_h3.softmax_provider import KEY_V4
+
+    frames, tokens, heads, dim, start = 6, 4, 2, 8, 3
+    end = start + frames * tokens
+    seq = end + 2
+    q = torch.randn(seq, heads, dim)
+    original = q.clone()
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    bounds = ((0, 2), (0, 2), (1, 3), (0, 2), (3, 5), (3, 5))
+    mutated_groups = []
+
+    def mutating_provider(native, local_q, local_k, local_v, **kwargs):
+        del local_k, local_v
+        if kwargs["kind"] == "local":
+            mutated_groups.append(local_q.shape[0])
+            local_q.add_(0.25)
+        return native()
+
+    retained.window_softmax_grouped_runtime(
+        q, k, v, start, end, frames, tokens, bounds, dim**-0.5,
+        transformer_options={KEY_V4: mutating_provider},
+    )
+    assert mutated_groups
+    # Untrusted providers still get independent indexed Q arrays and cannot
+    # corrupt the full Q buffer used by neighboring groups or future calls.
+    assert torch.equal(q, original)

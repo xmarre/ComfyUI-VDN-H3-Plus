@@ -230,6 +230,17 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         out[global_idx] = attend(query[global_idx], key, value, "global")
 
     groups = plan["groups"]
+    from .softmax_provider import KEY as V1, KEY_V2 as V2, KEY_V3 as V3, KEY_V4 as V4
+    opts = transformer_options or {}
+    v4 = opts.get(V4)
+    # A custom provider may mutate its Q argument. The old advanced-index
+    # gather isolates that mutation from the underlying full-sequence Q.
+    # Only the built-in native SDPA or a provider explicitly guaranteeing
+    # read-only Q may receive zero-copy query views.
+    readonly_q = (
+        not any(key in opts for key in (V1, V2, V3, V4))
+        or (callable(v4) and getattr(v4, "_vdn_readonly_query_contract_v1", False) is True)
+    )
     if groups:
         if resources is None:
             shape = (plan["max_kv_rows"], heads, head_dim)
@@ -245,7 +256,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
         v3 = not v4 and has_v3(transformer_options)
         v2 = not v4 and not v3 and has_v2(transformer_options)
         for group_index, (q_idx, win_idx) in enumerate(groups):
-            q_span = plan["contiguous_query_spans"][group_index] if query.is_contiguous() else None
+            q_span = plan["contiguous_query_spans"][group_index] if readonly_q and query.is_contiguous() else None
             window_rows = win_idx.numel()
             domain_rows = global_count + window_rows
             torch.index_select(
