@@ -122,3 +122,21 @@ def dispatch(options, native, q, k, v, *, kind, scale, square_aligned=False,
     if result.shape != q.shape or result.dtype != q.dtype or result.device != q.device:
         raise RuntimeError("VDN softmax provider returned incompatible shape/dtype/device")
     return result
+
+
+def execute_grouped_kv(provider, key, value, k_out, v_out, window_index, sink_rows,
+                       consumer, *, transformer_options=None, force_dense=False):
+    """Synchronous optional gather+prepare capability, scoped to one consumer.
+
+    Providers without this additive capability retain the original two gathers.
+    The callback must consume scratch before returning and must not retain it.
+    Errors propagate; partially written scratch is never retried as native.
+    """
+    execute = getattr(provider, "grouped_kv_v1", None)
+    if callable(execute):
+        return execute(key, value, k_out, v_out, window_index, sink_rows, consumer,
+                       transformer_options=transformer_options, force_dense=force_dense)
+    import torch
+    torch.index_select(key, 0, window_index, out=k_out[sink_rows:])
+    torch.index_select(value, 0, window_index, out=v_out[sink_rows:])
+    return consumer(k_out, v_out)

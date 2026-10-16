@@ -921,7 +921,7 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
         q, k, v = preprocess(options, q, k, v, heads)
     _record_component(record_component, "vdn_preprocess_host_wall_s", preprocess_started)
 
-    from .softmax_provider import partitioned_attention as partitioned_request_attention
+    from .softmax_provider import execute_grouped_kv, partitioned_attention as partitioned_request_attention
 
     scale = head_dim**-0.5
     raw_token_measure = (
@@ -1006,8 +1006,6 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             wire = group.wire(owner_generation=owner, plan_digest=grouped.plan_digest)
             measure = prefix_log_key_measure if group.prefix_k_range is not None else 0.0
             q_group = q[q_span[0]:q_span[1]] if q_span is not None else q[q_index]
-            torch.index_select(k, 0, k_index, out=k_scratch[grouped.video_start:group.kv_rows])
-            torch.index_select(v, 0, k_index, out=v_scratch[grouped.video_start:group.kv_rows])
             k_group = k_scratch[:group.kv_rows]
             v_group = v_scratch[:group.kv_rows]
         _record_component(record_component, "vdn_gather_host_wall_s", gather_started)
@@ -1031,22 +1029,28 @@ def _partitioned_vdn_forward(current, values, x, rope_freqs, transformer_options
             )
         softmax_started = time.perf_counter()
         with cuda_span("vdn_softmax"):
-            local_result = partitioned_request_attention(
-                q_group,
-                k_group,
-                v_group,
-                transformer_options=options,
-                block_index=block_index,
-                kind="local",
-                scale=scale,
-                sink_rows=group.sink_rows,
-                prefix_k_range=measure_range,
-                prefix_log_key_measure=measure,
-                semantic_digest=semantic_digest,
-                query_position_map=wire,
-                # Target-prefix hidden rows are always exact. The diagnostic arm
-                # forces only suffix local-query groups dense after the same
-                # grouped Q/K/V gather and measure bias have been fixed.
+            if PARTITIONED_PROVIDER_KEY not in options:
+                from sol_h3.partitioned_request import partitioned_request_attention as partitioned_provider
+            def consume_group(kg, vg):
+                return partitioned_request_attention(
+                    q_group, kg, vg,
+                    transformer_options=options,
+                    block_index=block_index,
+                    kind="local",
+                    scale=scale,
+                    sink_rows=group.sink_rows,
+                    prefix_k_range=measure_range,
+                    prefix_log_key_measure=measure,
+                    semantic_digest=semantic_digest,
+                    query_position_map=wire,
+                    # Target-prefix hidden rows are always exact. The diagnostic arm
+                    # forces only suffix local-query groups dense after the same
+                    # grouped Q/K/V gather and measure bias have been fixed.
+                    force_dense=force_dense,
+                )
+            local_result = execute_grouped_kv(
+                partitioned_provider, k, v, k_group, v_group, k_index,
+                grouped.video_start, consume_group, transformer_options=options,
                 force_dense=force_dense,
             )
             if q_span is not None:

@@ -675,8 +675,9 @@ def _batched_output_readout(
     """Batch the per-frame linear readout and epilogue by equal-grid domain."""
     heads = int(query.shape[1])
     head_dim = int(query.shape[2])
-    outputs = []
-    for start_frame, stop_frame, grid in _contiguous_grid_runs(frame_sizes):
+    runs = tuple(_contiguous_grid_runs(frame_sizes))
+    output = None
+    for start_frame, stop_frame, grid in runs:
         grid_h, grid_w = grid
         rows = grid_h * grid_w
         frames = stop_frame - start_frame
@@ -694,16 +695,19 @@ def _batched_output_readout(
             query_run,
             linear_state[start_frame:stop_frame].transpose(-1, -2),
         )
-        outputs.append(
-            B.linear_epilogue(
-                readout,
-                norm_weight,
-                gate[row_start:row_stop],
-                eps,
-                fuse=fuse,
-            )
+        result = B.linear_epilogue(
+            readout, norm_weight, gate[row_start:row_stop], eps, fuse=fuse,
         )
-    return torch.cat(outputs, dim=0)
+        del readout
+        if len(runs) == 1:
+            return result
+        if output is None:
+            output = result.new_empty((query.shape[0], heads * head_dim))
+        output[row_start:row_stop].copy_(result)
+        del result
+    if output is None:
+        raise RuntimeError("partitioned VDN output requires at least one frame")
+    return output
 
 
 def _core_readout(

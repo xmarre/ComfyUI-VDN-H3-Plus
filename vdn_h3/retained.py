@@ -195,7 +195,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     lazy square-Q compatibility ABI. A present but malformed v4 suppresses v2/v3
     routing and is handled by v4 dispatch as native for that call.
     """
-    from .softmax_provider import dispatch, has_v2, has_v3, has_v4, preprocess
+    from .softmax_provider import dispatch, execute_grouped_kv, has_v2, has_v3, has_v4, preprocess
 
     query, key, value = preprocess(
         transformer_options, query, key, value, query.shape[1])
@@ -259,12 +259,6 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
             q_span = plan["contiguous_query_spans"][group_index] if readonly_q and query.is_contiguous() else None
             window_rows = win_idx.numel()
             domain_rows = global_count + window_rows
-            torch.index_select(
-                key, 0, win_idx,
-                out=k_scratch[global_count:domain_rows])
-            torch.index_select(
-                value, 0, win_idx,
-                out=v_scratch[global_count:domain_rows])
             q_rows = (
                 query[q_span[0]:q_span[1]]
                 if q_span is not None else query.index_select(0, q_idx)
@@ -284,13 +278,13 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
                     square_q=query.index_select(0, domain_idx),
                     query_positions=query_positions,
                 )
-            result = attend(
-                q_rows,
-                k_scratch[:domain_rows],
-                v_scratch[:domain_rows],
-                "local",
-                plan["square_aligned"][group_index],
-                **contract,
+            result = execute_grouped_kv(
+                opts.get(V4) if v4 else None,
+                key, value, k_scratch[:domain_rows], v_scratch[:domain_rows],
+                win_idx, global_count,
+                lambda kg, vg: attend(q_rows, kg, vg, "local",
+                                      plan["square_aligned"][group_index], **contract),
+                transformer_options=transformer_options,
             )
             if q_span is not None:
                 out[q_span[0]:q_span[1]] = result
