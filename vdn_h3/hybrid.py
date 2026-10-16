@@ -681,18 +681,27 @@ def make_outer_release_wrapper(state):
                     reason = "outer_complete"
                 before_allocator = _cuda_allocator_snapshot()
                 retained = state.runtime.release_retained()
-                # Dropping references alone leaves cudaMallocAsync's reserved pool high.
-                # At this quiescent OUTER_SAMPLE boundary Comfy's own cache trim is safe
-                # and returns unused blocks before VAE decode.
-                comfy.model_management.soft_empty_cache()
+                # Probe -> high is an internal GPU-to-GPU handoff. Release
+                # VDN's live scratch, but leave already allocated-and-freed
+                # PyTorch CUDA cache blocks reusable for the immediately
+                # following target-grid stage. Comfy's get_free_memory()
+                # includes cached reusable bytes; a global soft_empty_cache()
+                # here synchronizes every CUDA stream and reintroduces
+                # allocator churn without increasing the next stage's usable
+                # VRAM. Terminal/outer/error completion still trims before VAE
+                # decode or cleanup.
+                cache_trimmed = reason != "probe_to_high"
+                if cache_trimmed:
+                    comfy.model_management.soft_empty_cache()
                 after_allocator = _cuda_allocator_snapshot()
                 _log.info(
                     "[vdn] progressive runtime release stage=%s reason=%s error=%s "
-                    "retained=%s allocator_before=%s allocator_after=%s",
+                    "retained=%s cache_trimmed=%s allocator_before=%s allocator_after=%s",
                     stage,
                     reason,
                     type(error).__name__ if error is not None else None,
                     retained,
+                    cache_trimmed,
                     before_allocator,
                     after_allocator,
                 )
