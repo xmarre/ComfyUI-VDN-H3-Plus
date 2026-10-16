@@ -548,3 +548,18 @@ class RuntimeBufferOwner:
             before = self._primary.retained_counts()
             self._primary.clear(wait_prefetch=True)
         return before
+
+    def try_release_retained(self):
+        """Reclaim idle scratch without interrupting an active execution lease.
+
+        None means retention is disabled or the pool is busy. The caller may
+        ask Core to evict unrelated models instead of blocking on that lease.
+        """
+        if not self.retain or not self._lease.acquire(blocking=False):
+            return None
+        try:
+            before = self._primary.retained_counts()
+            self._primary.clear(wait_prefetch=True)
+            return before
+        finally:
+            self._lease.release()
