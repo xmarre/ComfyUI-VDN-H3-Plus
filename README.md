@@ -313,9 +313,14 @@ For a repeatable 2-chunk MiniMax-H3 Continuum/Flow comparison, set
 `VDN_H3_PERF_PROFILE=1` in the ComfyUI launch environment and restart.
 This **does not change attention, QKV chunking, quantization, VDN weights,
 generation settings or the model's output**. It is **disabled by default**.
-The profiler records CUDA events at actual VDN QKV projection, learned linear
-readout, Q/K norm + RoPE, grouped softmax/Sol attention, and final output
-projection boundaries. The last interval includes the existing VDN finalization.
+The profiler records CUDA events in **both native VDN and Flow's physical
+partitioned forward** at actual QKV projection, learned linear readout,
+Q/K norm + RoPE, grouped softmax/Sol attention, and output projection
+boundaries. On the partitioned path, phase labels additionally encompass the
+existing physical prefix, grouped domain, preprocess and late-linear work
+in the intervals where they execute; they are coarse phase costs rather
+than individually isolated Sol-kernel launch timings. Uninstrumented H3
+MLP, modulation and non-VDN work are absent from the component totals. The last interval includes the existing VDN finalization.
 Each sample prints `[vdn] CUDA component audit` with the call count and
 aggregated milliseconds for these phases (and the current Flow stage where
 available). The cumulative stream durations are not interchangeable with the

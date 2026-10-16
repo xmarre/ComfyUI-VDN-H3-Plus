@@ -166,6 +166,19 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     x = torch.randn(plan.sequence_rows, 2).to(dtype)
     counters = {}
     events = []
+    phase_logs = []
+    from vdn_h3 import perf as vdn_perf
+
+    class Audit:
+        def __init__(self):
+            self.phases = []
+            phase_logs.append(self.phases)
+
+        def mark(self, name=None):
+            self.phases.append(name)
+
+    monkeypatch.setattr(vdn_perf, "forward", lambda stage, block, device: Audit())
+
     force_dense_calls = []
     weights_calls = []
 
@@ -230,6 +243,11 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
                 state._layout.reset(token)
 
     native = execute()
+    expected_audit = [
+        "qkv_projection", "linear_readout", "qk_norm_rope",
+        "grouped_softmax", "output_projection", None,
+    ]
+    assert phase_logs == [expected_audit]
     sink_counters = {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")}
     assert bool(sink_counters) == bool(sink_measure and mixed_grid)
     for k in sink_counters:
@@ -271,6 +289,7 @@ def test_pre_rope_readout_matches_late_path(monkeypatch, fast_kernels, dtype, st
     options[WITNESS_KEY] = SimpleNamespace(api=1, claim=lambda _context: False)
     monkeypatch.setattr(partitioned_linear, "partitioned_linear_readout", general)
     reference = execute()
+    assert phase_logs == [expected_audit, expected_audit]
     assert {k: v for k, v in counters.items() if k.startswith("partitioned_vdn_target_sink_measure_")} == sink_counters
     for k in sink_counters:
         counters.pop(k)
