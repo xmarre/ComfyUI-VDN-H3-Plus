@@ -221,7 +221,7 @@ def window_softmax_grouped_runtime(query, key, value, video_start, video_end,
     builder = lambda: _build_window_plan(
         video_start, video_end, num_frames, tokens_per_frame,
         bounds, anchor_frames, seq, query.device)
-    plan = resources.window_plan(plan_key, builder) if resources is not None else builder()
+    plan = resources.window_plan(plan_key, builder, device=query.device) if resources is not None else builder()
 
     out = torch.empty_like(query)
     global_idx = plan["global_idx"]

@@ -105,6 +105,16 @@ def _pre_evict_single_replacement(mapping, key):
         mapping.clear()
 
 
+def _scratch_device_key(device):
+    # A Python lease does not wait for previously enqueued CUDA work. Keep
+    # mutable scratch on its allocation stream, including across executions.
+    device = torch.device(device)
+    if device.type == "cuda":
+        stream = torch.cuda.current_stream(device)
+        return (str(stream.device), stream.cuda_stream)
+    return str(device)
+
+
 class _StreamPrefetcher:
     """One cancellable in-flight block transfer; no per-state worker/thread leak."""
 
@@ -279,7 +289,7 @@ class RuntimeBuffers:
     def delta_scratch(self, shape, device):
         if not self.retain:
             return torch.empty(shape, dtype=torch.float32, device=device)
-        key = (tuple(shape), str(device))
+        key = (tuple(shape), _scratch_device_key(device))
         hit = self._delta.get(key)
         if hit is None:
             _pre_evict_single_replacement(self._delta, key)
@@ -294,7 +304,7 @@ class RuntimeBuffers:
         if not self.retain:
             prefix = torch.empty(shape, dtype=dtype, device=device)
             return prefix, torch.empty_like(prefix)
-        key = (num_frames, tuple(state_shape), str(device), dtype)
+        key = (num_frames, tuple(state_shape), _scratch_device_key(device), dtype)
         hit = self._scan.get(key)
         if hit is None:
             _pre_evict_single_replacement(self._scan, key)
@@ -308,7 +318,7 @@ class RuntimeBuffers:
     def activation_scratch(self, video_rows, text_rows, heads, head_dim, device, dtype):
         if not self.retain:
             return None
-        key = (video_rows, text_rows, heads, head_dim, str(device), dtype)
+        key = (video_rows, text_rows, heads, head_dim, _scratch_device_key(device), dtype)
         hit = self._activations.get(key)
         if hit is None:
             _pre_evict_single_replacement(self._activations, key)
@@ -337,9 +347,11 @@ class RuntimeBuffers:
         """
         self._activations.clear()
 
-    def window_plan(self, key, builder):
+    def window_plan(self, key, builder, *, device=None):
         if not self.retain:
             return builder()
+        if device is not None:
+            key = (key, _scratch_device_key(device))
         hit = self._plans.get(key)
         if hit is None:
             hit = builder()
@@ -437,7 +449,7 @@ class RuntimeBuffers:
                 torch.empty(shape, device=device, dtype=dtype),
                 torch.empty(shape, device=device, dtype=dtype),
             )
-        key = (str(device), dtype, heads, head_dim)
+        key = (_scratch_device_key(device), dtype, heads, head_dim)
         pair = self._kv.get(key)
         need = rows * heads * head_dim
         if pair is None or pair[0].numel() < need:
