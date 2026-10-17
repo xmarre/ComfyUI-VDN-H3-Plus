@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5.10 — 2026-10-17
+
+- Integrate VDN PR #41 (bounded admission scratch reclaim), #42 (scoped grouped Sol K/V and QKV lifetime), #43 (CUDA stream-owned scratch), and #44 (BF16 fused temporal candidate with canary and eager fallback).
+- Document the full 550/550 learned-readout workload and the difference from selectively suppressed Core MSA/BSA benchmarks. End-to-end GPU ON/OFF speedup and full-tensor BF16 parity for #44 remain unverified.
+
+
 ## v1.5.9 — 2026-10-08
 
 - Equal-grid partitions route every local query group through the selected

@@ -1,3 +1,27 @@
+# ComfyUI-VDN-H3-Plus v1.5.10
+
+Coordinated release for full trained VDN/Sol/Flow continuation. This includes **all 550 learned VDN readouts in a 22-NFE two-chunk Sol run**, not the 166/550 reduced work observed in Core MSA/BSA; performance comparisons against those modes are not equivalent.
+
+## Changes
+
+- **PR #41:** bounded scratch reclaim before memory admission and safe allocator reuse; no forced eviction or global cache trim on the internal probe-to-high handoff.
+- **PR #42:** bounded raw pre-RoPE QKV ownership, zero-copy certified Q, and optional scoped Sol grouped K/V fusion without dropping the trained linear complement.
+- **PR #43:** stream-keyed retained scratch, preventing cross-CUDA-stream reuse before outstanding work is complete.
+- **PR #44:** optional Triton CUDA BF16 five-tap temporal convolution with per-multiply/add BF16 rounding, a one-time first-use bitwise canary and eager fallback. Node setting `fused_temporal=auto|on|off`, independent of `fast_kernels`.
+
+The owner's actual two-chunk Sol traces exercised VDN on all 550/550 block calls and Sol's 8,800 grouped K/V fusions. Per-run fused-temporal dispatch and end-to-end ON/OFF speedup have **not** been isolated; do not ascribe cross-backend timings to #44. CPU CI plus owner component Sol tests do not replace full SM120 trained-output BF16 parity for #44.
+
+## Coordinated versions
+
+| Component | Release | PRs |
+| --- | --- | --- |
+| VDN-H3-Plus | v1.5.10 | #41, #42, #43, #44 |
+| Sol-H3 | v0.1.11 | #41 |
+| Flow-Aligned Regenerate | v0.3.14 | #102, #103, #105, #107, #108 |
+| H3 Continuum-Plus | v3.4.9 | #44, #46, #47 |
+
+All Keyless work is excluded from these versions.
+
 # ComfyUI-VDN-H3-Plus v1.5.9
 
 Support Flow-Aligned Regenerate v0.3.11: native routing on equal-grid
