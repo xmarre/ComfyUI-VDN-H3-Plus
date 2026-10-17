@@ -7,7 +7,8 @@ sole owner of the diffusion model's parameter tree.
 
 The released 8-step checkpoint configuration: delta_rule="vdn_solve", bridge="alpha",
 a_fp32=True, enable_text_state=True, short_conv on (k, v), linear_head_dim=128.
-Everything here is eager PyTorch -- no Triton, no torch.compile, no CUDA kernels.
+Everything here is eager PyTorch apart from opt-in torch.compile helpers (fast_kernels)
+and the bit-exact single-pass BF16 temporal short-conv in temporal_shift.py.
 Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM), the
 recurrence in fp32 via preallocated banks, bf16 features and readout.
 """
@@ -20,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from .runtime import checked_cholesky
+from .temporal_shift import temporal_shift
 
 _log = logging.getLogger("comfy.vdn")
 
@@ -286,19 +288,7 @@ def _activate_fhsd_body(tokens, l2norm, num_frames, per_frame):
     return x.view(num_frames, per_frame, heads, dim).permute(0, 2, 1, 3).contiguous()
 
 
-def _temporal_shift(x, w, kernel):
-    """Depthwise k-tap conv over frames as shift-multiply-add. x [F, S, C]; w [C, k];
-    zero-padded, symmetric."""
-    pad = kernel // 2
-    xp = F.pad(x, (0, 0, 0, 0, pad, pad))
-    out = None
-    for dt in range(kernel):
-        part = xp[dt:dt + x.shape[0]] * w[:, dt].view(1, 1, -1)
-        out = part if out is None else out + part
-    return out
-
-
-def conv_features(tokens, sp_weight, tm_weight, num_frames, frame_size, l2norm):
+def conv_features(tokens, sp_weight, tm_weight, num_frames, frame_size, l2norm, *, fused_temporal="auto"):
     """Separable short conv: depthwise 5x5 spatial per frame (cudnn NHWC via a
     channels-last view), then the 5-tap temporal shift, then SiLU [+ L2Norm]."""
     heads, head_dim = tokens.shape[-2], tokens.shape[-1]
@@ -308,7 +298,7 @@ def conv_features(tokens, sp_weight, tm_weight, num_frames, frame_size, l2norm):
     volume = F.conv2d(volume, sp_weight, padding=2, groups=channels)
     x = volume.permute(0, 2, 3, 1).reshape(num_frames, grid_h * grid_w, channels)
     tm = tm_weight.squeeze(1)                     # Conv1d [C, 1, K] -> [C, K]
-    out = _temporal_shift(x, tm.to(x.dtype), tm.shape[-1])
+    out = temporal_shift(x, tm.to(x.dtype), tm.shape[-1], mode=fused_temporal)
     return _activate(out.reshape(-1, heads, head_dim), l2norm)
 
 
@@ -388,6 +378,7 @@ class LinearBranch:
         self.enable_text_state = enable_text_state
         self.delta_rule = delta_rule
         self.fuse_epilogue = False
+        self.fused_temporal = "auto"
         self._backend = None
         self._backend_key = None
 
@@ -404,13 +395,13 @@ class LinearBranch:
         if conv and "k" in conv:
             key = conv_features(k_raw, w["short_conv.k_sp.weight"],
                                 w["short_conv.k_tm.weight"], num_frames, frame_size,
-                                l2norm=True)
+                                l2norm=True, fused_temporal=self.fused_temporal)
         else:
             key = _activate(k_raw, l2norm=True)
         if conv and "v" in conv:
             value = conv_features(v_raw, w["short_conv.v_sp.weight"],
                                   w["short_conv.v_tm.weight"], num_frames, frame_size,
-                                  l2norm=False)
+                                  l2norm=False, fused_temporal=self.fused_temporal)
         else:
             value = _activate(v_raw, l2norm=False)
         return query, key, value
