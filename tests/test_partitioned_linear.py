@@ -1083,3 +1083,44 @@ def test_cross_grid_temporal_diagnostic_is_noop_on_uniform_grid():
 
     assert torch.equal(normal, suppressed)
     assert stats == {}
+
+
+def test_batched_output_returns_single_domain_epilogue_without_full_copy(monkeypatch):
+    import vdn_h3.partitioned_linear as module
+    query = torch.randn(12, 2, 8)
+    state = torch.randn(3, 2, 8, 8)
+    gate = torch.randn(12, 16)
+    weight = torch.ones(8)
+    expected = torch.randn(12, 16)
+    monkeypatch.setattr(module.B, "linear_epilogue", lambda *args, **kwargs: expected)
+    def no_cat(*args, **kwargs):
+        raise AssertionError("full output concatenation")
+    monkeypatch.setattr(torch, "cat", no_cat)
+    result = module._batched_output_readout(
+        query, state, gate, ((2, 2),) * 3, ((0, 4), (4, 8), (8, 12)), weight, 1e-6,
+    )
+    assert result is expected
+
+
+def test_mixed_domain_output_does_not_retain_all_epilogues(monkeypatch):
+    import weakref
+    import vdn_h3.partitioned_linear as module
+    query = torch.randn(10, 2, 8)
+    state = torch.randn(3, 2, 8, 8)
+    gate = torch.randn(10, 16)
+    references = []
+    original = module.B.linear_epilogue
+    def epilogue(*args, **kwargs):
+        assert all(ref() is None for ref in references)
+        output = original(*args, **kwargs)
+        references.append(weakref.ref(output))
+        return output
+    expected = module._framewise_output_reference(
+        query, state, gate, ((0, 4), (4, 6), (6, 10)), torch.ones(8), 1e-6,
+    )
+    monkeypatch.setattr(module.B, "linear_epilogue", epilogue)
+    result = module._batched_output_readout(
+        query, state, gate, ((2, 2), (1, 2), (2, 2)), ((0, 4), (4, 6), (6, 10)), torch.ones(8), 1e-6,
+    )
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+    assert all(ref() is None for ref in references)
