@@ -33,6 +33,22 @@ def test_runtime_buffer_owner_reuses_primary_but_isolates_nested_execution():
     assert current_runtime_buffers() is None
 
 
+def test_idle_scratch_reclaim_does_not_touch_an_active_execution():
+    owner = RuntimeBufferOwner(True)
+    with owner.execution() as resources:
+        scratch = resources.activation_scratch(8, 3, 2, 4, "cpu", torch.float32)
+        backing = weakref.ref(scratch["q"])
+        del scratch
+        assert backing() is not None
+        assert owner.try_release_retained() is None
+        assert backing() is not None
+    counts = owner.try_release_retained()
+    gc.collect()
+    assert counts["activations"] == 1
+    assert backing() is None
+    assert owner.try_release_retained()["activations"] == 0
+
+
 def test_activation_scratch_evicts_old_geometry_before_replacement_allocation(monkeypatch):
     owner = RuntimeBufferOwner(True)
     with owner.execution() as resources:
