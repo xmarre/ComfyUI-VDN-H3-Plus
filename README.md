@@ -1,5 +1,17 @@
 # ComfyUI-VDN-H3-Plus
 
+## v1.5.10 — coordinated release (17 October 2026)
+
+| Component | Release | PRs |
+| --- | --- | --- |
+| VDN-H3-Plus | v1.5.10 | #41, #42, #43, #44 |
+| Sol-H3 | v0.1.11 | #41 |
+| Flow-Aligned Regenerate | v0.3.14 | #102, #103, #105, #107, #108 |
+| H3 Continuum-Plus | v3.4.9 | #44, #46, #47 |
+
+The merged VDN #41–#44 stack provides bounded pre-RoPE QKV ownership, stream-safe scratch reuse, optional exact grouped Sol K/V fusion and an automatic CUDA BF16 fused temporal short-conv with one-time canary/eager fallback. Keep the trained linear complement enabled: full Sol observations used 550/550 VDN linear executions, unlike Core MSA/BSA runs that suppressed 384/550. `fused_temporal` (auto/on/off) and `fast_kernels` are independent. [Temporal implementation and acceptance caveats](docs/LINEAR_TEMPORAL_KERNEL.md).
+
+
 > **Plus fork:** This is the `xmarre` maintained Plus fork of [Saganaki22/ComfyUI-VDN-H3](https://github.com/Saganaki22/ComfyUI-VDN-H3). It preserves the upstream project's foundation while carrying additional features, integrations, fixes, and behavior that may intentionally diverge from upstream.
 
 A ComfyUI port of the released [OpenVDN VDN-H3](https://github.com/OpenVDN/vdn-minimax-h3) hybrid-attention architecture for ComfyUI's native MiniMax-H3 model.
