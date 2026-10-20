@@ -7,6 +7,7 @@ old registered handles and stale clone ejection cannot remove the newer set.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -213,3 +214,87 @@ def test_repeated_pseudo_continuum_chunks_do_not_accumulate(monkeypatch):
             injection.eject(vdn)
         assert module.forward == true_forward, chunk
         assert torch.allclose(module(x), true_forward(x), atol=1e-6), chunk
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_large_post_forward_delta_is_tiled_without_a_full_residual(monkeypatch, dtype):
+    from vdn_h3 import apply
+    down = torch.randn(5, 8, generator=torch.Generator().manual_seed(1001)).to(dtype)
+    up = torch.randn(16, 5, generator=torch.Generator().manual_seed(1002)).to(dtype)
+    bias = torch.randn(16, generator=torch.Generator().manual_seed(1003)).to(dtype)
+    x = torch.randn(2, 11, 8, generator=torch.Generator().manual_seed(1004)).to(dtype)
+    weight = torch.randn(16, 8, generator=torch.Generator().manual_seed(1005)).to(dtype)
+    base = torch.nn.functional.linear(x, weight)
+    expected = base + (_delta(x, down, up) + bias)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),), ((bias, 1.0),))
+    module = nn.Linear(8, 16, bias=False, dtype=dtype)
+    module.weight.data.copy_(weight)
+    handle = module.register_forward_hook(plan)
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 256)
+    linear = torch.nn.functional.linear
+    shapes = []
+
+    def inspected(inputs, weights, bias=None):
+        if weights.shape == up.shape:
+            shapes.append(tuple(inputs.shape))
+        return linear(inputs, weights, bias)
+
+    monkeypatch.setattr(apply.F, "linear", inspected)
+    try:
+        with torch.no_grad():
+            actual = module(x)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(actual, expected, rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
+                               atol=0.05 if dtype == torch.bfloat16 else 1e-5)
+    # The tile budget covers all batch dimensions and output channels.
+    # The output-sized up projection stays tiled even when a small complete
+    # down projection is retained and reused.
+    assert len(shapes) > 1
+    assert max(shape[-2] for shape in shapes) <= (4 if dtype == torch.bfloat16 else 2)
+
+
+def test_post_forward_large_delta_oom_retries_only_uncommitted_rows(monkeypatch):
+    from vdn_h3 import apply
+    down, up = _term(1006)
+    x = torch.randn(1, 13, 8, generator=torch.Generator().manual_seed(1007))
+    base = torch.randn(1, 13, 8, generator=torch.Generator().manual_seed(1008))
+    expected = base + _delta(x, down, up)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),))
+    module = nn.Linear(8, 8, bias=False)
+    handle = module.register_forward_hook(plan)
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 128)
+    linear = torch.nn.functional.linear
+    retries = []
+
+    def synthetic_allocator_pressure(inputs, weights, bias=None):
+        if inputs.shape[-2] > 2:
+            retries.append(inputs.shape[-2])
+            raise torch.OutOfMemoryError("synthetic tile workspace failure")
+        return linear(inputs, weights, bias)
+
+    monkeypatch.setattr(apply.F, "linear", synthetic_allocator_pressure)
+    try:
+        with torch.no_grad():
+            result = plan(module, (x,), base)
+    finally:
+        handle.remove()
+    assert retries
+    assert result is base
+    assert torch.allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_post_forward_gradient_mode_keeps_functional_result(monkeypatch):
+    from vdn_h3 import apply
+    down, up = _term(1009)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),))
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 8)
+    x = torch.randn(12, 8, requires_grad=True)
+    output = x @ torch.randn(8, 8)
+    original = output.clone()
+    result = plan(None, (x,), output)
+    assert result is not output
+    assert torch.equal(output, original)
+    result.sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()

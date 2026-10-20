@@ -36,11 +36,15 @@ import logging
 import threading
 import weakref
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
+from torch.nn.modules import module as torch_module
+from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 import comfy.lora
+import comfy.ops
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
@@ -201,6 +205,172 @@ def _module_compute_device_dtype(module, fallback_dtype: torch.dtype):
     return device, dtype
 
 
+
+# Limit the transient post-forward adapter residual independently of the H3
+# frame-statistics workspace. A full fc1 LoRA delta can exceed 4 GiB at the
+# high-resolution H3 grid, despite ample nominal VRAM.
+_POST_FORWARD_DELTA_TILE_BYTES = 256 * 1024 * 1024
+
+
+@lru_cache(maxsize=1)
+def _linear_forward_contracts():
+    # MixedPrecisionOps defines its Linear class inside a factory. Compare code
+    # objects and globals, not class names (or functools.wraps metadata), so each
+    # factory instance is accepted but caching/replaced methods are not.
+    classes = (
+        torch.nn.Linear,
+        comfy.ops.disable_weight_init.Linear,
+        comfy.ops.manual_cast.Linear,
+        comfy.ops.mixed_precision_ops().Linear,
+    )
+    contracts = []
+    for cls in classes:
+        names = ("forward",)
+        if cls is not torch.nn.Linear:
+            names += ("forward_comfy_cast_weights",)
+        if hasattr(cls, "_forward"):
+            names += ("_forward",)
+        methods = tuple((name, getattr(cls, name)) for name in names)
+        namespace = torch.nn.modules.linear.__dict__ if cls is torch.nn.Linear else comfy.ops.__dict__
+        if all(getattr(method, "__globals__", None) is namespace for _, method in methods):
+            contracts.append(methods)
+    return tuple(contracts)
+
+
+def _owns_post_forward_output(module, hook) -> bool:
+    """Qualify the standard linear forward and its observers on every call."""
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if (tuple(module._forward_hooks.values()) != (hook,)
+            or module._forward_hooks_with_kwargs
+            or torch_module._global_forward_hooks
+            or module._backward_hooks
+            or module._backward_pre_hooks
+            or module._compiled_call_impl is not None
+            or "forward" in vars(module)
+            or _get_current_dispatch_mode() is not None
+            or torch.overrides._get_current_function_mode() is not None):
+        return False
+    # A custom __call__ can retain the result before it invokes local hooks.
+    for name in ("__call__", "_call_impl", "_wrapped_call_impl"):
+        if getattr(getattr(module, name), "__func__", None) is not getattr(torch.nn.Module, name):
+            return False
+    for contract in _linear_forward_contracts():
+        for name, expected in contract:
+            actual = getattr(getattr(module, name, None), "__func__", None)
+            if (actual is None or actual.__code__ is not expected.__code__
+                    or actual.__globals__ is not expected.__globals__):
+                break
+        else:
+            return True
+    return False
+
+
+def _log_post_forward_oom(x, output):
+    """Best-effort diagnostics must never replace the original allocation error."""
+    if x.device.type != "cuda":
+        return
+    details = {}
+    for name, read in (
+        ("allocator", torch.cuda.get_allocator_backend),
+        ("mem_get_info", lambda: torch.cuda.mem_get_info(x.device)),
+        ("memory_stats", lambda: torch.cuda.memory_stats(x.device)),
+        ("memory_summary", lambda: torch.cuda.memory_summary(x.device)),
+    ):
+        try:
+            details[name] = read()
+        except Exception as error:
+            details[name] = f"unavailable ({type(error).__name__}: {error})"
+    _log.warning("[vdn] post-forward LoRA OOM device=%s output_shape=%s diagnostics=%s",
+                 x.device, tuple(output.shape), details)
+
+
+def _try_add_bounded_post_forward_lora(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    down: torch.Tensor,
+    up: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> bool:
+    """Accumulate a large inference-only LoRA residual in bounded row tiles.
+
+    The caller must first qualify the forward implementation and observers with
+    _owns_post_forward_output. Tensor layout checks alone do not prove ownership.
+    Updating that activation avoids a second full fc1-sized tensor. Gradients,
+    subclasses and shared-storage aliases retain the functional implementation.
+    Standard Linear can return a reshape of its private GEMM result; that view
+    is safe under the same qualified forward/observer contract.
+    """
+    if (
+        torch.is_grad_enabled()
+        or type(x) is not torch.Tensor
+        or type(output) is not torch.Tensor
+        or output.requires_grad
+        or output.ndim < 2
+        or x.ndim != output.ndim
+        or x.shape[:-1] != output.shape[:-1]
+        or x.device != output.device
+        or x.dtype != output.dtype
+        or not output.is_contiguous()
+        or (output._base is not None and output._base.numel() != output.numel())
+        or output.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+        or down.ndim != 2
+        or up.ndim != 2
+        or down.shape[1] != x.shape[-1]
+        or up.shape != (output.shape[-1], down.shape[0])
+    ):
+        return False
+    token_rows = int(output.shape[-2])
+    if token_rows <= 1:
+        return False
+    row_bytes = output.numel() // token_rows * output.element_size()
+    if row_bytes <= 0 or row_bytes * token_rows <= _POST_FORWARD_DELTA_TILE_BYTES:
+        return False
+
+    rows_per_tile = max(1, _POST_FORWARD_DELTA_TILE_BYTES // row_bytes)
+    # The down projection is rank-sized, usually much smaller than the output
+    # residual. Compute it once when it fits the same workspace budget instead
+    # of launching another small GEMM for every output tile. Keep the row-tiled
+    # path available if its allocation (or a later up-projection tile) cannot fit.
+    down_projection = None
+    down_bytes = output.numel() // output.shape[-1] * down.shape[0] * x.element_size()
+    if down_bytes <= _POST_FORWARD_DELTA_TILE_BYTES:
+        try:
+            down_projection = F.linear(x, down)
+        except torch.OutOfMemoryError:
+            pass
+    position = 0
+    while position < token_rows:
+        size = min(rows_per_tile, token_rows - position)
+        try:
+            # Compute the identical down -> up -> optional bias arithmetic,
+            # but over a small slice. Commit only after the entire delta is
+            # available, so an allocation failure can retry this slice safely.
+            def apply_tile():
+                if down_projection is None:
+                    projected = F.linear(x[..., position : position + size, :], down)
+                else:
+                    projected = down_projection[..., position : position + size, :]
+                partial = F.linear(projected, up)
+                if bias is not None:
+                    partial = partial + bias
+                output[..., position : position + size, :].add_(partial)
+
+            apply_tile()
+        except torch.OutOfMemoryError:
+            if size == 1:
+                if down_projection is not None:
+                    # Release the full rank workspace before retrying this
+                    # uncommitted row. A previous completed tile stays applied.
+                    down_projection = None
+                    continue
+                raise  # A genuinely unserviceable CUDA allocation stays fatal.
+            rows_per_tile = max(1, size // 2)
+            continue
+        position += size
+    return True
+
+
 class _PostForwardLoRA:
     """Exact additive low-rank residual without replacing ``module.forward``.
 
@@ -225,6 +395,9 @@ class _PostForwardLoRA:
         if not self.terms and not self.bias_terms:
             raise RuntimeError("VDN post-forward hook has no adapter terms")
         self._cache = {}
+        self._bounded_reported = False
+        self._bounded_fallback_reported = False
+        self._oom_reported = False
 
     def _fallback_dtype(self):
         for down, up, _scale in self.terms:
@@ -299,7 +472,38 @@ class _PostForwardLoRA:
                 f"{type(module).__name__} to be a Tensor"
             )
         x = inputs[0]
+        try:
+            return self._apply(module, x, output)
+        except torch.OutOfMemoryError:
+            if not self._oom_reported:
+                self._oom_reported = True
+                _log_post_forward_oom(x, output)
+            raise
+
+    def _apply(self, module, x, output):
         down, up, bias = self._weights_for(x)
+        large = output.numel() * output.element_size() > _POST_FORWARD_DELTA_TILE_BYTES
+        owned = down is not None and large and _owns_post_forward_output(module, self)
+        if down is not None and large and not owned and not self._bounded_fallback_reported:
+            _log.info(
+                "[vdn] bounded post-forward LoRA unavailable: output ownership "
+                "unqualified module=%s; using functional residual",
+                type(module).__name__,
+            )
+            self._bounded_fallback_reported = True
+        if owned and _try_add_bounded_post_forward_lora(x, output, down, up, bias):
+            if not self._bounded_reported:
+                _log.info(
+                    "[vdn] bounded post-forward LoRA active module=%s output_shape=%s "
+                    "avoided_full_delta_mib=%.1f tile_limit_mib=%.1f dtype=%s",
+                    type(module).__name__ if module is not None else "unknown",
+                    tuple(output.shape),
+                    output.numel() * output.element_size() / (1024 * 1024),
+                    _POST_FORWARD_DELTA_TILE_BYTES / (1024 * 1024),
+                    output.dtype,
+                )
+                self._bounded_reported = True
+            return output
         delta = None
         if down is not None:
             delta = F.linear(F.linear(x, down), up)
