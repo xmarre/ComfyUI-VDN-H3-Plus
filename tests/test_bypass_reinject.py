@@ -213,3 +213,73 @@ def test_repeated_pseudo_continuum_chunks_do_not_accumulate(monkeypatch):
             injection.eject(vdn)
         assert module.forward == true_forward, chunk
         assert torch.allclose(module(x), true_forward(x), atol=1e-6), chunk
+
+
+def test_large_post_forward_delta_is_tiled_without_a_full_residual(monkeypatch):
+    from vdn_h3 import apply
+    down = torch.randn(5, 8, generator=torch.Generator().manual_seed(1001))
+    up = torch.randn(16, 5, generator=torch.Generator().manual_seed(1002))
+    bias = torch.randn(16, generator=torch.Generator().manual_seed(1003))
+    x = torch.randn(2, 11, 8, generator=torch.Generator().manual_seed(1004))
+    weight = torch.randn(16, 8, generator=torch.Generator().manual_seed(1005))
+    base = torch.nn.functional.linear(x, weight)
+    expected = base + (_delta(x, down, up) + bias)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),), ((bias, 1.0),))
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 256)
+    linear = torch.nn.functional.linear
+    shapes = []
+
+    def inspected(inputs, weights, bias=None):
+        shapes.append(tuple(inputs.shape))
+        return linear(inputs, weights, bias)
+
+    monkeypatch.setattr(apply.F, "linear", inspected)
+    with torch.no_grad():
+        actual = plan(None, (x,), base)
+    assert actual is base
+    assert torch.allclose(actual, expected, rtol=1e-5, atol=1e-5)
+    # 2 batches * 16 outputs * fp32 = 128 bytes for each token row.
+    # Every pair of projections is restricted to at most 2 token rows.
+    assert len(shapes) > 2
+    assert max(shape[-2] for shape in shapes) <= 2
+
+
+def test_post_forward_large_delta_oom_retries_only_uncommitted_rows(monkeypatch):
+    from vdn_h3 import apply
+    down, up = _term(1006)
+    x = torch.randn(1, 13, 8, generator=torch.Generator().manual_seed(1007))
+    base = torch.randn(1, 13, 8, generator=torch.Generator().manual_seed(1008))
+    expected = base + _delta(x, down, up)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),))
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 128)
+    linear = torch.nn.functional.linear
+    retries = []
+
+    def synthetic_allocator_pressure(inputs, weights, bias=None):
+        if inputs.shape[-2] > 2:
+            retries.append(inputs.shape[-2])
+            raise torch.OutOfMemoryError("synthetic tile workspace failure")
+        return linear(inputs, weights, bias)
+
+    monkeypatch.setattr(apply.F, "linear", synthetic_allocator_pressure)
+    with torch.no_grad():
+        result = plan(None, (x,), base)
+    assert retries
+    assert result is base
+    assert torch.allclose(result, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_post_forward_gradient_mode_keeps_functional_result(monkeypatch):
+    from vdn_h3 import apply
+    down, up = _term(1009)
+    plan = apply._PostForwardLoRA(((down, up, 1.0),))
+    monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 8)
+    x = torch.randn(12, 8, requires_grad=True)
+    output = x @ torch.randn(8, 8)
+    original = output.clone()
+    result = plan(None, (x,), output)
+    assert result is not output
+    assert torch.equal(output, original)
+    result.sum().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
