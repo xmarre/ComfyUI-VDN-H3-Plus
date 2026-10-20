@@ -1124,3 +1124,44 @@ def test_mixed_domain_output_does_not_retain_all_epilogues(monkeypatch):
     )
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
     assert all(ref() is None for ref in references)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("a_fp32", [False, True])
+def test_native_uniform_frame_statistics_bound_value_temporary(monkeypatch, dtype, a_fp32):
+    """Bound large frame runs without reordering VDN statistics or mixing frames."""
+    from vdn_h3 import retained
+
+    generator = torch.Generator().manual_seed(222)
+    # Exercise the non-contiguous frame/head/token layout of the native path.
+    key = torch.randn((9, 17, 2, 8), generator=generator).to(dtype).permute(0, 2, 1, 3)
+    value = torch.randn((9, 17, 2, 8), generator=generator).to(dtype).permute(0, 2, 1, 3)
+    beta = torch.sigmoid(torch.randn((9, 2, 17), generator=generator)).to(dtype)
+
+    unbatched_a, unbatched_b = B.frame_statistics(key, value, beta, a_fp32=a_fp32)
+    frame_bytes = value[0].numel() * value.element_size()
+    monkeypatch.setattr(retained, "_FRAME_STATISTICS_VALUE_BUDGET_BYTES", frame_bytes * 2)
+    original = B.frame_statistics
+    observed = []
+
+    def witness(k, v, weights, a_fp32=True):
+        observed.append(int(v.shape[0]))
+        return original(k, v, weights, a_fp32=a_fp32)
+
+    monkeypatch.setattr(B, "frame_statistics", witness)
+    batched_a, batched_b = retained._bounded_frame_statistics(
+        key, value, beta, a_fp32=a_fp32,
+    )
+    assert observed == [2, 2, 2, 2, 1]
+    torch.testing.assert_close(batched_a, unbatched_a, atol=2e-5, rtol=2e-5)
+    torch.testing.assert_close(batched_b, unbatched_b, atol=2e-5, rtol=2e-5)
+
+    # Below budget, keep the original single-call path and exact outputs.
+    observed.clear()
+    monkeypatch.setattr(retained, "_FRAME_STATISTICS_VALUE_BUDGET_BYTES", frame_bytes * 9)
+    small_a, small_b = retained._bounded_frame_statistics(
+        key, value, beta, a_fp32=a_fp32,
+    )
+    assert observed == [9]
+    assert torch.equal(small_a, unbatched_a)
+    assert torch.equal(small_b, unbatched_b)
