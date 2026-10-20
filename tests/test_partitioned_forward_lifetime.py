@@ -363,7 +363,10 @@ def test_partitioned_bounded_qkv_producer_matches_unbounded_with_raw_linear(monk
     baseline = execute()
     options[QKV_PROJECTION_KEY] = projection
     bounded = execute()
-    torch.testing.assert_close(bounded, baseline, rtol=0, atol=0)
+    # Partitioned projection changes the QKV GEMM batch shape (37 rows vs.
+    # 4-row tiles). FP32 accumulation order is not bit-exact across GEMM
+    # algorithms even when the downstream readout is mathematically identical.
+    torch.testing.assert_close(bounded, baseline, rtol=1e-6, atol=1e-6)
     assert bool(group_calls) is grouped_capability
     if grouped_capability:
         assert len(group_calls) == 2 * plan.temporal
