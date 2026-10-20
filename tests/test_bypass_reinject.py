@@ -227,18 +227,24 @@ def test_large_post_forward_delta_is_tiled_without_a_full_residual(monkeypatch, 
     base = torch.nn.functional.linear(x, weight)
     expected = base + (_delta(x, down, up) + bias)
     plan = apply._PostForwardLoRA(((down, up, 1.0),), ((bias, 1.0),))
+    module = nn.Linear(8, 16, bias=False, dtype=dtype)
+    module.weight.data.copy_(weight)
+    handle = module.register_forward_hook(plan)
     monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 256)
     linear = torch.nn.functional.linear
     shapes = []
 
     def inspected(inputs, weights, bias=None):
-        shapes.append(tuple(inputs.shape))
+        if weights is down or weights is up:
+            shapes.append(tuple(inputs.shape))
         return linear(inputs, weights, bias)
 
     monkeypatch.setattr(apply.F, "linear", inspected)
-    with torch.no_grad():
-        actual = plan(None, (x,), base)
-    assert actual is base
+    try:
+        with torch.no_grad():
+            actual = module(x)
+    finally:
+        handle.remove()
     torch.testing.assert_close(actual, expected, rtol=0.02 if dtype == torch.bfloat16 else 1e-5,
                                atol=0.05 if dtype == torch.bfloat16 else 1e-5)
     # The tile budget covers all batch dimensions and output channels.
@@ -254,6 +260,8 @@ def test_post_forward_large_delta_oom_retries_only_uncommitted_rows(monkeypatch)
     base = torch.randn(1, 13, 8, generator=torch.Generator().manual_seed(1008))
     expected = base + _delta(x, down, up)
     plan = apply._PostForwardLoRA(((down, up, 1.0),))
+    module = nn.Linear(8, 8, bias=False)
+    handle = module.register_forward_hook(plan)
     monkeypatch.setattr(apply, "_POST_FORWARD_DELTA_TILE_BYTES", 128)
     linear = torch.nn.functional.linear
     retries = []
@@ -265,8 +273,11 @@ def test_post_forward_large_delta_oom_retries_only_uncommitted_rows(monkeypatch)
         return linear(inputs, weights, bias)
 
     monkeypatch.setattr(apply.F, "linear", synthetic_allocator_pressure)
-    with torch.no_grad():
-        result = plan(None, (x,), base)
+    try:
+        with torch.no_grad():
+            result = plan(module, (x,), base)
+    finally:
+        handle.remove()
     assert retries
     assert result is base
     assert torch.allclose(result, expected, rtol=1e-5, atol=1e-5)

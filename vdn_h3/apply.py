@@ -36,11 +36,15 @@ import logging
 import threading
 import weakref
 from collections import defaultdict
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
+from torch.nn.modules import module as torch_module
+from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 import comfy.lora
+import comfy.ops
 import comfy.model_management
 import comfy.patcher_extension
 import comfy.utils
@@ -208,6 +212,79 @@ def _module_compute_device_dtype(module, fallback_dtype: torch.dtype):
 _POST_FORWARD_DELTA_TILE_BYTES = 256 * 1024 * 1024
 
 
+@lru_cache(maxsize=1)
+def _linear_forward_contracts():
+    # MixedPrecisionOps defines its Linear class inside a factory. Compare code
+    # objects and globals, not class names (or functools.wraps metadata), so each
+    # factory instance is accepted but caching/replaced methods are not.
+    classes = (
+        torch.nn.Linear,
+        comfy.ops.disable_weight_init.Linear,
+        comfy.ops.manual_cast.Linear,
+        comfy.ops.mixed_precision_ops().Linear,
+    )
+    contracts = []
+    for cls in classes:
+        names = ("forward",)
+        if cls is not torch.nn.Linear:
+            names += ("forward_comfy_cast_weights",)
+        if hasattr(cls, "_forward"):
+            names += ("_forward",)
+        methods = tuple((name, getattr(cls, name)) for name in names)
+        namespace = torch.nn.modules.linear.__dict__ if cls is torch.nn.Linear else comfy.ops.__dict__
+        if all(getattr(method, "__globals__", None) is namespace for _, method in methods):
+            contracts.append(methods)
+    return tuple(contracts)
+
+
+def _owns_post_forward_output(module, hook) -> bool:
+    """Qualify the standard linear forward and its observers on every call."""
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if (tuple(module._forward_hooks.values()) != (hook,)
+            or module._forward_hooks_with_kwargs
+            or torch_module._global_forward_hooks
+            or module._backward_hooks
+            or module._backward_pre_hooks
+            or module._compiled_call_impl is not None
+            or "forward" in vars(module)
+            or _get_current_dispatch_mode() is not None
+            or torch.overrides._get_current_function_mode() is not None):
+        return False
+    # A custom __call__ can retain the result before it invokes local hooks.
+    for name in ("__call__", "_call_impl", "_wrapped_call_impl"):
+        if getattr(getattr(module, name), "__func__", None) is not getattr(torch.nn.Module, name):
+            return False
+    for contract in _linear_forward_contracts():
+        for name, expected in contract:
+            actual = getattr(getattr(module, name, None), "__func__", None)
+            if (actual is None or actual.__code__ is not expected.__code__
+                    or actual.__globals__ is not expected.__globals__):
+                break
+        else:
+            return True
+    return False
+
+
+def _log_post_forward_oom(x, output):
+    """Best-effort diagnostics must never replace the original allocation error."""
+    if x.device.type != "cuda":
+        return
+    details = {}
+    for name, read in (
+        ("allocator", torch.cuda.get_allocator_backend),
+        ("mem_get_info", lambda: torch.cuda.mem_get_info(x.device)),
+        ("memory_stats", lambda: torch.cuda.memory_stats(x.device)),
+        ("memory_summary", lambda: torch.cuda.memory_summary(x.device)),
+    ):
+        try:
+            details[name] = read()
+        except Exception as error:
+            details[name] = f"unavailable ({type(error).__name__}: {error})"
+    _log.warning("[vdn] post-forward LoRA OOM device=%s output_shape=%s diagnostics=%s",
+                 x.device, tuple(output.shape), details)
+
+
 def _try_add_bounded_post_forward_lora(
     x: torch.Tensor,
     output: torch.Tensor,
@@ -217,10 +294,10 @@ def _try_add_bounded_post_forward_lora(
 ) -> bool:
     """Accumulate a large inference-only LoRA residual in bounded row tiles.
 
-    The hook owns a newly returned linear activation at this point. Updating
-    that activation in-place avoids allocating a second full fc1-sized tensor.
-    Keep the old functional implementation for gradients, subclasses, views,
-    aliases, and other cases where mutation cannot be qualified.
+    The caller must first qualify the forward implementation and observers with
+    _owns_post_forward_output. Tensor layout checks alone do not prove ownership.
+    Updating that activation avoids a second full fc1-sized tensor. Gradients,
+    subclasses, views and aliases retain the functional implementation.
     """
     if (
         torch.is_grad_enabled()
@@ -297,6 +374,8 @@ class _PostForwardLoRA:
             raise RuntimeError("VDN post-forward hook has no adapter terms")
         self._cache = {}
         self._bounded_reported = False
+        self._bounded_fallback_reported = False
+        self._oom_reported = False
 
     def _fallback_dtype(self):
         for down, up, _scale in self.terms:
@@ -371,8 +450,26 @@ class _PostForwardLoRA:
                 f"{type(module).__name__} to be a Tensor"
             )
         x = inputs[0]
+        try:
+            return self._apply(module, x, output)
+        except torch.OutOfMemoryError:
+            if not self._oom_reported:
+                self._oom_reported = True
+                _log_post_forward_oom(x, output)
+            raise
+
+    def _apply(self, module, x, output):
         down, up, bias = self._weights_for(x)
-        if down is not None and _try_add_bounded_post_forward_lora(x, output, down, up, bias):
+        large = output.numel() * output.element_size() > _POST_FORWARD_DELTA_TILE_BYTES
+        owned = down is not None and large and _owns_post_forward_output(module, self)
+        if down is not None and large and not owned and not self._bounded_fallback_reported:
+            _log.info(
+                "[vdn] bounded post-forward LoRA unavailable: output ownership "
+                "unqualified module=%s; using functional residual",
+                type(module).__name__,
+            )
+            self._bounded_fallback_reported = True
+        if owned and _try_add_bounded_post_forward_lora(x, output, down, up, bias):
             if not self._bounded_reported:
                 _log.info(
                     "[vdn] bounded post-forward LoRA active module=%s output_shape=%s "
