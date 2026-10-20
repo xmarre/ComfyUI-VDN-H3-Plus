@@ -201,6 +201,77 @@ def _module_compute_device_dtype(module, fallback_dtype: torch.dtype):
     return device, dtype
 
 
+
+# Limit the transient post-forward adapter residual independently of the H3
+# frame-statistics workspace. A full fc1 LoRA delta can exceed 4 GiB at the
+# high-resolution H3 grid, despite ample nominal VRAM.
+_POST_FORWARD_DELTA_TILE_BYTES = 256 * 1024 * 1024
+
+
+def _try_add_bounded_post_forward_lora(
+    x: torch.Tensor,
+    output: torch.Tensor,
+    down: torch.Tensor,
+    up: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> bool:
+    """Accumulate a large inference-only LoRA residual in bounded row tiles.
+
+    The hook owns a newly returned linear activation at this point. Updating
+    that activation in-place avoids allocating a second full fc1-sized tensor.
+    Keep the old functional implementation for gradients, subclasses, views,
+    aliases, and other cases where mutation cannot be qualified.
+    """
+    if (
+        torch.is_grad_enabled()
+        or type(x) is not torch.Tensor
+        or type(output) is not torch.Tensor
+        or output.requires_grad
+        or output.ndim < 2
+        or x.ndim != output.ndim
+        or x.shape[:-1] != output.shape[:-1]
+        or x.device != output.device
+        or x.dtype != output.dtype
+        or not output.is_contiguous()
+        or output._base is not None
+        or output.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
+        or down.ndim != 2
+        or up.ndim != 2
+        or down.shape[1] != x.shape[-1]
+        or up.shape != (output.shape[-1], down.shape[0])
+    ):
+        return False
+    token_rows = int(output.shape[-2])
+    if token_rows <= 1:
+        return False
+    row_bytes = output.numel() // token_rows * output.element_size()
+    if row_bytes <= 0 or row_bytes * token_rows <= _POST_FORWARD_DELTA_TILE_BYTES:
+        return False
+
+    rows_per_tile = max(1, _POST_FORWARD_DELTA_TILE_BYTES // row_bytes)
+    position = 0
+    while position < token_rows:
+        size = min(rows_per_tile, token_rows - position)
+        try:
+            # Compute the identical down -> up -> optional bias arithmetic,
+            # but over a small slice. Commit only after the entire delta is
+            # available, so an allocation failure can retry this slice safely.
+            def apply_tile():
+                partial = F.linear(F.linear(x[..., position : position + size, :], down), up)
+                if bias is not None:
+                    partial = partial + bias
+                output[..., position : position + size, :].add_(partial)
+
+            apply_tile()
+        except torch.OutOfMemoryError:
+            if size == 1:
+                raise  # A genuinely unserviceable CUDA allocation stays fatal.
+            rows_per_tile = max(1, size // 2)
+            continue
+        position += size
+    return True
+
+
 class _PostForwardLoRA:
     """Exact additive low-rank residual without replacing ``module.forward``.
 
@@ -300,6 +371,8 @@ class _PostForwardLoRA:
             )
         x = inputs[0]
         down, up, bias = self._weights_for(x)
+        if down is not None and _try_add_bounded_post_forward_lora(x, output, down, up, bias):
+            return output
         delta = None
         if down is not None:
             delta = F.linear(F.linear(x, down), up)
