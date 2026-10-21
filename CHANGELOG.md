@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5.11 — 2026-10-21
+
+- Merge #46: batch native frame statistics over independent frame runs to reduce transient high-grid memory use; mathematical equivalence is per frame, but GPU floating-point results are not guaranteed bitwise-identical.
+- Merge #47: bound large post-forward adapter projections with output-ownership qualification, rank-workspace reuse, direct in-place addmm on private 2-D linear outputs, and best-effort OOM diagnostics. Unsupported calls preserve the previous functional path.
+- Related compatible releases: H3 Continuum Plus v3.5.0 and Flow-Aligned Regenerate v0.3.15. Trained-GPU numerical/visual and speed qualification remains partial.
+
 ## v1.5.10 — 2026-10-17
 
 - Integrate VDN PR #41 (bounded admission scratch reclaim), #42 (scoped grouped Sol K/V and QKV lifetime), #43 (CUDA stream-owned scratch), and #44 (BF16 fused temporal candidate with canary and eager fallback).
