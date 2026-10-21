@@ -1,3 +1,19 @@
+# ComfyUI-VDN-H3-Plus v1.5.11
+
+## High-grid memory fixes
+
+- **#46** bounds the per-frame native VDN statistics computation by processing independent frame runs. Reduces the maximum per-run weighted-value temporary for multi-frame readouts while preserving independent per-frame reductions. Frame ordering, learned recurrence, Q/K/V values and output shapes are retained. A late output concatenation still creates transient memory pressure; this mitigation is not a guarantee against OOM.
+- **#47** bounds large runtime VDN low-rank residual projections and adds strictly qualified private-output accumulation (direct_addmm) to avoid materializing multi-GiB deltas on eligible contiguous 2-D Linear outputs. Conservative ownership checking protects other observers; unqualified/unsupported calls keep the original functional path and can still OOM. CUDA OOM diagnostic collection is best effort.
+- CPU regression and exact-head CI passed for both changes. Installed H3 sampling exercised the direct-addmm path without observed OOM. The latest rank-workspace and frame-batching implementations have not received controlled matched GPU A/B numerical, visual-quality, allocator-stress or speed validation. GEMM launch shapes may produce non-bitwise floating-point differences.
+
+## Companion versions
+
+- H3 Continuum Plus v3.5.0 (Timeline Studio v26).
+- Flow-Aligned Regenerate v0.3.15 (unsupported audio-diagnostic handling).
+- Sol-H3 v0.1.11, Spectrum MiniMax H3 v0.2.29, Latent Upscaler-Plus v0.2.2 (unchanged).
+
+The exact-prefix mask, trained VDN weights, transformer-call count, and attention routing contracts are not intentionally changed by #46/#47. These changes do not remediate all allocator or high-grid bottlenecks.
+
 # ComfyUI-VDN-H3-Plus v1.5.10
 
 Coordinated release for full trained VDN/Sol/Flow continuation. This includes **all 550 learned VDN readouts in a 22-NFE two-chunk Sol run**, not the 166/550 reduced work observed in Core MSA/BSA; performance comparisons against those modes are not equivalent.
