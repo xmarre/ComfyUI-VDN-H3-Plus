@@ -20,6 +20,38 @@ from vdn_h3.query_positions import (
 from vdn_h3.runtime import current_runtime_buffers
 
 
+# Limit frame-statistics temporaries without changing the per-frame VDN
+# equations. The native uniform path otherwise multiplies an entire high-grid
+# value tensor at once (for example 55 * 56 * 1150 * 128 BF16 = 864.75 MiB),
+# while fp32 key/scaled-key temporaries and the original features are live.
+_FRAME_STATISTICS_VALUE_BUDGET_BYTES = 128 << 20
+
+
+def _bounded_frame_statistics(key, value, beta, *, a_fp32):
+    """Evaluate independent frame statistics in bounded contiguous frame runs.
+
+    Only the batch dimension is partitioned. Spatial tokens, accumulation
+    dtype, TF32 policy and the recurrence's frame order remain unchanged.
+    """
+    frames = int(value.shape[0])
+    if frames < 2:
+        return B.frame_statistics(key, value, beta, a_fp32=a_fp32)
+    bytes_per_frame = value[0].numel() * value.element_size()
+    frames_per_run = max(1, _FRAME_STATISTICS_VALUE_BUDGET_BYTES // bytes_per_frame)
+    if frames <= frames_per_run:
+        return B.frame_statistics(key, value, beta, a_fp32=a_fp32)
+    a_parts, b_parts = [], []
+    for first in range(0, frames, frames_per_run):
+        last = min(first + frames_per_run, frames)
+        a, b = B.frame_statistics(
+            key[first:last], value[first:last], beta[first:last],
+            a_fp32=a_fp32,
+        )
+        a_parts.append(a)
+        b_parts.append(b)
+    return torch.cat(a_parts, dim=0), torch.cat(b_parts, dim=0)
+
+
 def run_scans_runtime(backend, alpha, a_raw, b_raw, text_state=None):
     """Reference recurrence with execution-local bank reuse when available."""
     with torch.autocast(device_type=a_raw.device.type, enabled=False):
@@ -70,7 +102,7 @@ class RuntimeLinearBranch(B.LinearBranch):
         beta = beta.view(
             num_frames, tokens_per_frame, n_heads).permute(0, 2, 1)
 
-        a, b = B.frame_statistics(
+        a, b = _bounded_frame_statistics(
             key_by_frame, value_by_frame, beta, a_fp32=self.a_fp32)
         # Features and their views are no longer needed after frame statistics.
         del key_by_frame, value_by_frame, key, value, beta
